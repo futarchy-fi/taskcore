@@ -299,7 +299,11 @@ function handleListTasks(
       tasks = tasks.filter((t) => t.parentId === query["parentId"]);
     }
 
-    // Return a summary view
+    // full=true returns complete task objects; default returns summaries
+    if (query["full"] === "true") {
+      return { status: 200, body: { tasks } };
+    }
+
     const summaries = tasks.map((t) => ({
       id: t.id,
       title: t.title,
