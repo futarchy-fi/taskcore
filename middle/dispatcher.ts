@@ -8,8 +8,13 @@ import type {
   AgentExited,
   AgentStarted,
   LeaseGranted,
+  PhaseTransition,
   RetryScheduled,
+  ReviewPolicyMet,
+  ReviewVerdictSubmitted,
+  StateRef,
   Task,
+  TaskCompleted,
 } from "../core/types.js";
 import type { Config } from "./config.js";
 import { autoAnalysis } from "./analysis.js";
@@ -74,6 +79,231 @@ function loadRegistry(registryPath: string): AgentRegistryEntry[] {
   } catch {
     console.warn("[dispatcher] Could not load agent registry:", registryPath);
     return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-detect agent status from stdout
+// ---------------------------------------------------------------------------
+
+interface DetectedStatus {
+  status: "done" | "pending";
+  evidence: string;
+}
+
+/**
+ * Parse agent stdout for review verdicts.
+ *
+ * Review agents output JSON (--json flag) with structure:
+ *   { result: { payloads: [{ text: "..." }] } }
+ *
+ * The text contains a verdict line like:
+ *   **Review verdict for T{id}:** **pending (changes requested)**.
+ *   **Review verdict for T{id}:** **done (approved)**.
+ *
+ * We also check for the verdict embedded directly in the raw JSON string.
+ */
+function detectStatusFromOutput(
+  stdout: string,
+  _stderr: string,
+  phase: "analysis" | "execution" | "review",
+  _task: Task,
+): DetectedStatus | null {
+  // Only auto-detect for review phase — execution agents use task_update.py shim
+  if (phase !== "review") return null;
+
+  // Extract the text payload from agent JSON output
+  let text = "";
+  try {
+    const data = JSON.parse(stdout);
+    const payloads = data?.result?.payloads;
+    if (Array.isArray(payloads) && payloads.length > 0) {
+      text = payloads[0]?.text ?? "";
+    }
+  } catch {
+    // If JSON parse fails, fall back to scanning raw stdout
+    text = stdout;
+  }
+
+  if (!text) return null;
+
+  const lower = text.toLowerCase();
+
+  // Primary pattern: "review verdict for T{id}: **done" or "**pending"
+  const verdictMatch = lower.match(/review\s+verdict\s+for\s+t\d+[:\s*]*\*{0,2}(done|approved|pending|changes[_ ]requested)/);
+  if (verdictMatch) {
+    const v = verdictMatch[1]!;
+    if (v === "done" || v === "approved") {
+      return { status: "done", evidence: extractEvidence(text, verdictMatch.index!) };
+    }
+    if (v === "pending" || v.startsWith("changes")) {
+      return { status: "pending", evidence: extractEvidence(text, verdictMatch.index!) };
+    }
+  }
+
+  // Fallback patterns for less structured output
+  const approvePatterns = [
+    /\bverdict[:\s]*\*{0,2}approv/,
+    /\bmark(?:ing|ed)?\s+(?:as\s+)?(?:done|approved|complete)\b/,
+    /\bstatus[:\s]*["']?done["']?\b/,
+    /\ball\s+(?:criteria|requirements)\s+met\b/,
+  ];
+
+  const rejectPatterns = [
+    /\bverdict[:\s]*\*{0,2}(?:pending|changes[_ ]requested)\b/,
+    /\bmark(?:ing|ed)?\s+(?:as\s+)?(?:pending|changes[_ ]requested)\b/,
+    /\bsend(?:ing)?\s+back\s+for\s+(?:changes|revision)\b/,
+  ];
+
+  for (const pat of approvePatterns) {
+    if (pat.test(lower)) {
+      const m = lower.match(pat);
+      return { status: "done", evidence: extractEvidence(text, m?.index ?? 0) };
+    }
+  }
+
+  for (const pat of rejectPatterns) {
+    if (pat.test(lower)) {
+      const m = lower.match(pat);
+      return { status: "pending", evidence: extractEvidence(text, m?.index ?? 0) };
+    }
+  }
+
+  return null;
+}
+
+function extractEvidence(text: string, matchIdx: number): string {
+  const start = Math.max(0, matchIdx - 100);
+  const end = Math.min(text.length, matchIdx + 300);
+  const snippet = text.slice(start, end).trim();
+  return snippet.slice(0, 500) || "Auto-detected from agent output";
+}
+
+/**
+ * Apply an auto-detected review verdict directly via core events.
+ * This avoids HTTP round-trips and async complexity.
+ */
+function applyAutoDetectedStatus(
+  core: Core,
+  task: Task,
+  detected: DetectedStatus,
+): void {
+  const now = Date.now();
+  const fenceToken = task.currentFenceToken;
+  const ctx: AgentContext = {
+    sessionId: "",
+    agentId: "dispatcher-auto",
+    memoryRef: null,
+    contextTokens: null,
+    modelId: "auto-detect",
+  };
+
+  if (task.phase !== "review" || task.condition !== "active") {
+    console.warn(`[dispatcher] Auto-detect: T${task.id} not in review.active (${task.phase}.${task.condition}), skipping`);
+    return;
+  }
+
+  const round = task.reviewState?.round ?? 1;
+
+  if (detected.status === "done") {
+    // Approve: ReviewVerdictSubmitted → ReviewPolicyMet → TaskCompleted
+    const verdict: ReviewVerdictSubmitted = {
+      type: "ReviewVerdictSubmitted",
+      taskId: task.id,
+      ts: now,
+      fenceToken,
+      reviewer: ctx.agentId,
+      round,
+      verdict: "approve",
+      reasoning: detected.evidence,
+      agentContext: ctx,
+    };
+    const r1 = core.submit(verdict);
+    if (!r1.ok) {
+      console.error(`[dispatcher] Auto-detect ReviewVerdict failed for T${task.id}: ${r1.error.message}`);
+      return;
+    }
+
+    const policyMet: ReviewPolicyMet = {
+      type: "ReviewPolicyMet",
+      taskId: task.id,
+      ts: now + 1,
+      outcome: "approved",
+      summary: detected.evidence,
+      source: { type: "middle", id: "dispatcher-auto" },
+    };
+    const r2 = core.submit(policyMet);
+    if (!r2.ok) {
+      console.error(`[dispatcher] Auto-detect ReviewPolicyMet failed for T${task.id}: ${r2.error.message}`);
+      return;
+    }
+
+    const stateRef: StateRef = { branch: "main", commit: "0000000", parentCommit: "0000000" };
+    const completed: TaskCompleted = {
+      type: "TaskCompleted",
+      taskId: task.id,
+      ts: now + 2,
+      stateRef,
+    };
+    const r3 = core.submit(completed);
+    if (!r3.ok) {
+      console.error(`[dispatcher] Auto-detect TaskCompleted failed for T${task.id}: ${r3.error.message}`);
+      return;
+    }
+
+    console.log(`[dispatcher] T${task.id} auto-completed via review verdict detection`);
+
+  } else if (detected.status === "pending") {
+    // Changes requested: ReviewVerdictSubmitted → ReviewPolicyMet → PhaseTransition
+    const verdict: ReviewVerdictSubmitted = {
+      type: "ReviewVerdictSubmitted",
+      taskId: task.id,
+      ts: now,
+      fenceToken,
+      reviewer: ctx.agentId,
+      round,
+      verdict: "changes_requested",
+      reasoning: detected.evidence,
+      agentContext: ctx,
+    };
+    const r1 = core.submit(verdict);
+    if (!r1.ok) {
+      console.error(`[dispatcher] Auto-detect ReviewVerdict failed for T${task.id}: ${r1.error.message}`);
+      return;
+    }
+
+    const policyMet: ReviewPolicyMet = {
+      type: "ReviewPolicyMet",
+      taskId: task.id,
+      ts: now + 1,
+      outcome: "changes_requested",
+      summary: detected.evidence,
+      source: { type: "middle", id: "dispatcher-auto" },
+    };
+    const r2 = core.submit(policyMet);
+    if (!r2.ok) {
+      console.error(`[dispatcher] Auto-detect ReviewPolicyMet failed for T${task.id}: ${r2.error.message}`);
+      return;
+    }
+
+    const transition: PhaseTransition = {
+      type: "PhaseTransition",
+      taskId: task.id,
+      ts: now + 2,
+      from: { phase: "review", condition: "active" },
+      to: { phase: "execution", condition: "ready" },
+      reasonCode: "changes_requested",
+      reason: detected.evidence,
+      fenceToken,
+      agentContext: ctx,
+    };
+    const r3 = core.submit(transition);
+    if (!r3.ok) {
+      console.error(`[dispatcher] Auto-detect PhaseTransition failed for T${task.id}: ${r3.error.message}`);
+      return;
+    }
+
+    console.log(`[dispatcher] T${task.id} sent back to execution via review verdict detection`);
   }
 }
 
@@ -302,14 +532,26 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       clearTimeout(run.killTimer);
     }
 
-    // Submit AgentExited
+    // Auto-detect status from agent output (review agents may not call the status API)
     const task = core.getTask(run.taskId);
-    if (task && !task.terminal && task.condition === "active") {
+    if (task && !task.terminal && task.condition === "active" && exitCode === 0) {
+      const autoStatus = detectStatusFromOutput(stdout, stderr, run.phase, task);
+      if (autoStatus) {
+        console.log(`[dispatcher] T${run.taskId} auto-detected status="${autoStatus.status}" from agent output`);
+        applyAutoDetectedStatus(core, task, autoStatus);
+      } else if (run.phase === "review") {
+        console.log(`[dispatcher] T${run.taskId} review agent exited code=${exitCode} but no verdict detected (${stdout.length} bytes)`);
+      }
+    }
+
+    // Submit AgentExited
+    const taskAfter = core.getTask(run.taskId);
+    if (taskAfter && !taskAfter.terminal && taskAfter.condition === "active") {
       const exited: AgentExited = {
         type: "AgentExited",
         taskId: run.taskId,
         ts: Date.now(),
-        fenceToken: task.currentFenceToken,
+        fenceToken: taskAfter.currentFenceToken,
         exitCode,
         reportedCost: 1,
         agentContext: {
