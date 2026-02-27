@@ -1,0 +1,759 @@
+import * as http from "node:http";
+import type { Core } from "../core/index.js";
+import type {
+  AgentContext,
+  Event,
+  FailureSummary,
+  ReviewPolicyMet,
+  ReviewVerdictSubmitted,
+  PhaseTransition,
+  StateRef,
+  Task,
+  TaskBlocked,
+  TaskCompleted,
+  TaskCreated,
+  TaskId,
+  ValidationError,
+} from "../core/types.js";
+import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
+import type { Config } from "./config.js";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface RouteMatch {
+  handler: (
+    req: http.IncomingMessage,
+    params: Record<string, string>,
+    body: unknown,
+  ) => Promise<RouteResult>;
+  params: Record<string, string>;
+}
+
+interface RouteResult {
+  status: number;
+  body: unknown;
+}
+
+interface StatusUpdateBody {
+  status: "review" | "done" | "blocked" | "pending" | "execute" | "decompose";
+  evidence?: string;
+  blocker?: string;
+  stateRef?: StateRef;
+  children?: Array<{
+    title: string;
+    description: string;
+    costAllocation?: number;
+    assignee?: string;
+    reviewer?: string;
+  }>;
+}
+
+interface TaskCreateBody {
+  title: string;
+  description: string;
+  assignee?: string;
+  reviewer?: string;
+  consulted?: string;
+  priority?: string;
+  parentId?: string;
+  informed?: string | string[];
+  skipAnalysis?: boolean;
+  costBudget?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function parseBody(req: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf-8");
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function nextTaskId(core: Core): string {
+  const state = core.getState();
+  const ids = Object.keys(state.tasks).map((id) => parseInt(id, 10)).filter((n) => !Number.isNaN(n));
+  const max = ids.length > 0 ? Math.max(...ids) : 0;
+  return String(max + 1);
+}
+
+function agentContextFor(task: Task): AgentContext {
+  return {
+    sessionId: task.currentSessionId ?? "daemon",
+    agentId: task.leasedTo ?? "daemon",
+    memoryRef: null,
+    contextTokens: null,
+    modelId: "daemon",
+  };
+}
+
+function daemonAgentContext(): AgentContext {
+  return {
+    sessionId: "daemon",
+    agentId: "daemon",
+    memoryRef: null,
+    contextTokens: null,
+    modelId: "daemon",
+  };
+}
+
+function submitOrError(core: Core, event: Event): RouteResult | null {
+  const result = core.submit(event);
+  if (!result.ok) {
+    return {
+      status: 422,
+      body: { error: result.error.code, message: result.error.message },
+    };
+  }
+  return null;
+}
+
+function defaultStateRef(): StateRef {
+  return { branch: "main", commit: "0000000", parentCommit: "0000000" };
+}
+
+// ---------------------------------------------------------------------------
+// Route table builder
+// ---------------------------------------------------------------------------
+
+type Method = "GET" | "POST";
+
+interface RouteDef {
+  method: Method;
+  pattern: string; // e.g. "/tasks/:id/status"
+  handler: (
+    req: http.IncomingMessage,
+    params: Record<string, string>,
+    body: unknown,
+  ) => Promise<RouteResult>;
+}
+
+function matchRoute(
+  method: string,
+  url: string,
+  routes: RouteDef[],
+): RouteMatch | null {
+  for (const route of routes) {
+    if (route.method !== method) continue;
+    const params = matchPattern(route.pattern, url);
+    if (params !== null) {
+      return { handler: route.handler, params };
+    }
+  }
+  return null;
+}
+
+function matchPattern(
+  pattern: string,
+  url: string,
+): Record<string, string> | null {
+  const patternParts = pattern.split("/");
+  const urlParts = url.split("?")[0]!.split("/");
+
+  if (patternParts.length !== urlParts.length) return null;
+
+  const params: Record<string, string> = {};
+  for (let i = 0; i < patternParts.length; i++) {
+    const pp = patternParts[i]!;
+    const up = urlParts[i]!;
+    if (pp.startsWith(":")) {
+      params[pp.slice(1)] = decodeURIComponent(up);
+    } else if (pp !== up) {
+      return null;
+    }
+  }
+  return params;
+}
+
+function parseQuery(url: string): Record<string, string> {
+  const qs = url.split("?")[1];
+  if (!qs) return {};
+  const params: Record<string, string> = {};
+  for (const pair of qs.split("&")) {
+    const [k, v] = pair.split("=");
+    if (k) params[decodeURIComponent(k)] = decodeURIComponent(v ?? "");
+  }
+  return params;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP Server
+// ---------------------------------------------------------------------------
+
+export function createHttpServer(
+  core: Core,
+  config: Config,
+): http.Server {
+  const routes = buildRoutes(core, config);
+
+  const server = http.createServer(async (req, res) => {
+    const method = req.method ?? "GET";
+    const url = req.url ?? "/";
+
+    // CORS (for local dev)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const match = matchRoute(method, url, routes);
+    if (!match) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "not_found", message: `No route for ${method} ${url}` }));
+      return;
+    }
+
+    try {
+      const body = method === "POST" ? await parseBody(req) : {};
+      const result = await match.handler(req, match.params, body);
+      res.writeHead(result.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result.body));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "bad_request", message }));
+    }
+  });
+
+  return server;
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+function buildRoutes(core: Core, config: Config): RouteDef[] {
+  return [
+    { method: "GET", pattern: "/health", handler: handleHealth(core) },
+    { method: "GET", pattern: "/tasks", handler: handleListTasks(core) },
+    { method: "GET", pattern: "/tasks/:id", handler: handleGetTask(core) },
+    { method: "GET", pattern: "/dispatchable", handler: handleDispatchable(core) },
+    { method: "POST", pattern: "/tasks", handler: handleCreateTask(core, config) },
+    { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
+    { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core) },
+  ];
+}
+
+// GET /health
+function handleHealth(
+  core: Core,
+): RouteDef["handler"] {
+  return async () => {
+    const state = core.getState();
+    const taskCount = Object.keys(state.tasks).length;
+    const dispatchable = core.getDispatchable().length;
+    return {
+      status: 200,
+      body: {
+        status: "ok",
+        taskCount,
+        dispatchable,
+        sequence: state.sequence,
+        uptime: process.uptime(),
+      },
+    };
+  };
+}
+
+// GET /tasks?phase=X&condition=Y&terminal=Z
+function handleListTasks(
+  core: Core,
+): RouteDef["handler"] {
+  return async (req) => {
+    const query = parseQuery(req.url ?? "");
+    const state = core.getState();
+    let tasks = Object.values(state.tasks);
+
+    if (query["phase"]) {
+      tasks = tasks.filter((t) => t.phase === query["phase"]);
+    }
+    if (query["condition"]) {
+      tasks = tasks.filter((t) => t.condition === query["condition"]);
+    }
+    if (query["terminal"]) {
+      tasks = tasks.filter((t) => t.terminal === query["terminal"]);
+    }
+    if (query["parentId"]) {
+      tasks = tasks.filter((t) => t.parentId === query["parentId"]);
+    }
+
+    // Return a summary view
+    const summaries = tasks.map((t) => ({
+      id: t.id,
+      title: t.title,
+      phase: t.phase,
+      condition: t.condition,
+      terminal: t.terminal,
+      parentId: t.parentId,
+      assignee: t.metadata["assignee"] ?? null,
+      reviewer: t.metadata["reviewer"] ?? null,
+      priority: t.metadata["priority"] ?? "medium",
+      createdAt: t.createdAt,
+      updatedAt: t.updatedAt,
+    }));
+
+    return { status: 200, body: { tasks: summaries } };
+  };
+}
+
+// GET /tasks/:id
+function handleGetTask(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params) => {
+    const task = core.getTask(params["id"]!);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${params["id"]} not found` } };
+    }
+    return { status: 200, body: { task } };
+  };
+}
+
+// GET /dispatchable
+function handleDispatchable(
+  core: Core,
+): RouteDef["handler"] {
+  return async () => {
+    const tasks = core.getDispatchable();
+    const summaries = tasks.map((t) => ({
+      id: t.id,
+      title: t.title,
+      phase: t.phase,
+      condition: t.condition,
+      assignee: t.metadata["assignee"] ?? null,
+      priority: t.metadata["priority"] ?? "medium",
+      createdAt: t.createdAt,
+    }));
+    return { status: 200, body: { tasks: summaries } };
+  };
+}
+
+// POST /tasks
+function handleCreateTask(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, _params, body) => {
+    const b = body as TaskCreateBody;
+    if (!b.title || !b.description) {
+      return { status: 400, body: { error: "missing_fields", message: "title and description required" } };
+    }
+
+    const taskId = nextTaskId(core);
+    let parentId: TaskId | null = b.parentId ?? null;
+    let rootId = taskId;
+
+    if (parentId) {
+      const parent = core.getTask(parentId);
+      if (parent) {
+        rootId = parent.rootId;
+      }
+    }
+
+    // Apply routing overrides
+    let assignee = b.assignee ?? null;
+    let reviewer = b.reviewer ?? null;
+    if (assignee === config.disallowedAgent) {
+      assignee = config.disallowedAgentFallback;
+    }
+    if (reviewer === config.disallowedAgent) {
+      reviewer = config.disallowedAgentFallback;
+    }
+
+    const event: TaskCreated = {
+      type: "TaskCreated",
+      taskId,
+      ts: Date.now(),
+      title: b.title,
+      description: b.description,
+      parentId,
+      rootId,
+      initialPhase: "analysis",
+      initialCondition: "ready",
+      attemptBudgets: config.defaultAttemptBudgets,
+      costBudget: b.costBudget ?? config.defaultCostBudget,
+      dependencies: [],
+      reviewConfig: reviewer
+        ? { required: true, attemptBudget: 3, isolationRules: [] }
+        : null,
+      skipAnalysis: b.skipAnalysis ?? false,
+      metadata: {
+        assignee,
+        reviewer,
+        consulted: b.consulted ?? null,
+        priority: b.priority ?? "medium",
+        informed: b.informed ?? null,
+        createdBy: "http-api",
+        createdAt: new Date().toISOString(),
+      },
+      source: { type: "middle", id: "daemon" },
+    };
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    return {
+      status: 201,
+      body: {
+        taskId,
+        status: "created",
+        assignee,
+        priority: b.priority ?? "medium",
+        parentId,
+        message: `Task ${taskId} created: ${b.title}`,
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/events — raw event submission (fenced)
+function handleSubmitEvent(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const event = body as Event;
+    if (!event.type) {
+      return { status: 400, body: { error: "missing_type", message: "Event type required" } };
+    }
+    // Override taskId from URL
+    (event as { taskId: string }).taskId = params["id"]!;
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    return { status: 200, body: { ok: true, taskId: params["id"] } };
+  };
+}
+
+// POST /tasks/:id/status — agent-friendly status update
+function handleStatusUpdate(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as StatusUpdateBody;
+    const task = core.getTask(taskId);
+
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+    if (task.terminal) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+
+    const now = Date.now();
+    const fenceToken = task.currentFenceToken;
+    const ctx = agentContextFor(task);
+
+    switch (b.status) {
+      case "review":
+        return applyReviewTransition(core, task, fenceToken, ctx, now, b.evidence);
+
+      case "done":
+        return applyDoneTransition(core, task, fenceToken, ctx, now, b.evidence, b.stateRef);
+
+      case "blocked":
+        return applyBlockedTransition(core, task, now, b.blocker ?? b.evidence ?? "No reason provided");
+
+      case "pending":
+        return applyChangesRequestedTransition(core, task, fenceToken, ctx, now, b.evidence);
+
+      case "execute":
+        return applyExecuteTransition(core, task, fenceToken, ctx, now);
+
+      case "decompose":
+        return { status: 501, body: { error: "not_implemented", message: "Decompose via status not yet supported" } };
+
+      default:
+        return { status: 400, body: { error: "unknown_status", message: `Unknown status: ${b.status}` } };
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Status transition implementations
+// ---------------------------------------------------------------------------
+
+/** review: execution.active → review.ready */
+function applyReviewTransition(
+  core: Core,
+  task: Task,
+  fenceToken: number,
+  ctx: AgentContext,
+  ts: number,
+  evidence?: string,
+): RouteResult {
+  if (task.phase !== "execution" || task.condition !== "active") {
+    return {
+      status: 409,
+      body: {
+        error: "invalid_state",
+        message: `Task must be in execution.active, got ${task.phase}.${task.condition}`,
+      },
+    };
+  }
+
+  // Update metadata with evidence
+  if (evidence) {
+    const metaEvent: Event = {
+      type: "AgentExited",
+      taskId: task.id,
+      ts,
+      fenceToken,
+      exitCode: 0,
+      reportedCost: 1,
+      agentContext: ctx,
+    };
+    const err = submitOrError(core, metaEvent);
+    if (err) return err;
+  }
+
+  const transition: PhaseTransition = {
+    type: "PhaseTransition",
+    taskId: task.id,
+    ts: ts + 1,
+    from: { phase: "execution", condition: "active" },
+    to: { phase: "review", condition: "ready" },
+    reasonCode: "work_complete",
+    reason: evidence ?? "Work complete",
+    fenceToken,
+    agentContext: ctx,
+  };
+
+  const err = submitOrError(core, transition);
+  if (err) return err;
+
+  return {
+    status: 200,
+    body: { ok: true, taskId: task.id, transition: "execution.active → review.ready" },
+  };
+}
+
+/** done: review.active → completed (via ReviewVerdict + ReviewPolicyMet + TaskCompleted) */
+function applyDoneTransition(
+  core: Core,
+  task: Task,
+  fenceToken: number,
+  ctx: AgentContext,
+  ts: number,
+  evidence?: string,
+  stateRef?: StateRef,
+): RouteResult {
+  if (task.phase !== "review" || task.condition !== "active") {
+    return {
+      status: 409,
+      body: {
+        error: "invalid_state",
+        message: `Task must be in review.active for done, got ${task.phase}.${task.condition}`,
+      },
+    };
+  }
+
+  const round = task.reviewState?.round ?? 1;
+
+  // 1. ReviewVerdictSubmitted
+  const verdict: ReviewVerdictSubmitted = {
+    type: "ReviewVerdictSubmitted",
+    taskId: task.id,
+    ts,
+    fenceToken,
+    reviewer: ctx.agentId,
+    round,
+    verdict: "approve",
+    reasoning: evidence ?? "Approved",
+    agentContext: ctx,
+  };
+  let err = submitOrError(core, verdict);
+  if (err) return err;
+
+  // 2. ReviewPolicyMet
+  const policyMet: ReviewPolicyMet = {
+    type: "ReviewPolicyMet",
+    taskId: task.id,
+    ts: ts + 1,
+    outcome: "approved",
+    summary: evidence ?? "Review approved",
+    source: { type: "middle", id: "daemon" },
+  };
+  err = submitOrError(core, policyMet);
+  if (err) return err;
+
+  // 3. TaskCompleted
+  const completed: TaskCompleted = {
+    type: "TaskCompleted",
+    taskId: task.id,
+    ts: ts + 2,
+    stateRef: stateRef ?? defaultStateRef(),
+  };
+  err = submitOrError(core, completed);
+  if (err) return err;
+
+  return {
+    status: 200,
+    body: { ok: true, taskId: task.id, transition: "review.active → done" },
+  };
+}
+
+/** blocked: any active state → TaskBlocked */
+function applyBlockedTransition(
+  core: Core,
+  task: Task,
+  ts: number,
+  blocker: string,
+): RouteResult {
+  const summary: FailureSummary = {
+    childId: null,
+    approach: task.phase ?? "unknown",
+    whatFailed: blocker,
+    whatWasLearned: "",
+    artifactRef: null,
+  };
+
+  const blocked: TaskBlocked = {
+    type: "TaskBlocked",
+    taskId: task.id,
+    ts,
+    reason: blocker,
+    reasonCode: "agent_reported_blocked",
+    summary,
+    source: { type: "middle", id: "daemon" },
+  };
+
+  const err = submitOrError(core, blocked);
+  if (err) return err;
+
+  return {
+    status: 200,
+    body: { ok: true, taskId: task.id, transition: `${task.phase}.${task.condition} → blocked` },
+  };
+}
+
+/** pending (changes_requested): review.active → execution.ready */
+function applyChangesRequestedTransition(
+  core: Core,
+  task: Task,
+  fenceToken: number,
+  ctx: AgentContext,
+  ts: number,
+  evidence?: string,
+): RouteResult {
+  if (task.phase !== "review" || task.condition !== "active") {
+    return {
+      status: 409,
+      body: {
+        error: "invalid_state",
+        message: `Task must be in review.active for changes_requested, got ${task.phase}.${task.condition}`,
+      },
+    };
+  }
+
+  const round = task.reviewState?.round ?? 1;
+
+  // 1. ReviewVerdictSubmitted (changes_requested)
+  const verdict: ReviewVerdictSubmitted = {
+    type: "ReviewVerdictSubmitted",
+    taskId: task.id,
+    ts,
+    fenceToken,
+    reviewer: ctx.agentId,
+    round,
+    verdict: "changes_requested",
+    reasoning: evidence ?? "Changes requested",
+    agentContext: ctx,
+  };
+  let err = submitOrError(core, verdict);
+  if (err) return err;
+
+  // 2. ReviewPolicyMet (changes_requested)
+  const policyMet: ReviewPolicyMet = {
+    type: "ReviewPolicyMet",
+    taskId: task.id,
+    ts: ts + 1,
+    outcome: "changes_requested",
+    summary: evidence ?? "Changes requested",
+    source: { type: "middle", id: "daemon" },
+  };
+  err = submitOrError(core, policyMet);
+  if (err) return err;
+
+  // 3. PhaseTransition review.active → execution.ready
+  const transition: PhaseTransition = {
+    type: "PhaseTransition",
+    taskId: task.id,
+    ts: ts + 2,
+    from: { phase: "review", condition: "active" },
+    to: { phase: "execution", condition: "ready" },
+    reasonCode: "changes_requested",
+    reason: evidence ?? "Changes requested by reviewer",
+    fenceToken,
+    agentContext: ctx,
+  };
+  err = submitOrError(core, transition);
+  if (err) return err;
+
+  return {
+    status: 200,
+    body: { ok: true, taskId: task.id, transition: "review.active → execution.ready" },
+  };
+}
+
+/** execute: analysis.active → execution.ready */
+function applyExecuteTransition(
+  core: Core,
+  task: Task,
+  fenceToken: number,
+  ctx: AgentContext,
+  ts: number,
+): RouteResult {
+  if (task.phase !== "analysis" || task.condition !== "active") {
+    return {
+      status: 409,
+      body: {
+        error: "invalid_state",
+        message: `Task must be in analysis.active for execute, got ${task.phase}.${task.condition}`,
+      },
+    };
+  }
+
+  const transition: PhaseTransition = {
+    type: "PhaseTransition",
+    taskId: task.id,
+    ts,
+    from: { phase: "analysis", condition: "active" },
+    to: { phase: "execution", condition: "ready" },
+    reasonCode: "decision_execute",
+    reason: "Analysis complete, proceeding to execution",
+    fenceToken,
+    agentContext: ctx,
+  };
+
+  const err = submitOrError(core, transition);
+  if (err) return err;
+
+  return {
+    status: 200,
+    body: { ok: true, taskId: task.id, transition: "analysis.active → execution.ready" },
+  };
+}

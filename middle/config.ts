@@ -1,0 +1,92 @@
+import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
+import type { AttemptBudgetMaxInput } from "../core/types.js";
+
+function envInt(key: string, fallback: number): number {
+  const v = process.env[key];
+  if (v === undefined) return fallback;
+  const n = parseInt(v, 10);
+  return Number.isNaN(n) ? fallback : n;
+}
+
+function envStr(key: string, fallback: string): string {
+  return process.env[key] ?? fallback;
+}
+
+export interface Config {
+  /** HTTP listen port */
+  port: number;
+  /** SQLite database path */
+  dbPath: string;
+  /** Agent registry JSON path */
+  agentRegistry: string;
+  /** Workspace root directory */
+  workspaceDir: string;
+  /** Max concurrent agent dispatches */
+  maxConcurrent: number;
+  /** Core tick interval (auto-events) */
+  tickIntervalMs: number;
+  /** Dispatch loop interval */
+  dispatchIntervalMs: number;
+  /** Default agent lease timeout */
+  leaseTimeoutMs: number;
+  /** Lock file path */
+  lockFile: string;
+  /** Dashboard runtime JSON (executor_runtime.json compat) */
+  runtimeFile: string;
+  /** Dashboard lifecycle JSONL (task_run_lifecycle.jsonl compat) */
+  lifecycleFile: string;
+  /** Agent spawn command */
+  agentCommand: string;
+  /** Telegram notification target */
+  telegramTarget: string;
+  /** Default cost budget for new tasks */
+  defaultCostBudget: number;
+  /** Default attempt budgets */
+  defaultAttemptBudgets: AttemptBudgetMaxInput;
+  /** Max agent runtime before SIGKILL (ms) */
+  agentTimeoutMs: number;
+  /** Disallowed agent (rerouting) */
+  disallowedAgent: string;
+  /** Fallback agent for rerouting */
+  disallowedAgentFallback: string;
+}
+
+export function loadConfig(): Config {
+  const workspaceDir = envStr(
+    "WORKSPACE_DIR",
+    envStr("OPENCLAW_STATE_DIR", `${process.env["HOME"]}/.openclaw/workspace`),
+  );
+
+  return {
+    port: envInt("ORCHESTRATOR_PORT", 18800),
+    dbPath: envStr("ORCHESTRATOR_DB", `${workspaceDir}/data/taskcore.db`),
+    agentRegistry: envStr(
+      "AGENT_REGISTRY",
+      `${workspaceDir}/agents/registry.json`,
+    ),
+    workspaceDir,
+    maxConcurrent: envInt("MAX_CONCURRENT", 1),
+    tickIntervalMs: envInt("TICK_INTERVAL_MS", 2_000),
+    dispatchIntervalMs: envInt("DISPATCH_INTERVAL_MS", 10_000),
+    leaseTimeoutMs: envInt("LEASE_TIMEOUT_MS", 600_000),
+    lockFile: envStr(
+      "ORCHESTRATOR_LOCK",
+      `${workspaceDir}/data/taskcore.lock`,
+    ),
+    runtimeFile: envStr(
+      "RUNTIME_FILE",
+      `${workspaceDir}/data/task-dashboard/executor_runtime.json`,
+    ),
+    lifecycleFile: envStr(
+      "LIFECYCLE_FILE",
+      `${workspaceDir}/data/task-dashboard/task_run_lifecycle.jsonl`,
+    ),
+    agentCommand: envStr("AGENT_COMMAND", "openclaw"),
+    telegramTarget: envStr("TELEGRAM_TARGET", ""),
+    defaultCostBudget: envInt("DEFAULT_COST_BUDGET", 100),
+    defaultAttemptBudgets: DEFAULT_ATTEMPT_BUDGETS,
+    agentTimeoutMs: envInt("AGENT_TIMEOUT_MS", 600_000),
+    disallowedAgent: envStr("DISALLOWED_ROUTED_AGENT", "hermes"),
+    disallowedAgentFallback: envStr("DISALLOWED_AGENT_FALLBACK", "orchestrator"),
+  };
+}
