@@ -475,7 +475,7 @@ function applyChildCostRecovered(state: SystemState, event: Extract<Event, { typ
     const childClone = deepCloneTask(child);
     const childRemaining = Math.max(0, computeCostRemaining(childClone.cost));
     recoveredAmount = Math.min(recoveredAmount, childRemaining);
-    childClone.cost.allocated -= recoveredAmount;
+    childClone.cost.allocated = Math.max(0, childClone.cost.allocated - recoveredAmount);
     childClone.costRecoveredToParent = true;
     childClone.updatedAt = event.ts;
     state.tasks[childClone.id] = childClone;
@@ -634,9 +634,122 @@ function applyTaskBlocked(state: SystemState, event: Extract<Event, { type: "Tas
   addParentFailureSummary(state, t, summary, event.ts);
 }
 
+function applyTaskExhausted(state: SystemState, event: Extract<Event, { type: "TaskExhausted" }>, task: Task): void {
+  const t = deepCloneTask(task);
+  t.condition = "exhausted";
+  t.leasedTo = null;
+  t.leaseExpiresAt = null;
+  t.retryAfter = null;
+  t.waitState = null;
+  t.lastAgentExitAt = null;
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
+function applyBudgetIncreased(state: SystemState, event: Extract<Event, { type: "BudgetIncreased" }>, task: Task): void {
+  const t = deepCloneTask(task);
+
+  if (event.costBudgetIncrease > 0) {
+    t.cost.allocated += event.costBudgetIncrease;
+  }
+
+  if (event.attemptBudgetIncrease) {
+    for (const phase of ["analysis", "decomposition", "execution", "review"] as const) {
+      const entry = event.attemptBudgetIncrease[phase];
+      if (entry) {
+        t.attempts[phase].max = entry.max;
+      }
+    }
+  }
+
+  // If task is exhausted and budget is now sufficient, transition back to ready
+  if (t.condition === "exhausted" && t.phase !== null) {
+    const attempt = t.attempts[t.phase];
+    const hasAttempts = attempt.used < attempt.max;
+    const hasCost = computeCostRemaining(t.cost) > 0;
+    if (hasAttempts && hasCost) {
+      t.condition = "ready";
+    }
+  }
+
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
 function applyTaskCanceled(state: SystemState, event: Extract<Event, { type: "TaskCanceled" }>, task: Task): void {
   const t = deepCloneTask(task);
   setTerminal(t, "canceled", event.ts);
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
+function applyTaskRevived(state: SystemState, event: Extract<Event, { type: "TaskRevived" }>, task: Task): void {
+  const t = deepCloneTask(task);
+
+  // Clear terminal state, restore to ready condition at the specified phase
+  t.terminal = null;
+  t.phase = event.phase;
+  t.condition = "ready";
+  t.retryAfter = null;
+  t.leasedTo = null;
+  t.leaseExpiresAt = null;
+  t.lastAgentExitAt = null;
+
+  // Reset attempt counters for specified phases
+  for (const phase of event.resetAttempts) {
+    if (t.attempts[phase]) {
+      t.attempts[phase].used = 0;
+    }
+  }
+
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
+function applyTaskReparented(state: SystemState, event: Extract<Event, { type: "TaskReparented" }>, task: Task): void {
+  const t = deepCloneTask(task);
+
+  // Remove from old parent's children[]
+  if (t.parentId !== null) {
+    const oldParent = state.tasks[t.parentId];
+    if (oldParent) {
+      const oldParentClone = deepCloneTask(oldParent);
+      oldParentClone.children = oldParentClone.children.filter((id) => id !== t.id);
+      oldParentClone.updatedAt = event.ts;
+      state.tasks[oldParentClone.id] = oldParentClone;
+    }
+  }
+
+  // Update task's parentId and rootId
+  t.parentId = event.newParentId;
+  t.rootId = event.newRootId;
+
+  // Add to new parent's children[]
+  const newParent = state.tasks[event.newParentId];
+  if (newParent) {
+    const newParentClone = deepCloneTask(newParent);
+    if (!newParentClone.children.includes(t.id)) {
+      newParentClone.children.push(t.id);
+    }
+    newParentClone.updatedAt = event.ts;
+    state.tasks[newParentClone.id] = newParentClone;
+  }
+
+  // Transitively update rootId for all descendants (BFS)
+  const queue: TaskId[] = [...t.children];
+  while (queue.length > 0) {
+    const childId = queue.shift()!;
+    const child = state.tasks[childId];
+    if (!child) continue;
+    if (child.rootId !== event.newRootId) {
+      const childClone = deepCloneTask(child);
+      childClone.rootId = event.newRootId;
+      childClone.updatedAt = event.ts;
+      state.tasks[childClone.id] = childClone;
+      queue.push(...childClone.children);
+    }
+  }
+
   t.updatedAt = event.ts;
   state.tasks[t.id] = t;
 }
@@ -710,11 +823,23 @@ function applyUnchecked(state: SystemState, event: Event): void {
     case "TaskFailed":
       applyTaskFailed(state, event, task);
       break;
+    case "TaskExhausted":
+      applyTaskExhausted(state, event, task);
+      break;
+    case "BudgetIncreased":
+      applyBudgetIncreased(state, event, task);
+      break;
     case "TaskBlocked":
       applyTaskBlocked(state, event, task);
       break;
     case "TaskCanceled":
       applyTaskCanceled(state, event, task);
+      break;
+    case "TaskRevived":
+      applyTaskRevived(state, event, task);
+      break;
+    case "TaskReparented":
+      applyTaskReparented(state, event, task);
       break;
     default: {
       const neverEvent: never = event;

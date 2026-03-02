@@ -4,6 +4,7 @@ import { OrchestrationCore } from "../core/index.js";
 import { loadConfig } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { createDispatcher } from "./dispatcher.js";
+import { exportState } from "./state-export.js";
 
 // ---------------------------------------------------------------------------
 // Lock file
@@ -94,7 +95,7 @@ async function main(): Promise<void> {
     try {
       const result = core.tick(Date.now());
       if (!result.ok) {
-        console.error(`[daemon] Tick error: ${result.error.message}`);
+        console.error(`[daemon] Tick error: ${result.error.message} (task=${result.error.taskId ?? "?"}, event=${result.error.eventType ?? "?"})`);
       } else if (result.value > 0) {
         console.log(`[daemon] Tick processed ${result.value} auto-event(s)`);
       }
@@ -112,6 +113,22 @@ async function main(): Promise<void> {
     }
   }, config.dispatchIntervalMs);
 
+  // State export loop (dashboard compatibility)
+  try {
+    exportState(core, config);
+    console.log("[daemon] Initial state export complete");
+  } catch (err) {
+    console.error("[daemon] Initial state export error:", err);
+  }
+
+  const exportInterval = setInterval(() => {
+    try {
+      exportState(core, config);
+    } catch (err) {
+      console.error("[daemon] State export error:", err);
+    }
+  }, 30_000);
+
   // Graceful shutdown
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -121,6 +138,7 @@ async function main(): Promise<void> {
 
     clearInterval(tickInterval);
     clearInterval(dispatchInterval);
+    clearInterval(exportInterval);
 
     // Stop accepting new connections
     server.close();
