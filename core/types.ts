@@ -7,11 +7,11 @@ export type Timestamp = number;
 export type Duration = number;
 
 export type Phase = "analysis" | "decomposition" | "execution" | "review";
-export type Condition = "ready" | "leased" | "active" | "waiting" | "retryWait";
+export type Condition = "ready" | "leased" | "active" | "waiting" | "retryWait" | "exhausted";
 export type Terminal = "done" | "failed" | "blocked" | "canceled";
 
 export const PHASES: readonly Phase[] = ["analysis", "decomposition", "execution", "review"];
-export const CONDITIONS: readonly Condition[] = ["ready", "leased", "active", "waiting", "retryWait"];
+export const CONDITIONS: readonly Condition[] = ["ready", "leased", "active", "waiting", "retryWait", "exhausted"];
 export const TERMINALS: readonly Terminal[] = ["done", "failed", "blocked", "canceled"];
 
 export interface AttemptBudget {
@@ -34,10 +34,10 @@ export interface AttemptBudgetMaxInput {
 }
 
 export const DEFAULT_ATTEMPT_BUDGETS: AttemptBudgetMaxInput = {
-  analysis: { max: 3 },
-  decomposition: { max: 2 },
-  execution: { max: 4 },
-  review: { max: 3 },
+  analysis: { max: 4 },
+  decomposition: { max: 3 },
+  execution: { max: 8 },
+  review: { max: 6 },
 };
 
 export interface CostBudget {
@@ -386,6 +386,21 @@ export interface TaskFailed extends BaseEvent {
   summary: FailureSummary;
 }
 
+export interface TaskExhausted extends BaseEvent {
+  type: "TaskExhausted";
+  reason: "budget_exhausted" | "cost_exhausted";
+  phase: Phase;
+  source: EventSource;
+}
+
+export interface BudgetIncreased extends BaseEvent {
+  type: "BudgetIncreased";
+  attemptBudgetIncrease: Partial<AttemptBudgetMaxInput> | null;
+  costBudgetIncrease: number;
+  reason: string;
+  source: EventSource;
+}
+
 export interface TaskBlocked extends BaseEvent {
   type: "TaskBlocked";
   reason: string;
@@ -397,6 +412,23 @@ export interface TaskBlocked extends BaseEvent {
 export interface TaskCanceled extends BaseEvent {
   type: "TaskCanceled";
   reason: "parent_redecomposed" | "manual" | "dependency_failed";
+  source: EventSource;
+}
+
+export interface TaskRevived extends BaseEvent {
+  type: "TaskRevived";
+  phase: Phase;
+  resetAttempts: Phase[];
+  reason: string;
+  source: EventSource;
+}
+
+export interface TaskReparented extends BaseEvent {
+  type: "TaskReparented";
+  oldParentId: TaskId | null;
+  newParentId: TaskId;
+  oldRootId: TaskId;
+  newRootId: TaskId;
   source: EventSource;
 }
 
@@ -421,8 +453,12 @@ export type Event =
   | ReviewPolicyMet
   | TaskCompleted
   | TaskFailed
+  | TaskExhausted
+  | BudgetIncreased
   | TaskBlocked
-  | TaskCanceled;
+  | TaskCanceled
+  | TaskRevived
+  | TaskReparented;
 
 export type EventType = Event["type"];
 
