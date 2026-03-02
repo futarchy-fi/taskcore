@@ -2,6 +2,8 @@ import * as http from "node:http";
 import type { Core } from "../core/index.js";
 import type {
   AgentContext,
+  AttemptBudgetMaxInput,
+  BudgetIncreased,
   Event,
   FailureSummary,
   ReviewPolicyMet,
@@ -10,9 +12,12 @@ import type {
   StateRef,
   Task,
   TaskBlocked,
+  TaskCanceled,
   TaskCompleted,
   TaskCreated,
   TaskId,
+  TaskReparented,
+  TaskRevived,
   ValidationError,
 } from "../core/types.js";
 import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
@@ -37,7 +42,7 @@ interface RouteResult {
 }
 
 interface StatusUpdateBody {
-  status: "review" | "done" | "blocked" | "pending" | "execute" | "decompose";
+  status: "review" | "done" | "blocked" | "pending" | "execute" | "decompose" | "cancel";
   evidence?: string;
   blocker?: string;
   stateRef?: StateRef;
@@ -249,10 +254,16 @@ function buildRoutes(core: Core, config: Config): RouteDef[] {
     { method: "GET", pattern: "/health", handler: handleHealth(core) },
     { method: "GET", pattern: "/tasks", handler: handleListTasks(core) },
     { method: "GET", pattern: "/tasks/:id", handler: handleGetTask(core) },
+    { method: "GET", pattern: "/tasks/:id/events", handler: handleGetTaskEvents(core) },
     { method: "GET", pattern: "/dispatchable", handler: handleDispatchable(core) },
     { method: "POST", pattern: "/tasks", handler: handleCreateTask(core, config) },
     { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
     { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core) },
+    { method: "POST", pattern: "/tasks/:id/reparent", handler: handleReparent(core) },
+    { method: "POST", pattern: "/tasks/:id/revive", handler: handleRevive(core) },
+    { method: "POST", pattern: "/tasks/:id/budget", handler: handleBudgetIncrease(core) },
+    { method: "GET", pattern: "/attention", handler: handleAttention(core) },
+    { method: "GET", pattern: "/attention/telegram", handler: handleAttentionTelegram(core) },
   ];
 }
 
@@ -332,6 +343,25 @@ function handleGetTask(
       return { status: 404, body: { error: "not_found", message: `Task ${params["id"]} not found` } };
     }
     return { status: 200, body: { task } };
+  };
+}
+
+// GET /tasks/:id/events
+function handleGetTaskEvents(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params) => {
+    const taskId = params["id"]!;
+    const events = core.getEvents(taskId);
+
+    if (events.length === 0) {
+      const task = core.getTask(taskId);
+      if (!task) {
+        return { status: 404, body: { error: "not_found", message: "Task " + taskId + " not found" } };
+      }
+    }
+
+    return { status: 200, body: { events } };
   };
 }
 
@@ -490,9 +520,149 @@ function handleStatusUpdate(
       case "decompose":
         return { status: 501, body: { error: "not_implemented", message: "Decompose via status not yet supported" } };
 
+      case "cancel":
+        return applyCancelTransition(core, task, now, b.evidence);
+
       default:
         return { status: 400, body: { error: "unknown_status", message: `Unknown status: ${b.status}` } };
     }
+  };
+}
+
+// POST /tasks/:id/reparent
+function handleReparent(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as { newParentId?: string };
+
+    if (!b.newParentId) {
+      return { status: 400, body: { error: "missing_fields", message: "newParentId required" } };
+    }
+
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const newParent = core.getTask(b.newParentId);
+    if (!newParent) {
+      return { status: 404, body: { error: "not_found", message: `New parent task ${b.newParentId} not found` } };
+    }
+
+    const event: TaskReparented = {
+      type: "TaskReparented",
+      taskId,
+      ts: Date.now(),
+      oldParentId: task.parentId,
+      newParentId: b.newParentId,
+      oldRootId: task.rootId,
+      newRootId: newParent.rootId,
+      source: { type: "middle", id: "daemon" },
+    };
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    return {
+      status: 200,
+      body: { ok: true, taskId, newParentId: b.newParentId, newRootId: newParent.rootId },
+    };
+  };
+}
+
+// POST /tasks/:id/revive — revive a failed/blocked task
+function handleRevive(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as { phase?: string; resetAttempts?: string[]; reason?: string };
+
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    if (!task.terminal || (task.terminal !== "failed" && task.terminal !== "blocked")) {
+      return { status: 409, body: { error: "not_terminal", message: `Task ${taskId} is not failed or blocked (terminal=${task.terminal})` } };
+    }
+
+    // Default: revive to the phase where it failed, reset that phase's attempts
+    const phase = (b.phase ?? task.failureSummaries[0]?.approach?.match(/(\w+) phase/)?.[1] ?? "execution") as "analysis" | "execution" | "review";
+    const resetAttempts = (b.resetAttempts ?? [phase]) as ("analysis" | "execution" | "review")[];
+    const reason = b.reason ?? "manual revive";
+
+    const event: TaskRevived = {
+      type: "TaskRevived",
+      taskId,
+      ts: Date.now(),
+      phase,
+      resetAttempts,
+      reason,
+      source: { type: "middle", id: "daemon" },
+    };
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    return {
+      status: 200,
+      body: { ok: true, taskId, phase, resetAttempts, reason },
+    };
+  };
+}
+
+// POST /tasks/:id/budget — increase budget for an exhausted or active task
+function handleBudgetIncrease(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as {
+      attemptBudgetIncrease?: Partial<AttemptBudgetMaxInput>;
+      costBudgetIncrease?: number;
+      reason?: string;
+    };
+
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    if (task.terminal) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+
+    const reason = b.reason ?? "budget increase via API";
+    if (!reason.trim()) {
+      return { status: 400, body: { error: "missing_reason", message: "reason is required" } };
+    }
+
+    const event: BudgetIncreased = {
+      type: "BudgetIncreased",
+      taskId,
+      ts: Date.now(),
+      attemptBudgetIncrease: b.attemptBudgetIncrease ?? null,
+      costBudgetIncrease: b.costBudgetIncrease ?? 0,
+      reason,
+      source: { type: "middle", id: "daemon" },
+    };
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    const updated = core.getTask(taskId);
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        condition: updated?.condition ?? null,
+        message: `Budget increased for T${taskId}`,
+      },
+    };
   };
 }
 
@@ -654,6 +824,36 @@ function applyBlockedTransition(
   };
 }
 
+
+
+/** cancel: any non-terminal state -> TaskCanceled */
+function applyCancelTransition(
+  core: Core,
+  task: Task,
+  ts: number,
+  evidence?: string,
+): RouteResult {
+  const canceled: TaskCanceled = {
+    type: "TaskCanceled",
+    taskId: task.id,
+    ts,
+    reason: "manual",
+    source: { type: "middle", id: "daemon" },
+  };
+
+  const err = submitOrError(core, canceled);
+  if (err) return err;
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      taskId: task.id,
+      transition: `${task.phase ?? "null"}.${task.condition ?? "null"} -> canceled`,
+      note: evidence ?? null,
+    },
+  };
+}
 /** pending (changes_requested): review.active → execution.ready */
 function applyChangesRequestedTransition(
   core: Core,
@@ -759,5 +959,150 @@ function applyExecuteTransition(
   return {
     status: 200,
     body: { ok: true, taskId: task.id, transition: "analysis.active → execution.ready" },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Attention endpoints
+// ---------------------------------------------------------------------------
+
+interface AttentionTask {
+  id: string;
+  title: string;
+  terminal: string | null;
+  phase: string | null;
+  condition: string | null;
+  priority: string;
+  assignee: string | null;
+  reason: string | null;
+  updatedAt: number;
+  reviewRound: number | null;
+}
+
+function collectAttentionTasks(core: Core): {
+  blocked: AttentionTask[];
+  failed: AttentionTask[];
+  overdue: AttentionTask[];
+  exhausted: AttentionTask[];
+} {
+  const state = core.getState();
+  const allTasks = Object.values(state.tasks);
+  const now = Date.now();
+
+  const toSummary = (t: Task): AttentionTask => ({
+    id: t.id,
+    title: t.title,
+    terminal: t.terminal,
+    phase: t.phase,
+    condition: t.condition,
+    priority: (t.metadata["priority"] as string | undefined) ?? "medium",
+    assignee: (t.metadata["assignee"] as string | undefined) ?? null,
+    reason: t.terminalSummary?.whatFailed ?? null,
+    updatedAt: t.updatedAt,
+    reviewRound: t.reviewState?.round ?? null,
+  });
+
+  const blocked = allTasks
+    .filter((t) => t.terminal === "blocked")
+    .map(toSummary);
+
+  const failed = allTasks
+    .filter((t) => t.terminal === "failed")
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, 20)
+    .map(toSummary);
+
+  // Tasks whose lease has expired but haven't transitioned yet
+  const overdue = allTasks
+    .filter(
+      (t) =>
+        !t.terminal &&
+        (t.condition === "leased" || t.condition === "active") &&
+        t.leaseExpiresAt !== null &&
+        t.leaseExpiresAt <= now,
+    )
+    .map(toSummary);
+
+  const exhausted = allTasks
+    .filter((t) => t.condition === "exhausted")
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map(toSummary);
+
+  return { blocked, failed, overdue, exhausted };
+}
+
+// GET /attention
+function handleAttention(
+  core: Core,
+): RouteDef["handler"] {
+  return async () => {
+    const { blocked, failed, overdue, exhausted } = collectAttentionTasks(core);
+    return {
+      status: 200,
+      body: {
+        blocked: blocked.length,
+        failed: failed.length,
+        stalled: overdue.length,
+        exhausted: exhausted.length,
+        tasks: { blocked, failed, stalled: overdue, exhausted },
+      },
+    };
+  };
+}
+
+// GET /attention/telegram
+function handleAttentionTelegram(
+  core: Core,
+): RouteDef["handler"] {
+  return async () => {
+    const { blocked, failed, overdue, exhausted } = collectAttentionTasks(core);
+    const total = blocked.length + failed.length + overdue.length + exhausted.length;
+
+    if (total === 0) {
+      return { status: 200, body: { text: "✅ No tasks need attention." } };
+    }
+
+    const lines: string[] = [`🚨 Attention needed (${total} tasks)`];
+
+    if (blocked.length > 0) {
+      lines.push("");
+      lines.push(`BLOCKED (${blocked.length}):`);
+      for (const t of blocked) {
+        const pri = t.priority.toUpperCase().slice(0, 4);
+        lines.push(`• T${t.id} [${pri}] ${t.title.slice(0, 50)}`);
+        if (t.reason) lines.push(`  Reason: ${t.reason.slice(0, 80)}`);
+      }
+    }
+
+    if (failed.length > 0) {
+      lines.push("");
+      lines.push(`FAILED (${failed.length}):`);
+      for (const t of failed) {
+        const pri = t.priority.toUpperCase().slice(0, 4);
+        lines.push(`• T${t.id} [${pri}] ${t.title.slice(0, 50)}`);
+        if (t.reason) lines.push(`  ${t.reason.slice(0, 80)}`);
+      }
+    }
+
+    if (exhausted.length > 0) {
+      lines.push("");
+      lines.push(`EXHAUSTED (${exhausted.length}):`);
+      for (const t of exhausted) {
+        const pri = t.priority.toUpperCase().slice(0, 4);
+        lines.push(`• T${t.id} [${pri}] ${t.title.slice(0, 50)}`);
+        lines.push(`  Budget exhausted in ${t.phase} phase`);
+      }
+    }
+
+    if (overdue.length > 0) {
+      lines.push("");
+      lines.push(`LEASE OVERDUE (${overdue.length}):`);
+      for (const t of overdue) {
+        const pri = t.priority.toUpperCase().slice(0, 4);
+        lines.push(`• T${t.id} [${pri}] ${t.condition}, lease expired`);
+      }
+    }
+
+    return { status: 200, body: { text: lines.join("\n") } };
   };
 }

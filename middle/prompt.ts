@@ -98,22 +98,19 @@ function buildWorkPrompt(core: Core, task: Task, config: Config): string {
   // Status update instructions
   sections.push("## How to Report Status");
   sections.push("");
-  sections.push("When you finish your work, report your status using one of these methods:");
+  sections.push("When done, report your status:");
   sections.push("");
-  sections.push("### Option 1: HTTP API");
   sections.push("```bash");
-  sections.push(`curl -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
+  sections.push(`# Work complete → submit for review:`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
   sections.push(`  -H 'Content-Type: application/json' \\`);
   sections.push(`  -d '{"status": "review", "evidence": "Description of what you did"}'`);
-  sections.push("```");
   sections.push("");
-  sections.push("### Option 2: CLI bridge");
-  sections.push("```bash");
-  sections.push(`python3 task-update-bridge.py --task-id ${task.id} --status review --evidence "Description of what you did"`);
+  sections.push(`# Blocked → cannot proceed:`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
+  sections.push(`  -H 'Content-Type: application/json' \\`);
+  sections.push(`  -d '{"status": "blocked", "evidence": "What is blocking you"}'`);
   sections.push("```");
-  sections.push("");
-  sections.push("### Option 3: MCP tool");
-  sections.push("Use the `update_status` MCP tool with `taskId`, `status`, and `evidence` parameters.");
   sections.push("");
 
   // Behavioral rules
@@ -146,12 +143,29 @@ function buildReviewPrompt(core: Core, task: Task, config: Config): string {
   sections.push(task.description);
   sections.push("");
 
-  // Evidence from assignee
-  const evidence = task.metadata["evidence"] as string | undefined;
-  if (evidence) {
+  // Evidence from assignee — read from the most recent PhaseTransition to review,
+  // which carries the actual evidence the agent submitted (metadata["evidence"] is
+  // only set at creation time and goes stale after re-execution cycles).
+  const events = core.getEvents(task.id);
+  let assigneeEvidence: string | null = null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i] as unknown as Record<string, unknown>;
+    if (ev["type"] === "PhaseTransition") {
+      const to = ev["to"] as { phase: string } | undefined;
+      if (to?.phase === "review" && typeof ev["reason"] === "string") {
+        assigneeEvidence = ev["reason"] as string;
+        break;
+      }
+    }
+  }
+  // Fall back to metadata if no PhaseTransition evidence found (e.g. migrated tasks)
+  if (!assigneeEvidence) {
+    assigneeEvidence = (task.metadata["evidence"] as string | undefined) ?? null;
+  }
+  if (assigneeEvidence) {
     sections.push("## Assignee Evidence");
     sections.push("");
-    sections.push(evidence);
+    sections.push(assigneeEvidence);
     sections.push("");
   }
 
@@ -233,14 +247,17 @@ function getTaskDiff(task: Task, workspaceDir: string): string | null {
   const taskPrefix = `T${task.id}`;
 
   try {
-    // Strategy 1: Find commits tagged with T{id} prefix
+    // Strategy 1: Find commits tagged with T{id} prefix and diff only those
     const logCmd = `git log --oneline --all --grep="^${taskPrefix}" --format="%H" 2>/dev/null`;
     const commits = execSync(logCmd, { cwd: workspaceDir, encoding: "utf-8" }).trim();
 
     if (commits) {
       const commitList = commits.split("\n");
       const oldest = commitList[commitList.length - 1]!;
-      const diffCmd = `git diff ${oldest}^..HEAD -- . 2>/dev/null`;
+      const newest = commitList[0]!;
+      // Scope diff to only the task's own commits (oldest^..newest),
+      // not oldest^..HEAD which includes all other tasks' changes too.
+      const diffCmd = `git diff ${oldest}^..${newest} -- . 2>/dev/null`;
       try {
         const diff = execSync(diffCmd, { cwd: workspaceDir, encoding: "utf-8" }).trim();
         if (diff) return diff;
@@ -249,7 +266,8 @@ function getTaskDiff(task: Task, workspaceDir: string): string | null {
       }
     }
 
-    // Strategy 2: Uncommitted changes
+    // Strategy 2: Uncommitted changes scoped to task prefix in file paths
+    // (this is a best-effort fallback — not all tasks have file path patterns)
     const diff = execSync("git diff HEAD 2>/dev/null", {
       cwd: workspaceDir,
       encoding: "utf-8",

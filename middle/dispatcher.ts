@@ -21,6 +21,25 @@ import { autoAnalysis } from "./analysis.js";
 import { buildPrompt } from "./prompt.js";
 
 // ---------------------------------------------------------------------------
+// Telegram notifications
+// ---------------------------------------------------------------------------
+
+function notifyTelegram(config: Config, msg: string): void {
+  if (!config.telegramTarget) return;
+  try {
+    const child = spawn("openclaw", [
+      "message", "send",
+      "--channel", "telegram",
+      "--target", config.telegramTarget,
+      "--message", msg,
+    ], { stdio: "ignore", detached: true });
+    child.unref();
+  } catch {
+    // Never block dispatcher on notification failure
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -33,6 +52,7 @@ interface ActiveRun {
   process: ChildProcess;
   startedAt: number;
   killTimer: ReturnType<typeof setTimeout> | null;
+  nudged?: boolean;
 }
 
 interface AgentRegistryEntry {
@@ -141,29 +161,36 @@ function detectStatusFromOutput(
     }
   }
 
-  // Fallback patterns for less structured output
+  // Strip fenced code blocks to avoid matching on curl templates / JSON payloads
+  // that the agent is quoting in its reasoning (not actual verdicts).
+  const stripped = lower.replace(/```[\s\S]*?```/g, " [code-block] ");
+
+  // Fallback patterns for less structured output (applied to stripped text only)
   const approvePatterns = [
     /\bverdict[:\s]*\*{0,2}approv/,
     /\bmark(?:ing|ed)?\s+(?:as\s+)?(?:done|approved|complete)\b/,
-    /\bstatus[:\s]*["']?done["']?\b/,
     /\ball\s+(?:criteria|requirements)\s+met\b/,
+    /\bacceptable\b.*\bapprov/,
   ];
 
   const rejectPatterns = [
-    /\bverdict[:\s]*\*{0,2}(?:pending|changes[_ ]requested)\b/,
+    /\bverdict[:\s]*\*{0,2}(?:pending|changes[_ ]requested|not acceptable)\b/,
     /\bmark(?:ing|ed)?\s+(?:as\s+)?(?:pending|changes[_ ]requested)\b/,
     /\bsend(?:ing)?\s+back\s+for\s+(?:changes|revision)\b/,
+    /\bshould\s+be\s+\*{0,2}(?:requested\s+changes|pending|rejected)\b/,
+    /\bnot\s+acceptable\b/,
+    /\brequest(?:ed)?\s+changes\b/,
   ];
 
   for (const pat of approvePatterns) {
-    if (pat.test(lower)) {
+    if (pat.test(stripped)) {
       const m = lower.match(pat);
       return { status: "done", evidence: extractEvidence(text, m?.index ?? 0) };
     }
   }
 
   for (const pat of rejectPatterns) {
-    if (pat.test(lower)) {
+    if (pat.test(stripped)) {
       const m = lower.match(pat);
       return { status: "pending", evidence: extractEvidence(text, m?.index ?? 0) };
     }
@@ -184,6 +211,7 @@ function extractEvidence(text: string, matchIdx: number): string {
  * This avoids HTTP round-trips and async complexity.
  */
 function applyAutoDetectedStatus(
+  config: Config,
   core: Core,
   task: Task,
   detected: DetectedStatus,
@@ -252,6 +280,7 @@ function applyAutoDetectedStatus(
     }
 
     console.log(`[dispatcher] T${task.id} auto-completed via review verdict detection`);
+    notifyTelegram(config, `✅ T${task.id} done\n${task.title.slice(0, 60)}`);
 
   } else if (detected.status === "pending") {
     // Changes requested: ReviewVerdictSubmitted → ReviewPolicyMet → PhaseTransition
@@ -304,6 +333,7 @@ function applyAutoDetectedStatus(
     }
 
     console.log(`[dispatcher] T${task.id} sent back to execution via review verdict detection`);
+    notifyTelegram(config, `📝 T${task.id} changes requested\n${task.title.slice(0, 60)}`);
   }
 }
 
@@ -423,11 +453,15 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     const prompt = buildPrompt(core, task.id, runPhase, config);
 
     // 4. Spawn agent process
+    // Prepend "/new " to force a fresh session for each dispatch.
+    // Without this, openclaw routes all dispatches to the same agent:coder-lite:main
+    // session (--session-id is ignored when --agent is specified), causing tasks to
+    // share context and the agent to just produce text summaries instead of working.
     const args = [
       "agent",
       "--agent", agentId,
       "--session-id", sessionId,
-      "-m", prompt,
+      "-m", `/new ${prompt}`,
       "--json",
     ];
 
@@ -463,6 +497,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     run.killTimer = setTimeout(() => {
       console.warn(`[dispatcher] T${task.id} agent timeout, sending SIGKILL`);
       child.kill("SIGKILL");
+      notifyTelegram(config, `⏰ T${task.id} killed (timeout)\nAgent: ${agentId}`);
       appendLifecycle({
         event: "timeout_kill",
         runId,
@@ -491,6 +526,8 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     child.on("close", (exitCode, signal) => {
       handleChildExit(run, exitCode ?? -1, signal, stdout, stderr);
     });
+
+    notifyTelegram(config, `🚀 T${task.id} dispatched\n${task.title.slice(0, 60)}\nAgent: ${agentId}, Phase: ${phase}`);
   }
 
   function selectAgent(task: Task, phase: string): string | null {
@@ -538,9 +575,16 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       const autoStatus = detectStatusFromOutput(stdout, stderr, run.phase, task);
       if (autoStatus) {
         console.log(`[dispatcher] T${run.taskId} auto-detected status="${autoStatus.status}" from agent output`);
-        applyAutoDetectedStatus(core, task, autoStatus);
+        applyAutoDetectedStatus(config, core, task, autoStatus);
       } else if (run.phase === "review") {
         console.log(`[dispatcher] T${run.taskId} review agent exited code=${exitCode} but no verdict detected (${stdout.length} bytes)`);
+      } else {
+        // Execution/analysis agent exited without reporting status — log for diagnosis
+        const stderrSnippet = stderr.trim().slice(-500);
+        const stdoutSnippet = stdout.trim().slice(-500);
+        console.warn(`[dispatcher] T${run.taskId} ${run.phase} agent exited code=${exitCode} without reporting status (stdout=${stdout.length}b, stderr=${stderr.length}b)`);
+        if (stderrSnippet) console.warn(`[dispatcher] T${run.taskId} stderr tail: ${stderrSnippet}`);
+        if (stdoutSnippet) console.warn(`[dispatcher] T${run.taskId} stdout tail: ${stdoutSnippet}`);
       }
     }
 
@@ -567,9 +611,16 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
         console.error(`[dispatcher] AgentExited failed for T${run.taskId}: ${exitResult.error.message}`);
       }
 
-      // If task still active after exit (agent didn't update status), schedule retry
+      // If task still active after exit (agent didn't update status)
       const updatedTask = core.getTask(run.taskId);
       if (updatedTask && !updatedTask.terminal && updatedTask.phase !== null) {
+        // Try a status nudge first (one chance per run, only for clean exits)
+        if (exitCode === 0 && !run.nudged) {
+          console.log(`[dispatcher] T${run.taskId} agent forgot to report status — sending nudge to same session`);
+          spawnStatusNudge(run, updatedTask);
+          return; // Don't schedule retry yet — wait for nudge result
+        }
+
         // Determine backoff
         const phase = updatedTask.phase;
         const attemptUsed = updatedTask.attempts[phase].used;
@@ -597,6 +648,15 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
           console.error(`[dispatcher] RetryScheduled failed for T${run.taskId}: ${retryResult.error.message}`);
         } else {
           console.log(`[dispatcher] T${run.taskId} retry scheduled in ${Math.round(backoff / 1000)}s`);
+          notifyTelegram(config, `🔄 T${run.taskId} retry in ${Math.round(backoff / 1000)}s (attempt ${attemptUsed})`);
+        }
+
+        // Check if task became exhausted or failed after retry scheduling
+        const taskAfterRetry = core.getTask(run.taskId);
+        if (taskAfterRetry?.terminal === "failed") {
+          notifyTelegram(config, `❌ T${run.taskId} FAILED\n${taskAfterRetry.title.slice(0, 60)}`);
+        } else if (taskAfterRetry?.condition === "exhausted") {
+          notifyTelegram(config, `⏸ T${run.taskId} EXHAUSTED\n${taskAfterRetry.title.slice(0, 60)}\nIncrease budget: POST /tasks/${run.taskId}/budget`);
         }
       }
     }
@@ -618,6 +678,71 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     // Remove from active runs
     activeRuns.delete(run.taskId);
     writeRuntimeFile();
+  }
+
+  /**
+   * Send a follow-up message to the same session asking the agent to report status.
+   * No `/new` prefix — continues the existing conversation so the agent has context.
+   * This doesn't burn a retry attempt; if the nudge also fails, the normal retry flow kicks in.
+   */
+  function spawnStatusNudge(originalRun: ActiveRun, task: Task): void {
+    const statusType = task.phase === "review" ? "done" : "review";
+    const nudgeMessage = [
+      `Run this exact command now. Do not do anything else — just run this command:`,
+      ``,
+      `curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`,
+      `  -H 'Content-Type: application/json' \\`,
+      `  -d '{"status": "${statusType}", "evidence": "Brief summary of what you did"}'`,
+      ``,
+      `Replace the evidence text with a short summary of what you actually did, then run it.`,
+    ].join("\n");
+
+    const args = [
+      "agent",
+      "--agent", originalRun.agentId,
+      "--session-id", originalRun.sessionId,
+      "-m", nudgeMessage,
+      "--json",
+    ];
+
+    console.log(`[dispatcher] T${task.id} sending status nudge to session ${originalRun.sessionId.slice(0, 8)}`);
+
+    const child = spawn(config.agentCommand, args, {
+      cwd: config.workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        TASK_ID: task.id,
+        ORCHESTRATOR_PORT: String(config.port),
+      },
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+    // Reuse the run slot with nudged=true
+    const nudgeRun: ActiveRun = {
+      ...originalRun,
+      process: child,
+      startedAt: Date.now(),
+      nudged: true,
+      killTimer: null,
+    };
+
+    // 60s timeout for nudge (should be fast)
+    nudgeRun.killTimer = setTimeout(() => {
+      console.warn(`[dispatcher] T${task.id} nudge timeout, killing`);
+      child.kill("SIGKILL");
+    }, 60_000);
+
+    activeRuns.set(task.id, nudgeRun);
+    writeRuntimeFile();
+
+    child.on("close", (code, sig) => {
+      handleChildExit(nudgeRun, code ?? -1, sig, stdout, stderr);
+    });
   }
 
   function stopAll(): void {
