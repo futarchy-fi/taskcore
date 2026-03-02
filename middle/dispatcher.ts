@@ -21,10 +21,10 @@ import { autoAnalysis } from "./analysis.js";
 import { buildPrompt } from "./prompt.js";
 
 // ---------------------------------------------------------------------------
-// Telegram notifications
+// Telegram notifications — batched digest
 // ---------------------------------------------------------------------------
 
-function notifyTelegram(config: Config, msg: string): void {
+function sendTelegram(config: Config, msg: string): void {
   if (!config.telegramTarget) return;
   try {
     const child = spawn("openclaw", [
@@ -37,6 +37,73 @@ function notifyTelegram(config: Config, msg: string): void {
   } catch {
     // Never block dispatcher on notification failure
   }
+}
+
+// Urgent notifications go out immediately (failures, exhausted, blocked).
+function notifyUrgent(config: Config, msg: string): void {
+  sendTelegram(config, msg);
+}
+
+// Everything else accumulates in a digest buffer that flushes periodically.
+interface DigestEntry {
+  emoji: string;
+  taskId: string;
+  title: string;
+  detail: string;
+}
+
+const digestBuffer: DigestEntry[] = [];
+let digestTimer: ReturnType<typeof setTimeout> | null = null;
+const DIGEST_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+let lastDigestConfig: Config | null = null;
+
+function pushDigest(config: Config, entry: DigestEntry): void {
+  lastDigestConfig = config;
+  digestBuffer.push(entry);
+  // Auto-flush if we haven't set a timer yet
+  if (!digestTimer) {
+    digestTimer = setTimeout(() => flushDigest(), DIGEST_INTERVAL_MS);
+  }
+}
+
+function flushDigest(): void {
+  digestTimer = null;
+  if (digestBuffer.length === 0 || !lastDigestConfig) return;
+
+  const entries = digestBuffer.splice(0);
+  const done = entries.filter((e) => e.emoji === "✅");
+  const changesReq = entries.filter((e) => e.emoji === "📝");
+  const dispatched = entries.filter((e) => e.emoji === "🚀");
+  const retries = entries.filter((e) => e.emoji === "🔄");
+  const timeouts = entries.filter((e) => e.emoji === "⏰");
+
+  const lines: string[] = [];
+  lines.push(`📊 Pipeline digest (last ${Math.round(DIGEST_INTERVAL_MS / 60000)}min)`);
+
+  if (done.length > 0) {
+    lines.push(`\n✅ Completed: ${done.length}`);
+    for (const d of done) lines.push(`  T${d.taskId} ${d.title}`);
+  }
+  if (changesReq.length > 0) {
+    lines.push(`\n📝 Sent back: ${changesReq.length}`);
+    for (const d of changesReq) lines.push(`  T${d.taskId} ${d.title}`);
+  }
+  if (dispatched.length > 0) {
+    lines.push(`\n🚀 Dispatched: ${dispatched.length}`);
+  }
+  if (retries.length > 0) {
+    lines.push(`🔄 Retries: ${retries.length}`);
+  }
+  if (timeouts.length > 0) {
+    lines.push(`⏰ Timeouts: ${timeouts.length}`);
+  }
+
+  sendTelegram(lastDigestConfig, lines.join("\n"));
+}
+
+// Exported for daemon shutdown to flush any pending digest.
+export function flushNotificationDigest(): void {
+  flushDigest();
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +347,7 @@ function applyAutoDetectedStatus(
     }
 
     console.log(`[dispatcher] T${task.id} auto-completed via review verdict detection`);
-    notifyTelegram(config, `✅ T${task.id} done\n${task.title.slice(0, 60)}`);
+    pushDigest(config, { emoji: "✅", taskId: task.id, title: task.title.slice(0, 60), detail: "" });
 
   } else if (detected.status === "pending") {
     // Changes requested: ReviewVerdictSubmitted → ReviewPolicyMet → PhaseTransition
@@ -333,7 +400,7 @@ function applyAutoDetectedStatus(
     }
 
     console.log(`[dispatcher] T${task.id} sent back to execution via review verdict detection`);
-    notifyTelegram(config, `📝 T${task.id} changes requested\n${task.title.slice(0, 60)}`);
+    pushDigest(config, { emoji: "📝", taskId: task.id, title: task.title.slice(0, 60), detail: "" });
   }
 }
 
@@ -497,7 +564,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     run.killTimer = setTimeout(() => {
       console.warn(`[dispatcher] T${task.id} agent timeout, sending SIGKILL`);
       child.kill("SIGKILL");
-      notifyTelegram(config, `⏰ T${task.id} killed (timeout)\nAgent: ${agentId}`);
+      pushDigest(config, { emoji: "⏰", taskId: task.id, title: task.title.slice(0, 40), detail: `Agent: ${agentId}` });
       appendLifecycle({
         event: "timeout_kill",
         runId,
@@ -527,7 +594,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       handleChildExit(run, exitCode ?? -1, signal, stdout, stderr);
     });
 
-    notifyTelegram(config, `🚀 T${task.id} dispatched\n${task.title.slice(0, 60)}\nAgent: ${agentId}, Phase: ${phase}`);
+    pushDigest(config, { emoji: "🚀", taskId: task.id, title: task.title.slice(0, 60), detail: `${agentId} ${phase}` });
   }
 
   function selectAgent(task: Task, phase: string): string | null {
@@ -648,15 +715,15 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
           console.error(`[dispatcher] RetryScheduled failed for T${run.taskId}: ${retryResult.error.message}`);
         } else {
           console.log(`[dispatcher] T${run.taskId} retry scheduled in ${Math.round(backoff / 1000)}s`);
-          notifyTelegram(config, `🔄 T${run.taskId} retry in ${Math.round(backoff / 1000)}s (attempt ${attemptUsed})`);
+          pushDigest(config, { emoji: "🔄", taskId: run.taskId, title: "", detail: `attempt ${attemptUsed}` });
         }
 
         // Check if task became exhausted or failed after retry scheduling
         const taskAfterRetry = core.getTask(run.taskId);
         if (taskAfterRetry?.terminal === "failed") {
-          notifyTelegram(config, `❌ T${run.taskId} FAILED\n${taskAfterRetry.title.slice(0, 60)}`);
+          notifyUrgent(config, `❌ T${run.taskId} FAILED\n${taskAfterRetry.title.slice(0, 60)}`);
         } else if (taskAfterRetry?.condition === "exhausted") {
-          notifyTelegram(config, `⏸ T${run.taskId} EXHAUSTED\n${taskAfterRetry.title.slice(0, 60)}\nIncrease budget: POST /tasks/${run.taskId}/budget`);
+          notifyUrgent(config, `⏸ T${run.taskId} EXHAUSTED\n${taskAfterRetry.title.slice(0, 60)}`);
         }
       }
     }

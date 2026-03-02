@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { OrchestrationCore } from "../core/index.js";
 import { loadConfig } from "./config.js";
 import { createHttpServer } from "./http.js";
-import { createDispatcher } from "./dispatcher.js";
+import { createDispatcher, flushNotificationDigest } from "./dispatcher.js";
 import { exportState } from "./state-export.js";
 
 // ---------------------------------------------------------------------------
@@ -142,6 +142,9 @@ async function main(): Promise<void> {
 
     // Stop accepting new connections
     server.close();
+
+    // Flush any pending notification digest
+    flushNotificationDigest();
 
     // Kill active agents
     dispatcher.stopAll();
