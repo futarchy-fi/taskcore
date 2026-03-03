@@ -139,6 +139,11 @@ export class SQLitePersistence {
   }
 
   public close(): void {
+    try {
+      this.db.pragma("wal_checkpoint(TRUNCATE)");
+    } catch (err) {
+      console.error("[persistence] WAL checkpoint failed:", err);
+    }
     this.db.close();
   }
 }

@@ -263,7 +263,19 @@ export class OrchestrationCore implements Core {
   }
 
   public close(): void {
-    this.persistence.saveSnapshot(this.state);
+    // Guard: never overwrite a good snapshot with an empty/smaller state
+    const existing = this.persistence.loadLatestSnapshot();
+    const currentTaskCount = Object.keys(this.state.tasks).length;
+    if (existing) {
+      const existingTaskCount = Object.keys(existing.state.tasks).length;
+      if (currentTaskCount === 0 && existingTaskCount > 0) {
+        console.error(`[core] Refusing to save empty snapshot over ${existingTaskCount}-task snapshot at seq ${existing.sequence}`);
+      } else {
+        this.persistence.saveSnapshot(this.state);
+      }
+    } else {
+      this.persistence.saveSnapshot(this.state);
+    }
     this.persistence.close();
   }
 
