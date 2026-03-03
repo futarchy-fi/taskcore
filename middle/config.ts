@@ -41,6 +41,8 @@ export interface Config {
   telegramTarget: string;
   /** Default cost budget for new tasks */
   defaultCostBudget: number;
+  /** Default context budget (passed to agent on lease) */
+  defaultContextBudget: number;
   /** Default attempt budgets */
   defaultAttemptBudgets: AttemptBudgetMaxInput;
   /** Max agent runtime before SIGKILL (ms) */
@@ -84,6 +86,7 @@ export function loadConfig(): Config {
     agentCommand: envStr("AGENT_COMMAND", "openclaw"),
     telegramTarget: envStr("TELEGRAM_TARGET", ""),
     defaultCostBudget: envInt("DEFAULT_COST_BUDGET", 100),
+    defaultContextBudget: envInt("DEFAULT_CONTEXT_BUDGET", 200),
     defaultAttemptBudgets: DEFAULT_ATTEMPT_BUDGETS,
     agentTimeoutMs: envInt("AGENT_TIMEOUT_MS", 600_000),
     disallowedAgent: envStr("DISALLOWED_ROUTED_AGENT", "hermes"),

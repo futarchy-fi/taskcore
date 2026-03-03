@@ -21,6 +21,141 @@ import { autoAnalysis } from "./analysis.js";
 import { buildPrompt } from "./prompt.js";
 
 // ---------------------------------------------------------------------------
+// Incident reporting — writes to data/incidents/YYYY-MM-DD.jsonl
+// ---------------------------------------------------------------------------
+
+type IncidentSeverity = "critical" | "error" | "warning" | "info";
+type IncidentCategory =
+  | "agent-crash"
+  | "agent-timeout"
+  | "agent-error"
+  | "rate-limit"
+  | "context-overflow"
+  | "retry-exhausted"
+  | "unexpected-behavior";
+
+interface IncidentContext {
+  taskId?: string | undefined;
+  agentId?: string | undefined;
+  sessionId?: string | undefined;
+  modelId?: string | undefined;
+  phase?: string | undefined;
+  elapsedMs?: number | undefined;
+  exitCode?: number | undefined;
+  signal?: string | null | undefined;
+  stdoutBytes?: number | undefined;
+  stderrBytes?: number | undefined;
+  stderrSnippet?: string | undefined;
+  stdoutSnippet?: string | undefined;
+  attempt?: number | undefined;
+  [key: string]: unknown;
+}
+
+function appendIncident(
+  config: Config,
+  severity: IncidentSeverity,
+  category: IncidentCategory,
+  summary: string,
+  detail?: string,
+  context?: IncidentContext,
+  tags?: string[],
+): void {
+  try {
+    const now = new Date();
+    const dateStr = now.toISOString().slice(0, 10);
+    const timeStr = now.toISOString().slice(11, 19).replace(/:/g, "");
+    const rand = crypto.randomBytes(3).toString("hex").slice(0, 5);
+    const incId = `inc_${dateStr.replace(/-/g, "")}_${timeStr}_${rand}`;
+
+    const incDir = path.join(config.workspaceDir, "data", "incidents");
+    if (!fs.existsSync(incDir)) {
+      fs.mkdirSync(incDir, { recursive: true });
+    }
+
+    const record = {
+      id: incId,
+      ts: now.toISOString(),
+      severity,
+      category,
+      source: "taskcore-dispatcher",
+      detection: "auto",
+      summary,
+      detail: detail ?? null,
+      context: context ?? null,
+      chain_id: null,
+      parent_id: null,
+      tags: tags ?? [],
+      resolved: false,
+      resolved_at: null,
+      resolved_by: null,
+    };
+
+    const line = JSON.stringify(record) + "\n";
+    const filepath = path.join(incDir, `${dateStr}.jsonl`);
+    fs.appendFileSync(filepath, line);
+  } catch (err) {
+    // Never block dispatcher on incident write failure
+    console.error("[dispatcher] Failed to write incident:", err);
+  }
+}
+
+/**
+ * Classify an agent failure from stderr/stdout patterns.
+ * Returns { category, severity, reason } or null for unclassifiable exits.
+ */
+function classifyAgentFailure(
+  exitCode: number,
+  signal: string | null,
+  stderr: string,
+  stdout: string,
+): { category: IncidentCategory; severity: IncidentSeverity; reason: string } | null {
+  const combined = (stderr + " " + stdout).toLowerCase();
+
+  // Context overflow — the most important one to track
+  if (
+    combined.includes("context_length_exceeded") ||
+    combined.includes("maximum context length") ||
+    combined.includes("context window") ||
+    combined.includes("token limit exceeded") ||
+    combined.includes("prompt is too long")
+  ) {
+    return { category: "context-overflow", severity: "warning", reason: "context_length_exceeded" };
+  }
+
+  // Rate limiting
+  if (
+    combined.includes("rate_limit") ||
+    combined.includes("429") ||
+    combined.includes("too many requests") ||
+    combined.includes("rate limit")
+  ) {
+    return { category: "rate-limit", severity: "warning", reason: "rate_limited" };
+  }
+
+  // Agent timeout (SIGKILL from our timer)
+  if (signal === "SIGKILL") {
+    return { category: "agent-timeout", severity: "warning", reason: "timeout_killed" };
+  }
+
+  // API errors (overloaded, server errors)
+  if (
+    combined.includes("overloaded") ||
+    combined.includes("503") ||
+    combined.includes("502") ||
+    combined.includes("internal server error")
+  ) {
+    return { category: "agent-error", severity: "warning", reason: "api_error" };
+  }
+
+  // Non-zero exit (generic crash)
+  if (exitCode !== 0) {
+    return { category: "agent-crash", severity: "warning", reason: `exit_code_${exitCode}` };
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Telegram notifications — batched digest
 // ---------------------------------------------------------------------------
 
@@ -104,6 +239,43 @@ function flushDigest(): void {
 // Exported for daemon shutdown to flush any pending digest.
 export function flushNotificationDigest(): void {
   flushDigest();
+}
+
+// ---------------------------------------------------------------------------
+// Informed-target notifications (per-task, not digest)
+// ---------------------------------------------------------------------------
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+
+function notifyInformed(task: Task, event: string, detail?: string): void {
+  const informed = task.metadata["informed"];
+  if (!informed || !Array.isArray(informed) || informed.length === 0) return;
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.warn("[dispatcher] notifyInformed: TELEGRAM_BOT_TOKEN not set, skipping notification");
+    return;
+  }
+
+  const msg = detail
+    ? `${event} T${task.id}: ${task.title.slice(0, 60)}\n${detail}`
+    : `${event} T${task.id}: ${task.title.slice(0, 60)}`;
+
+  for (const target of informed) {
+    const t = String(target).trim();
+    if (!t || !t.startsWith("telegram:")) continue;
+    const parts = t.slice("telegram:".length).split(":");
+    const chatId = parts[parts.length - 1];
+    if (!chatId) continue;
+    fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: msg }),
+    }).then(r => {
+      if (!r.ok) console.warn(`[dispatcher] notifyInformed Telegram ${r.status} for chat=${chatId}`);
+      else console.log(`[dispatcher] notifyInformed sent to chat=${chatId}`);
+    }).catch(err => {
+      console.warn(`[dispatcher] notifyInformed error: ${err.message}`);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +520,7 @@ function applyAutoDetectedStatus(
 
     console.log(`[dispatcher] T${task.id} auto-completed via review verdict detection`);
     pushDigest(config, { emoji: "✅", taskId: task.id, title: task.title.slice(0, 60), detail: "" });
+    notifyInformed(task, "✅ Done");
 
   } else if (detected.status === "pending") {
     // Changes requested: ReviewVerdictSubmitted → ReviewPolicyMet → PhaseTransition
@@ -401,6 +574,7 @@ function applyAutoDetectedStatus(
 
     console.log(`[dispatcher] T${task.id} sent back to execution via review verdict detection`);
     pushDigest(config, { emoji: "📝", taskId: task.id, title: task.title.slice(0, 60), detail: "" });
+    notifyInformed(task, "📝 Changes requested");
   }
 }
 
@@ -485,7 +659,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       leaseTimeout: config.leaseTimeoutMs,
       sessionId,
       sessionType: "fresh",
-      contextBudget: task.contextBudget,
+      contextBudget: task.contextBudget || config.defaultContextBudget,
     };
     const leaseResult = core.submit(lease);
     if (!leaseResult.ok) {
@@ -636,6 +810,51 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       clearTimeout(run.killTimer);
     }
 
+    // Classify and report failure as incident
+    const failure = (exitCode !== 0 || signal)
+      ? classifyAgentFailure(exitCode, signal, stderr, stdout)
+      : null;
+
+    if (failure) {
+      const incCtx: IncidentContext = {
+        taskId: run.taskId,
+        agentId: run.agentId,
+        sessionId: run.sessionId,
+        modelId: "claude-sonnet-4-6",
+        phase: run.phase,
+        elapsedMs: elapsed,
+        exitCode,
+        signal,
+        stdoutBytes: stdout.length,
+        stderrBytes: stderr.length,
+        stderrSnippet: stderr.trim().slice(-1000) || undefined,
+        stdoutSnippet: exitCode !== 0 ? stdout.trim().slice(-500) || undefined : undefined,
+      };
+
+      const task = core.getTask(run.taskId);
+      if (task) {
+        const phase = task.phase;
+        if (phase) {
+          (incCtx as Record<string, unknown>)["attempt"] = task.attempts[phase].used;
+          (incCtx as Record<string, unknown>)["attemptMax"] = task.attempts[phase].max;
+        }
+      }
+
+      appendIncident(
+        config,
+        failure.severity,
+        failure.category,
+        `T${run.taskId} ${run.agentId} ${failure.reason} (exit=${exitCode}, ${Math.round(elapsed / 1000)}s)`,
+        failure.category === "context-overflow"
+          ? `Context overflow in T${run.taskId} (${run.agentId}, phase=${run.phase}). ` +
+            `This indicates the prompt + conversation exceeded the model's context window. ` +
+            `stderr: ${stderr.trim().slice(-500)}`
+          : undefined,
+        incCtx,
+        [run.agentId, run.phase, failure.reason],
+      );
+    }
+
     // Auto-detect status from agent output (review agents may not call the status API)
     const task = core.getTask(run.taskId);
     if (task && !task.terminal && task.condition === "active" && exitCode === 0) {
@@ -722,8 +941,28 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
         const taskAfterRetry = core.getTask(run.taskId);
         if (taskAfterRetry?.terminal === "failed") {
           notifyUrgent(config, `❌ T${run.taskId} FAILED\n${taskAfterRetry.title.slice(0, 60)}`);
+          notifyInformed(taskAfterRetry, "❌ Failed");
+          appendIncident(
+            config,
+            "error",
+            "retry-exhausted",
+            `T${run.taskId} ${run.agentId} failed (retries exhausted)`,
+            `Task "${taskAfterRetry.title}" exhausted all retry attempts. Last failure: ${failure?.reason ?? "unknown"}.`,
+            { taskId: run.taskId, agentId: run.agentId, phase: run.phase },
+            [run.agentId, "terminal-failure"],
+          );
         } else if (taskAfterRetry?.condition === "exhausted") {
           notifyUrgent(config, `⏸ T${run.taskId} EXHAUSTED\n${taskAfterRetry.title.slice(0, 60)}`);
+          notifyInformed(taskAfterRetry, "⏸ Exhausted");
+          appendIncident(
+            config,
+            "warning",
+            "retry-exhausted",
+            `T${run.taskId} ${run.agentId} exhausted (budget depleted)`,
+            `Task "${taskAfterRetry.title}" ran out of budget. Needs manual budget increase via POST /tasks/${run.taskId}/budget.`,
+            { taskId: run.taskId, agentId: run.agentId, phase: run.phase },
+            [run.agentId, "exhausted"],
+          );
         }
       }
     }

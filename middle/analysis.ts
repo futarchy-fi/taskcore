@@ -55,7 +55,7 @@ export function autoAnalysis(core: Core, task: Task, config: Config): boolean {
     leaseTimeout: 60_000, // 1 minute (virtual, will complete instantly)
     sessionId,
     sessionType: "fresh",
-    contextBudget: task.contextBudget,
+    contextBudget: task.contextBudget || config.defaultContextBudget,
   };
   const leaseResult = core.submit(lease);
   if (!leaseResult.ok) {
