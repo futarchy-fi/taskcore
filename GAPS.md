@@ -94,11 +94,11 @@ only when `lastAgentExitAt` is set. But if the daemon restarts, in-memory
 `activeRuns` is lost and `AgentExited` events are never submitted — so
 `lastAgentExitAt` stays null and the reaper never fires.
 
-There is no startup reconciliation: the daemon doesn't scan for `condition:
-active` tasks with no live process on boot.
+**Fixed 2026-03-03**: Startup reconciliation now detects orphaned active/leased
+tasks and submits `RetryScheduled` events with reason `"orphaned_on_restart"`.
 
 - clock.ts:108-127 (reaper conditions)
-- daemon.ts:94-105 (tick loop, no startup scan)
+- daemon.ts `reconcileOrphanedTasks()` (the fix)
 - dispatcher.ts:586 (activeRuns map, in-memory only)
 
 ### Status nudge — untested
@@ -126,6 +126,25 @@ from a previous attempt, not the latest execution.
 ---
 
 ## Data Exports
+
+### Event persistence — restart race condition (FIXED)
+
+`systemctl restart` could start a new daemon while the old one was still in its
+shutdown handler, causing two processes to race on the same SQLite DB. This
+corrupted WAL state and caused event loss (1604 events lost in production, 76
+completed tasks regressed to earlier states).
+
+**Fixed 2026-03-03**:
+- persistence.ts: explicit `PRAGMA wal_checkpoint(TRUNCATE)` before `db.close()`
+- index.ts: guard against saving empty snapshots over populated ones
+- systemd unit: `TimeoutStopSec=30` + `RestartSec=5` to prevent race
+
+Remaining risk: a truly unclean shutdown (SIGKILL, OOM kill) can still lose
+events that are in the WAL but not yet checkpointed to the main DB. Periodic
+background checkpointing would mitigate this.
+
+- persistence.ts:141-148 (close with WAL checkpoint)
+- index.ts:265-280 (snapshot guard)
 
 ### `writeRuntimeFile` / `appendLifecycle` — write-only
 
