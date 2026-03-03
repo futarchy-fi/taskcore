@@ -292,7 +292,7 @@ export interface DependencySatisfied extends BaseEvent {
 export interface RetryScheduled extends BaseEvent {
   type: "RetryScheduled";
   fenceToken: number;
-  reason: "agent_crashed" | "agent_timeout" | "lease_expired" | "no_progress" | "agent_exit_followup_timeout";
+  reason: "agent_crashed" | "agent_timeout" | "lease_expired" | "no_progress" | "agent_exit_followup_timeout" | "orphaned_on_restart";
   retryAfter: Timestamp;
   phase: Phase;
   attemptNumber: number;

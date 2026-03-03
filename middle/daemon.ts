@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { OrchestrationCore } from "../core/index.js";
+import type { RetryScheduled } from "../core/types.js";
 import { loadConfig } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { createDispatcher, flushNotificationDigest } from "./dispatcher.js";
@@ -50,6 +51,51 @@ function releaseLock(lockPath: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Startup reconciliation
+// ---------------------------------------------------------------------------
+
+/**
+ * On daemon restart, the in-memory activeRuns map is lost. Tasks that were
+ * "active" when the previous daemon died will stay active forever because
+ * AgentExited was never submitted (so lastAgentExitAt is null and the clock
+ * reaper can't fire). This function detects those orphans and moves them to
+ * retryWait so they can be re-dispatched.
+ */
+function reconcileOrphanedTasks(core: OrchestrationCore): void {
+  const state = core.getState();
+  const now = Date.now();
+  let reconciled = 0;
+
+  for (const task of Object.values(state.tasks)) {
+    if (task.terminal !== null) continue;
+    if (task.condition !== "active" && task.condition !== "leased") continue;
+    if (task.phase === null) continue;
+
+    const event: RetryScheduled = {
+      type: "RetryScheduled",
+      taskId: task.id,
+      ts: now,
+      fenceToken: task.currentFenceToken,
+      reason: "orphaned_on_restart",
+      retryAfter: now + 1_000,
+      phase: task.phase,
+      attemptNumber: Math.max(1, task.attempts[task.phase].used),
+    };
+
+    const result = core.submit(event);
+    if (result.ok) {
+      reconciled++;
+    } else {
+      console.warn(`[daemon] Could not reconcile T${task.id}: ${result.error.message}`);
+    }
+  }
+
+  if (reconciled > 0) {
+    console.log(`[daemon] Reconciled ${reconciled} orphaned task(s) from previous run`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -77,6 +123,9 @@ async function main(): Promise<void> {
     snapshotEvery: 50,
   });
   console.log(`[daemon] Core initialized. Tasks: ${Object.keys(core.getState().tasks).length}`);
+
+  // Reconcile orphaned active tasks from previous daemon lifetime
+  reconcileOrphanedTasks(core);
 
   // Create dispatcher
   const dispatcher = createDispatcher(core, config);
