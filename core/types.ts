@@ -432,6 +432,13 @@ export interface TaskReparented extends BaseEvent {
   source: EventSource;
 }
 
+export interface MetadataUpdated extends BaseEvent {
+  type: "MetadataUpdated";
+  patch: Record<string, unknown>;
+  reason: string;
+  source: EventSource;
+}
+
 export type Event =
   | TaskCreated
   | LeaseGranted
@@ -458,7 +465,8 @@ export type Event =
   | TaskBlocked
   | TaskCanceled
   | TaskRevived
-  | TaskReparented;
+  | TaskReparented
+  | MetadataUpdated;
 
 export type EventType = Event["type"];
 

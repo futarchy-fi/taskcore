@@ -10,7 +10,7 @@ import {
   type RetryScheduled,
   type SystemState,
   type Task,
-  type TaskFailed,
+  type TaskExhausted,
 } from "./types.js";
 
 const AGENT_EXIT_FOLLOWUP_TIMEOUT = 60_000;
@@ -70,45 +70,37 @@ export class CoreClock {
         continue;
       }
 
+      if (task.condition === "exhausted") {
+        continue;
+      }
+
       const retryDue = backoffDue(task, now);
 
       if ((task.condition === "ready" || retryDue) && computeCostRemaining(task.cost) <= 0) {
-        const failEvent: TaskFailed = {
-          type: "TaskFailed",
+        const exhaustEvent: TaskExhausted = {
+          type: "TaskExhausted",
           taskId: task.id,
           ts: now,
           reason: "cost_exhausted",
           phase: task.phase,
-          summary: {
-            childId: null,
-            approach: "cost budget exhausted",
-            whatFailed: "Task tree cost budget fully consumed",
-            whatWasLearned: "No remaining cost budget for further execution",
-            artifactRef: task.stateRef,
-          },
+          source: { type: "core", id: this.sourceId },
         };
-        due.push(failEvent);
+        due.push(exhaustEvent);
         continue;
       }
 
       if (task.condition === "ready" || retryDue) {
         const attempt = task.attempts[task.phase];
         if (attempt.used >= attempt.max) {
-          const failEvent: TaskFailed = {
-            type: "TaskFailed",
+          const exhaustEvent: TaskExhausted = {
+            type: "TaskExhausted",
             taskId: task.id,
             ts: now,
             reason: "budget_exhausted",
             phase: task.phase,
-            summary: {
-              childId: null,
-              approach: `${task.phase} attempt budget exhausted`,
-              whatFailed: `Reached max attempts (${attempt.max}) for ${task.phase} phase`,
-              whatWasLearned: "All retry attempts consumed without success",
-              artifactRef: task.stateRef,
-            },
+            source: { type: "core", id: this.sourceId },
           };
-          due.push(failEvent);
+          due.push(exhaustEvent);
           continue;
         }
       }
