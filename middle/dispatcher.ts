@@ -854,10 +854,8 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
 
     if (phase === "review") {
       agent = reviewer ?? null;
-    } else if (phase === "analysis") {
-      agent = assignee ?? "analyst";
-    } else if (phase === "decomposition") {
-      agent = assignee ?? "analyst";
+    } else if (phase === "analysis" || phase === "decomposition") {
+      agent = "analyst";
     } else {
       agent = assignee ?? null;
     }
