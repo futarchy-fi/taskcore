@@ -171,24 +171,6 @@ function classifyAgentFailure(
 }
 
 // ---------------------------------------------------------------------------
-// Agent spawn wrapper — run agents as a different OS user if configured
-// ---------------------------------------------------------------------------
-
-function spawnAgent(
-  config: Config,
-  command: string,
-  args: string[],
-  options: Parameters<typeof spawn>[2],
-): ChildProcess {
-  if (config.agentRunAsUser) {
-    // Wrap with sudo to run as the configured user
-    const sudoArgs = ["-n", "-u", config.agentRunAsUser, "-E", command, ...args];
-    return spawn("sudo", sudoArgs, options);
-  }
-  return spawn(command, args, options);
-}
-
-// ---------------------------------------------------------------------------
 // Telegram notifications — batched digest
 // ---------------------------------------------------------------------------
 
@@ -745,11 +727,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       return;
     }
 
-    // 3. Build prompt
-    const runPhase = phase === "review" ? "review" : "work";
-    const prompt = buildPrompt(core, task.id, runPhase, config);
-
-    // 4. Set up worktrees (journal + optional code)
+    // 3. Set up worktrees (journal + optional code)
     let journalWorktreePath: string | undefined;
     let codeWorktreePath: string | undefined;
 
@@ -779,6 +757,13 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       console.warn(`[dispatcher] T${task.id} worktree setup failed (non-fatal):`, err);
     }
 
+    // 4. Build prompt (after worktree setup so paths are real)
+    const runPhase = phase === "review" ? "review" : "work";
+    const prompt = buildPrompt(core, task.id, runPhase, config, {
+      journalWorktreePath: journalWorktreePath ?? null,
+      codeWorktreePath: codeWorktreePath ?? null,
+    });
+
     // 5. Spawn agent process
     // Prepend "/new " to force a fresh session for each dispatch.
     // Without this, openclaw routes all dispatches to the same agent:coder-lite:main
@@ -806,7 +791,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       spawnEnv["CODE_WORKTREE"] = codeWorktreePath;
     }
 
-    const child = spawnAgent(config, config.agentCommand, args, {
+    const child = spawn(config.agentCommand, args, {
       cwd: config.workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
       env: spawnEnv,
@@ -1162,7 +1147,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
 
     console.log(`[dispatcher] T${task.id} sending status nudge to session ${originalRun.sessionId.slice(0, 8)}`);
 
-    const child = spawnAgent(config, config.agentCommand, args, {
+    const child = spawn(config.agentCommand, args, {
       cwd: config.workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
       env: {

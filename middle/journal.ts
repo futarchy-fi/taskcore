@@ -11,7 +11,7 @@ import type { StateRef } from "../core/types.js";
  * Initialize the journal git repo. Idempotent — no-op if already initialized.
  */
 export function initJournalRepo(repoPath: string): void {
-  fs.mkdirSync(repoPath, { recursive: true });
+  ensureDir(repoPath);
 
   const gitDir = path.join(repoPath, ".git");
   if (fs.existsSync(gitDir)) return;
@@ -21,7 +21,7 @@ export function initJournalRepo(repoPath: string): void {
   git(repoPath, ["config", "user.name", "taskcore"]);
 
   const readme = path.join(repoPath, "README.md");
-  fs.writeFileSync(readme, "# Taskcore Journal\n\nOne branch per task.\n");
+  writeFile(readme, "# Taskcore Journal\n\nOne branch per task.\n");
   git(repoPath, ["add", "README.md"]);
   git(repoPath, ["commit", "-m", "init journal repo"]);
 }
@@ -51,8 +51,8 @@ export function createTaskBranch(
   git(repoPath, ["checkout", "-b", branch, base]);
 
   const taskDir = path.join(repoPath, "tasks", `T${taskId}`);
-  fs.mkdirSync(taskDir, { recursive: true });
-  fs.writeFileSync(path.join(taskDir, "journal.md"), `# T${taskId} Journal\n`);
+  ensureDir(taskDir);
+  writeFile(path.join(taskDir, "journal.md"), `# T${taskId} Journal\n`);
   git(repoPath, ["add", "."]);
   git(repoPath, ["commit", "-m", `T${taskId}: init journal`]);
 
@@ -85,7 +85,7 @@ export function writeFailureSummary(
   summary: { whatFailed: string; whatWasLearned: string },
 ): void {
   const taskDir = path.join(worktreePath, "tasks", `T${taskId}`);
-  fs.mkdirSync(taskDir, { recursive: true });
+  ensureDir(taskDir);
 
   const content = [
     `# Failure Summary — T${taskId}`,
@@ -100,7 +100,7 @@ export function writeFailureSummary(
     "",
   ].join("\n");
 
-  fs.writeFileSync(path.join(taskDir, "failure-summary.md"), content);
+  writeFile(path.join(taskDir, "failure-summary.md"), content);
   git(worktreePath, ["add", "."]);
   git(worktreePath, ["commit", "-m", `T${taskId}: failure summary`]);
 }
@@ -249,6 +249,7 @@ function branchExists(repoPath: string, branch: string): boolean {
   }
 }
 
+/** Run a git command. */
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, {
     cwd,
@@ -259,4 +260,14 @@ function git(cwd: string, args: string[]): string {
       GIT_TERMINAL_PROMPT: "0",
     },
   });
+}
+
+/** mkdir -p */
+function ensureDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+/** Write a file. */
+function writeFile(filePath: string, content: string): void {
+  fs.writeFileSync(filePath, content);
 }
