@@ -79,7 +79,7 @@ const TOOLS = [
         task: { type: "string", description: "Detailed task description" },
         assignee: {
           type: "string",
-          description: "Agent to assign (coder, analyst, coder-lite, orchestrator, etc.)",
+          description: "Agent to assign (coder, analyst, coder-lite, overseer, etc.)",
         },
         priority: {
           type: "string",
@@ -91,6 +91,12 @@ const TOOLS = [
         parentTaskId: {
           type: "string",
           description: "Optional parent task ID",
+        },
+        dependsOn: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional task IDs that this task depends on. The new task will start in 'waiting' condition until all dependencies complete.",
         },
       },
       required: ["title", "task"],
@@ -118,6 +124,31 @@ const TOOLS = [
     },
   },
   {
+    name: "update_metadata",
+    description: "Update metadata on an existing task (priority, assignee, reviewer, etc.)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID to update" },
+        priority: {
+          type: "string",
+          enum: ["backlog", "low", "medium", "high", "critical"],
+          description: "New priority level",
+        },
+        assignee: { type: "string", description: "New agent assignee" },
+        reviewer: { type: "string", description: "New reviewer" },
+        consulted: { type: "string", description: "New consulted agent" },
+        informed: {
+          type: "array",
+          items: { type: "string" },
+          description: "New notification targets",
+        },
+        reason: { type: "string", description: "Reason for the change" },
+      },
+      required: ["taskId"],
+    },
+  },
+  {
     name: "report_incident",
     description: "Report an incident (error, timeout, unexpected behavior, etc.)",
     inputSchema: {
@@ -142,7 +173,7 @@ const TOOLS = [
 // ---------------------------------------------------------------------------
 
 async function handleDelegate(args: Record<string, unknown>): Promise<unknown> {
-  const body = {
+  const body: Record<string, unknown> = {
     title: args["title"] as string,
     description: args["task"] as string,
     assignee: args["assignee"] ?? null,
@@ -151,6 +182,10 @@ async function handleDelegate(args: Record<string, unknown>): Promise<unknown> {
     priority: args["priority"] ?? "medium",
     parentId: args["parentTaskId"] ? String(args["parentTaskId"]) : null,
   };
+
+  if (args["dependsOn"]) {
+    body["dependsOn"] = args["dependsOn"];
+  }
 
   const res = await httpRequest("POST", "/tasks", body);
   return res.body;
@@ -169,6 +204,30 @@ async function handleUpdateStatus(args: Record<string, unknown>): Promise<unknow
   };
 
   const res = await httpRequest("POST", `/tasks/${taskId}/status`, body);
+  return res.body;
+}
+
+async function handleUpdateMetadata(args: Record<string, unknown>): Promise<unknown> {
+  const taskId = args["taskId"] as string;
+  if (!taskId) {
+    return { error: "no_task_id", message: "taskId is required" };
+  }
+
+  const body: Record<string, unknown> = {};
+  for (const key of ["priority", "assignee", "reviewer", "consulted", "informed"]) {
+    if (args[key] !== undefined) {
+      body[key] = args[key];
+    }
+  }
+  if (args["reason"]) {
+    body["reason"] = args["reason"];
+  }
+
+  if (Object.keys(body).filter((k) => k !== "reason").length === 0) {
+    return { error: "empty_patch", message: "No metadata fields to update" };
+  }
+
+  const res = await httpRequest("PATCH", `/tasks/${taskId}/metadata`, body);
   return res.body;
 }
 
@@ -261,6 +320,9 @@ async function handleMessage(msg: JsonRpcRequest): Promise<void> {
             break;
           case "update_status":
             result = await handleUpdateStatus(args);
+            break;
+          case "update_metadata":
+            result = await handleUpdateMetadata(args);
             break;
           case "report_incident":
             result = await handleReportIncident(args);
