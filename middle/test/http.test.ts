@@ -110,7 +110,7 @@ describe("HTTP API", () => {
       title: "Test task",
       description: "A test description",
       assignee: "coder",
-      reviewer: "hermes",
+      reviewer: "overseer",
       priority: "high",
     });
     assert.equal(res.status, 201);
@@ -135,6 +135,39 @@ describe("HTTP API", () => {
 
   test("GET /tasks/:id returns 404 for missing task", async () => {
     const res = await request("GET", "/tasks/999");
+    assert.equal(res.status, 404);
+  });
+
+  test("GET /tasks/:id/events returns events for existing task", async () => {
+    await request("POST", "/tasks", {
+      title: "Events task",
+      description: "Task with events",
+      assignee: "coder",
+    });
+
+    const leaseRes = await request("POST", "/tasks/1/events", {
+      type: "LeaseGranted",
+      taskId: "1",
+      ts: Date.now(),
+      fenceToken: 1,
+      agentId: "coder",
+      phase: "analysis",
+      leaseTimeout: 600000,
+      sessionId: "session-1",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    assert.equal(leaseRes.status, 200);
+
+    const res = await request("GET", "/tasks/1/events");
+    assert.equal(res.status, 200);
+    const body = res.body as { events: Array<{ type: string }> };
+    assert.ok(body.events.length >= 2);
+    assert.equal(body.events[0]?.type, "TaskCreated");
+  });
+
+  test("GET /tasks/:id/events returns 404 for missing task", async () => {
+    const res = await request("GET", "/tasks/999/events");
     assert.equal(res.status, 404);
   });
 
@@ -171,13 +204,119 @@ describe("HTTP API", () => {
     assert.equal(res.status, 404);
   });
 
+  test("PATCH /tasks/:id/metadata updates priority", async () => {
+    await request("POST", "/tasks", {
+      title: "Metadata test",
+      description: "Test metadata update",
+      assignee: "coder",
+      priority: "low",
+    });
+
+    const res = await request("PATCH", "/tasks/1/metadata", {
+      priority: "critical",
+      reason: "Urgent reprioritization",
+    });
+    assert.equal(res.status, 200);
+    const body = res.body as { ok: boolean; metadata: Record<string, unknown> };
+    assert.equal(body.ok, true);
+    assert.equal(body.metadata["priority"], "critical");
+    assert.equal(body.metadata["assignee"], "coder"); // unchanged
+  });
+
+  test("PATCH /tasks/:id/metadata updates assignee", async () => {
+    await request("POST", "/tasks", {
+      title: "Reassign test",
+      description: "Test assignee change",
+      assignee: "coder",
+    });
+
+    const res = await request("PATCH", "/tasks/1/metadata", {
+      assignee: "analyst",
+      reason: "Reassigned to analyst",
+    });
+    assert.equal(res.status, 200);
+    const body = res.body as { ok: boolean; metadata: Record<string, unknown> };
+    assert.equal(body.metadata["assignee"], "analyst");
+  });
+
+  test("PATCH /tasks/:id/metadata rejects invalid priority", async () => {
+    await request("POST", "/tasks", {
+      title: "Bad priority test",
+      description: "Invalid priority value",
+    });
+
+    const res = await request("PATCH", "/tasks/1/metadata", {
+      priority: "super-urgent",
+    });
+    assert.equal(res.status, 422);
+  });
+
+  test("PATCH /tasks/:id/metadata returns 404 for missing task", async () => {
+    const res = await request("PATCH", "/tasks/999/metadata", {
+      priority: "high",
+    });
+    assert.equal(res.status, 404);
+  });
+
+  test("POST /tasks rejects unknown assignee", async () => {
+    const res = await request("POST", "/tasks", {
+      title: "Bad assignee test",
+      description: "Unknown agent",
+      assignee: "nonexistent-agent",
+    });
+    assert.equal(res.status, 422);
+    const body = res.body as { error: string; message: string };
+    assert.equal(body.error, "invalid_role");
+    assert.ok(body.message.includes("nonexistent-agent"));
+  });
+
+  test("PATCH /tasks/:id/metadata rejects unknown assignee", async () => {
+    await request("POST", "/tasks", {
+      title: "Valid task",
+      description: "Will try to update with bad assignee",
+    });
+
+    const res = await request("PATCH", "/tasks/1/metadata", {
+      assignee: "ghost-agent",
+    });
+    assert.equal(res.status, 422);
+    const body = res.body as { error: string };
+    assert.equal(body.error, "invalid_role");
+  });
+
+  test("PATCH /tasks/:id/metadata allows null assignee (remove)", async () => {
+    await request("POST", "/tasks", {
+      title: "Null assignee test",
+      description: "Should allow null to remove",
+      assignee: "coder",
+    });
+
+    const res = await request("PATCH", "/tasks/1/metadata", {
+      assignee: null,
+      reason: "Unassign",
+    });
+    assert.equal(res.status, 200);
+  });
+
+  test("PATCH /tasks/:id/metadata rejects empty patch", async () => {
+    await request("POST", "/tasks", {
+      title: "Empty patch test",
+      description: "No fields to update",
+    });
+
+    const res = await request("PATCH", "/tasks/1/metadata", {
+      reason: "Just a reason, no changes",
+    });
+    assert.equal(res.status, 400);
+  });
+
   test("full lifecycle: create → auto-analysis → dispatch → review → done", async () => {
     // Create task
     const createRes = await request("POST", "/tasks", {
       title: "Lifecycle test",
       description: "Full lifecycle",
       assignee: "coder",
-      reviewer: "hermes",
+      reviewer: "overseer",
       skipAnalysis: true,
     });
     assert.equal(createRes.status, 201);

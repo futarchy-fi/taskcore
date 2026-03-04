@@ -4,8 +4,10 @@ import type {
   AgentContext,
   AttemptBudgetMaxInput,
   BudgetIncreased,
+  Dependency,
   Event,
   FailureSummary,
+  MetadataUpdated,
   ReviewPolicyMet,
   ReviewVerdictSubmitted,
   PhaseTransition,
@@ -22,6 +24,7 @@ import type {
 } from "../core/types.js";
 import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
 import type { Config } from "./config.js";
+import { loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,6 +69,7 @@ interface TaskCreateBody {
   informed?: string | string[];
   skipAnalysis?: boolean;
   costBudget?: number;
+  dependsOn?: string | string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +142,7 @@ function defaultStateRef(): StateRef {
 // Route table builder
 // ---------------------------------------------------------------------------
 
-type Method = "GET" | "POST";
+type Method = "GET" | "POST" | "PATCH";
 
 interface RouteDef {
   method: Method;
@@ -206,7 +210,8 @@ export function createHttpServer(
   core: Core,
   config: Config,
 ): http.Server {
-  const routes = buildRoutes(core, config);
+  const registry = loadRegistry(config.agentRegistry);
+  const routes = buildRoutes(core, config, registry);
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
@@ -214,7 +219,7 @@ export function createHttpServer(
 
     // CORS (for local dev)
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
     if (method === "OPTIONS") {
@@ -231,7 +236,7 @@ export function createHttpServer(
     }
 
     try {
-      const body = method === "POST" ? await parseBody(req) : {};
+      const body = (method === "POST" || method === "PATCH") ? await parseBody(req) : {};
       const result = await match.handler(req, match.params, body);
       res.writeHead(result.status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -249,19 +254,20 @@ export function createHttpServer(
 // Routes
 // ---------------------------------------------------------------------------
 
-function buildRoutes(core: Core, config: Config): RouteDef[] {
+function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[] {
   return [
     { method: "GET", pattern: "/health", handler: handleHealth(core) },
     { method: "GET", pattern: "/tasks", handler: handleListTasks(core) },
     { method: "GET", pattern: "/tasks/:id", handler: handleGetTask(core) },
     { method: "GET", pattern: "/tasks/:id/events", handler: handleGetTaskEvents(core) },
     { method: "GET", pattern: "/dispatchable", handler: handleDispatchable(core) },
-    { method: "POST", pattern: "/tasks", handler: handleCreateTask(core, config) },
+    { method: "POST", pattern: "/tasks", handler: handleCreateTask(core, config, registry) },
     { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
     { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core) },
     { method: "POST", pattern: "/tasks/:id/reparent", handler: handleReparent(core) },
     { method: "POST", pattern: "/tasks/:id/revive", handler: handleRevive(core) },
     { method: "POST", pattern: "/tasks/:id/budget", handler: handleBudgetIncrease(core) },
+    { method: "PATCH", pattern: "/tasks/:id/metadata", handler: handleMetadataUpdate(core, registry) },
     { method: "GET", pattern: "/attention", handler: handleAttention(core) },
     { method: "GET", pattern: "/attention/telegram", handler: handleAttentionTelegram(core) },
   ];
@@ -388,11 +394,22 @@ function handleDispatchable(
 function handleCreateTask(
   core: Core,
   config: Config,
+  registry: Registry,
 ): RouteDef["handler"] {
   return async (_req, _params, body) => {
     const b = body as TaskCreateBody;
     if (!b.title || !b.description) {
       return { status: 400, body: { error: "missing_fields", message: "title and description required" } };
+    }
+
+    // Validate role fields against registry
+    const roleErr = validateMetadataRoles(registry, {
+      assignee: b.assignee ?? null,
+      reviewer: b.reviewer ?? null,
+      consulted: b.consulted ?? null,
+    });
+    if (roleErr) {
+      return { status: 422, body: { error: "invalid_role", message: roleErr } };
     }
 
     const taskId = nextTaskId(core);
@@ -416,6 +433,29 @@ function handleCreateTask(
       reviewer = config.disallowedAgentFallback;
     }
 
+    // Build dependencies from dependsOn
+    const depIds = b.dependsOn
+      ? (Array.isArray(b.dependsOn) ? b.dependsOn : [b.dependsOn])
+      : [];
+
+    const dependencies: Dependency[] = [];
+    for (const depId of depIds) {
+      const depTask = core.getTask(String(depId));
+      if (!depTask) {
+        return { status: 422, body: { error: "invalid_dependency", message: `Dependency target task ${depId} not found` } };
+      }
+      dependencies.push({
+        id: `dep-${taskId}-on-${depId}`,
+        type: "task",
+        target: String(depId),
+        blocking: true,
+        timing: "before_start",
+        status: depTask.terminal === "done" ? "fulfilled" : "pending",
+      });
+    }
+
+    const hasPendingDeps = dependencies.some((d) => d.status === "pending");
+
     const event: TaskCreated = {
       type: "TaskCreated",
       taskId,
@@ -425,10 +465,10 @@ function handleCreateTask(
       parentId,
       rootId,
       initialPhase: "analysis",
-      initialCondition: "ready",
+      initialCondition: hasPendingDeps ? "waiting" : "ready",
       attemptBudgets: config.defaultAttemptBudgets,
       costBudget: b.costBudget ?? config.defaultCostBudget,
-      dependencies: [],
+      dependencies,
       reviewConfig: reviewer
         ? { required: true, attemptBudget: 3, isolationRules: [] }
         : null,
@@ -456,6 +496,8 @@ function handleCreateTask(
         assignee,
         priority: b.priority ?? "medium",
         parentId,
+        dependsOn: depIds.length > 0 ? depIds : undefined,
+        condition: hasPendingDeps ? "waiting" : "ready",
         message: `Task ${taskId} created: ${b.title}`,
       },
     };
@@ -666,6 +708,66 @@ function handleBudgetIncrease(
   };
 }
 
+// PATCH /tasks/:id/metadata — update task metadata (priority, assignee, etc.)
+function handleMetadataUpdate(
+  core: Core,
+  registry: Registry,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as Record<string, unknown>;
+
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    // Validate role fields against registry
+    const roleErr = validateMetadataRoles(registry, b);
+    if (roleErr) {
+      return { status: 422, body: { error: "invalid_role", message: roleErr } };
+    }
+
+    // Extract reason (defaults to "metadata update via API"), everything else is the patch
+    const reason = typeof b["reason"] === "string" && b["reason"].trim()
+      ? b["reason"] as string
+      : "metadata update via API";
+
+    const patch: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(b)) {
+      if (key === "reason") continue;
+      patch[key] = value;
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return { status: 400, body: { error: "empty_patch", message: "No metadata fields to update (provide fields other than reason)" } };
+    }
+
+    const event: MetadataUpdated = {
+      type: "MetadataUpdated",
+      taskId,
+      ts: Date.now(),
+      patch,
+      reason,
+      source: { type: "middle", id: "daemon" },
+    };
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    const updated = core.getTask(taskId);
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        metadata: updated?.metadata ?? null,
+        message: `Metadata updated for T${taskId}`,
+      },
+    };
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Status transition implementations
 // ---------------------------------------------------------------------------
@@ -726,6 +828,29 @@ function applyReviewTransition(
 }
 
 /** done: review.active → completed (via ReviewVerdict + ReviewPolicyMet + TaskCompleted) */
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+
+function notifyInformed(task: Task, event: string, detail?: string): void {
+  const informed = task.metadata["informed"];
+  if (!informed || !Array.isArray(informed) || informed.length === 0) return;
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const msg = detail
+    ? `${event} T${task.id}: ${task.title.slice(0, 60)}\n${detail}`
+    : `${event} T${task.id}: ${task.title.slice(0, 60)}`;
+  for (const target of informed) {
+    const t = String(target).trim();
+    if (!t || !t.startsWith("telegram:")) continue;
+    const parts = t.slice("telegram:".length).split(":");
+    const chatId = parts[parts.length - 1];
+    if (!chatId) continue;
+    fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: msg }),
+    }).catch(() => {});
+  }
+}
+
 function applyDoneTransition(
   core: Core,
   task: Task,
@@ -784,6 +909,8 @@ function applyDoneTransition(
   err = submitOrError(core, completed);
   if (err) return err;
 
+  notifyInformed(task, "✅ Done");
+
   return {
     status: 200,
     body: { ok: true, taskId: task.id, transition: "review.active → done" },
@@ -801,7 +928,7 @@ function applyBlockedTransition(
     childId: null,
     approach: task.phase ?? "unknown",
     whatFailed: blocker,
-    whatWasLearned: "",
+    whatWasLearned: "Agent reported blocked — awaiting resolution.",
     artifactRef: null,
   };
 
@@ -817,6 +944,8 @@ function applyBlockedTransition(
 
   const err = submitOrError(core, blocked);
   if (err) return err;
+
+  notifyInformed(task, "🚫 Blocked", blocker);
 
   return {
     status: 200,
