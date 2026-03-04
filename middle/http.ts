@@ -1486,9 +1486,11 @@ function handleDecomposeCommit(
         }
       }
 
+      const parentPriority = (task.metadata["priority"] as string | undefined) ?? "medium";
       const metadata: Record<string, unknown> = {};
       if (child.assignee) metadata["assignee"] = child.assignee;
       if (child.reviewer) metadata["reviewer"] = child.reviewer;
+      metadata["priority"] = parentPriority;
 
       childSpecs.push({
         taskId: childId,
@@ -1703,9 +1705,11 @@ function handleDecompose(
         }
       }
 
+      const parentPriority = (task.metadata["priority"] as string | undefined) ?? "medium";
       const metadata: Record<string, unknown> = {};
       if (child.assignee) metadata["assignee"] = child.assignee;
       if (child.reviewer) metadata["reviewer"] = child.reviewer;
+      metadata["priority"] = parentPriority;
 
       childSpecs.push({
         taskId: childId,

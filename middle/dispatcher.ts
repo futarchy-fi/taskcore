@@ -344,6 +344,18 @@ function taskPriority(task: Task): number {
   return PRIORITY_ORDER[p ?? "medium"] ?? 2;
 }
 
+function taskDepth(task: Task, core: Core): number {
+  let depth = 0;
+  let id = task.parentId;
+  while (id) {
+    depth++;
+    const parent = core.getTask(id);
+    if (!parent) break;
+    id = parent.parentId;
+  }
+  return depth;
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -641,6 +653,14 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
         const pa = taskPriority(a);
         const pb = taskPriority(b);
         if (pa !== pb) return pa - pb;
+        // Same priority: prefer review phase (finish work before starting new)
+        const ra = a.phase === "review" ? 0 : 1;
+        const rb = b.phase === "review" ? 0 : 1;
+        if (ra !== rb) return ra - rb;
+        // Then prefer deeper tasks (DFS-like)
+        const da = taskDepth(a, core);
+        const db = taskDepth(b, core);
+        if (da !== db) return db - da;
         return a.createdAt - b.createdAt;
       });
 
