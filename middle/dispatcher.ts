@@ -19,6 +19,21 @@ import type {
 import type { Config } from "./config.js";
 import { autoAnalysis } from "./analysis.js";
 import { buildPrompt } from "./prompt.js";
+import { loadRegistry as loadRegistryShared } from "./registry.js";
+import {
+  createTaskBranch,
+  commitJournal,
+  writeFailureSummary as writeJournalFailureSummary,
+  mergeTaskBranch,
+  getBranchRef,
+  taskBranch,
+} from "./journal.js";
+import {
+  createWorktree,
+  removeWorktree,
+  discardUncommitted,
+  getWorktreePath,
+} from "./worktree.js";
 
 // ---------------------------------------------------------------------------
 // Incident reporting — writes to data/incidents/YYYY-MM-DD.jsonl
@@ -292,6 +307,10 @@ interface ActiveRun {
   startedAt: number;
   killTimer: ReturnType<typeof setTimeout> | null;
   nudged?: boolean;
+  /** Journal worktree path (if created) */
+  journalWorktree?: string | undefined;
+  /** Code worktree path (if created) */
+  codeWorktree?: string | undefined;
 }
 
 interface AgentRegistryEntry {
@@ -505,7 +524,8 @@ function applyAutoDetectedStatus(
       return;
     }
 
-    const stateRef: StateRef = { branch: "main", commit: "0000000", parentCommit: "0000000" };
+    const stateRef: StateRef = getBranchRef(config.journalRepoPath, taskBranch(task.id))
+      ?? { branch: "main", commit: "0000000", parentCommit: "0000000" };
     const completed: TaskCompleted = {
       type: "TaskCompleted",
       taskId: task.id,
@@ -519,6 +539,15 @@ function applyAutoDetectedStatus(
     }
 
     console.log(`[dispatcher] T${task.id} auto-completed via review verdict detection`);
+
+    // Merge journal branch on completion
+    try {
+      const parentId = (task.metadata["parentId"] as string) ?? null;
+      mergeTaskBranch(config.journalRepoPath, task.id, parentId);
+    } catch (err) {
+      console.warn(`[dispatcher] T${task.id} journal merge failed (non-fatal):`, err);
+    }
+
     pushDigest(config, { emoji: "✅", taskId: task.id, title: task.title.slice(0, 60), detail: "" });
     notifyInformed(task, "✅ Done");
 
@@ -584,6 +613,14 @@ function applyAutoDetectedStatus(
 
 export function createDispatcher(core: Core, config: Config): Dispatcher {
   const activeRuns = new Map<string, ActiveRun>();
+  const registry = loadRegistryShared(config.agentRegistry);
+
+  function isHumanAssigned(task: Task, phase: string): boolean {
+    const assignee = task.metadata["assignee"] as string | undefined;
+    const reviewer = task.metadata["reviewer"] as string | undefined;
+    const target = phase === "review" ? reviewer : assignee;
+    return target != null && registry.memberIds.has(target);
+  }
 
   function runOnce(): void {
     const dispatchable = core.getDispatchable();
@@ -594,6 +631,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       .filter((t) => {
         const p = taskPriority(t);
         if (p >= 4) return false; // skip backlog
+        if (t.phase && isHumanAssigned(t, t.phase)) return false; // skip human-assigned
         return true;
       })
       .sort((a, b) => {
@@ -693,7 +731,37 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     const runPhase = phase === "review" ? "review" : "work";
     const prompt = buildPrompt(core, task.id, runPhase, config);
 
-    // 4. Spawn agent process
+    // 4. Set up worktrees (journal + optional code)
+    let journalWorktreePath: string | undefined;
+    let codeWorktreePath: string | undefined;
+
+    try {
+      // Journal worktree
+      const jBranch = taskBranch(task.id);
+      const jPath = getWorktreePath(config.worktreeBaseDir, task.id, "journal");
+      const parentId = (task.metadata["parentId"] as string) ?? null;
+      createTaskBranch(config.journalRepoPath, task.id, parentId);
+      createWorktree(config.journalRepoPath, jPath, jBranch);
+      journalWorktreePath = jPath;
+
+      // Code worktree (only if task specifies a target repo)
+      const targetRepo = task.metadata["repo"] as string | undefined;
+      if (targetRepo) {
+        const cPath = getWorktreePath(config.worktreeBaseDir, task.id, "code");
+        const baseBranch = (task.metadata["base_branch"] as string) ?? "main";
+        const codeBranch = `task/T${task.id}`;
+        try {
+          createWorktree(targetRepo, cPath, codeBranch, baseBranch);
+          codeWorktreePath = cPath;
+        } catch (err) {
+          console.warn(`[dispatcher] T${task.id} code worktree failed:`, err);
+        }
+      }
+    } catch (err) {
+      console.warn(`[dispatcher] T${task.id} worktree setup failed (non-fatal):`, err);
+    }
+
+    // 5. Spawn agent process
     // Prepend "/new " to force a fresh session for each dispatch.
     // Without this, openclaw routes all dispatches to the same agent:coder-lite:main
     // session (--session-id is ignored when --agent is specified), causing tasks to
@@ -708,14 +776,22 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
 
     console.log(`[dispatcher] Spawning ${agentId} for T${task.id} phase=${phase} run=${runId.slice(0, 8)}`);
 
+    const spawnEnv: Record<string, string | undefined> = {
+      ...process.env,
+      TASK_ID: task.id,
+      ORCHESTRATOR_PORT: String(config.port),
+    };
+    if (journalWorktreePath) {
+      spawnEnv["JOURNAL_PATH"] = `${journalWorktreePath}/tasks/T${task.id}/`;
+    }
+    if (codeWorktreePath) {
+      spawnEnv["CODE_WORKTREE"] = codeWorktreePath;
+    }
+
     const child = spawn(config.agentCommand, args, {
       cwd: config.workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        TASK_ID: task.id,
-        ORCHESTRATOR_PORT: String(config.port),
-      },
+      env: spawnEnv,
     });
 
     let stdout = "";
@@ -732,6 +808,8 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       process: child,
       startedAt: now,
       killTimer: null,
+      journalWorktree: journalWorktreePath,
+      codeWorktree: codeWorktreePath,
     };
 
     // Set kill timer
@@ -981,9 +1059,62 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       elapsedMs: Date.now() - run.startedAt,
     });
 
+    // Journal & worktree cleanup
+    cleanupWorktrees(run, exitCode, signal);
+
     // Remove from active runs
     activeRuns.delete(run.taskId);
     writeRuntimeFile();
+  }
+
+  /**
+   * Handle journal commits and worktree cleanup after agent exit.
+   *
+   * Success: commit journal, populate StateRef, remove worktrees (branches preserved).
+   * Failure: discard uncommitted, write failure summary, remove worktrees.
+   */
+  function cleanupWorktrees(run: ActiveRun, exitCode: number, signal: string | null): void {
+    const taskAfterExit = core.getTask(run.taskId);
+
+    try {
+      if (run.journalWorktree) {
+        if (exitCode === 0 && !signal) {
+          // Success — commit any remaining journal entries
+          commitJournal(run.journalWorktree, run.taskId, "agent session complete");
+        } else {
+          // Failure — discard uncommitted, write failure summary
+          discardUncommitted(run.journalWorktree);
+          const reason = signal === "SIGKILL" ? "timeout" : `exit_code_${exitCode}`;
+          writeJournalFailureSummary(run.journalWorktree, run.taskId, {
+            whatFailed: `Agent ${run.agentId} failed: ${reason}`,
+            whatWasLearned: taskAfterExit?.failureSummaries.at(-1)?.whatWasLearned ?? "No learnings captured",
+          });
+        }
+
+        // Populate StateRef from journal branch
+        const ref = getBranchRef(config.journalRepoPath, taskBranch(run.taskId));
+        if (ref && taskAfterExit) {
+          // StateRef is captured but not submitted as an event here —
+          // it flows through AgentExited / TaskCompleted events upstream
+          console.log(`[dispatcher] T${run.taskId} journal ref: ${ref.commit.slice(0, 8)}`);
+        }
+
+        // Remove journal worktree (branch stays for reviewer / archive)
+        removeWorktree(config.journalRepoPath, run.journalWorktree);
+      }
+
+      if (run.codeWorktree) {
+        if (exitCode !== 0 || signal) {
+          discardUncommitted(run.codeWorktree);
+        }
+        const targetRepo = taskAfterExit?.metadata["repo"] as string | undefined;
+        if (targetRepo) {
+          removeWorktree(targetRepo, run.codeWorktree);
+        }
+      }
+    } catch (err) {
+      console.warn(`[dispatcher] T${run.taskId} worktree cleanup error (non-fatal):`, err);
+    }
   }
 
   /**

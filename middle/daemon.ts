@@ -6,6 +6,8 @@ import { loadConfig } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { createDispatcher, flushNotificationDigest } from "./dispatcher.js";
 import { exportState } from "./state-export.js";
+import { initJournalRepo } from "./journal.js";
+import { cleanupStaleWorktrees } from "./worktree.js";
 
 // ---------------------------------------------------------------------------
 // Lock file
@@ -140,6 +142,24 @@ async function main(): Promise<void> {
 
   // Reconcile orphaned active tasks from previous daemon lifetime
   reconcileOrphanedTasks(core);
+
+  // Initialize journal repo
+  try {
+    initJournalRepo(config.journalRepoPath);
+    console.log(`[daemon] Journal repo ready at ${config.journalRepoPath}`);
+  } catch (err) {
+    console.error("[daemon] Journal repo init failed (non-fatal):", err);
+  }
+
+  // Cleanup stale worktrees from previous crashes
+  try {
+    const cleaned = cleanupStaleWorktrees(config.worktreeBaseDir);
+    if (cleaned > 0) {
+      console.log(`[daemon] Cleaned up ${cleaned} stale worktree(s)`);
+    }
+  } catch (err) {
+    console.error("[daemon] Worktree cleanup failed (non-fatal):", err);
+  }
 
   // Create dispatcher
   const dispatcher = createDispatcher(core, config);
