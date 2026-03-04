@@ -1569,8 +1569,8 @@ function buildAddChildGuidance(taskId: string): string {
   return `Add children one at a time:\n` +
     `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/add-child \\\n` +
     `    -H 'Content-Type: application/json' \\\n` +
-    `    -d '{"title": "...", "description": "...", "costAllocation": 10, "skipAnalysis": true}'\n\n` +
-    `Optional fields: assignee, reviewer, dependsOnSiblings (array of sibling indices, 0-based).\n` +
+    `    -d '{"title": "...", "description": "...", "costAllocation": 10}'\n\n` +
+    `Optional fields: assignee, reviewer, dependsOnSiblings (array of sibling indices, 0-based), skipAnalysis (default false — only set true for trivial tasks).\n` +
     `When done adding children, commit:\n` +
     `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/commit \\\n` +
     `    -H 'Content-Type: application/json' \\\n` +
