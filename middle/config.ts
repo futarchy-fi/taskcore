@@ -55,6 +55,10 @@ export interface Config {
   disallowedAgent: string;
   /** Fallback agent for rerouting */
   disallowedAgentFallback: string;
+  /** Journal git repo path (task branches + failure summaries) */
+  journalRepoPath: string;
+  /** Base directory for git worktrees (journal + code) */
+  worktreeBaseDir: string;
 }
 
 export function loadConfig(): Config {
@@ -99,5 +103,10 @@ export function loadConfig(): Config {
     agentTimeoutMs: envInt("AGENT_TIMEOUT_MS", 600_000),
     disallowedAgent: envStr("DISALLOWED_ROUTED_AGENT", "hermes"),
     disallowedAgentFallback: envStr("DISALLOWED_AGENT_FALLBACK", "overseer"),
+    journalRepoPath: envStr(
+      "JOURNAL_REPO_PATH",
+      `${process.env["HOME"]}/.openclaw/journal`,
+    ),
+    worktreeBaseDir: envStr("WORKTREE_BASE_DIR", "/tmp/taskcore-worktrees"),
   };
 }

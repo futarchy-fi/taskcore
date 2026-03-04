@@ -24,7 +24,7 @@ PRIORITY_CHOICES = ["backlog", "low", "medium", "high", "critical"]
 AGENT_CHOICES = [
     "coder", "analyst", "coder-lite", "hermes", "ceo", "orchestrator",
 ]
-REVIEWER_CHOICES = AGENT_CHOICES + ["human"]
+REVIEWER_CHOICES = AGENT_CHOICES + ["kelvin", "arthur"]
 
 
 def post(path: str, body: dict) -> dict:

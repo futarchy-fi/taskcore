@@ -4,6 +4,11 @@ import * as path from "node:path";
 import type { Core } from "../core/index.js";
 import type { Task, TaskId } from "../core/types.js";
 import type { Config } from "./config.js";
+import {
+  getJournalContent,
+  getFailureSummaries,
+} from "./journal.js";
+import { getWorktreePath } from "./worktree.js";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -86,6 +91,39 @@ function buildWorkPrompt(core: Core, task: Task, config: Config): string {
     }
   }
 
+  // Parent context (if task has a parent, load the parent's journal)
+  const parentId = task.metadata["parentId"] as string | undefined;
+  if (parentId) {
+    const parentJournal = getJournalContent(config.journalRepoPath, parentId);
+    if (parentJournal) {
+      sections.push("## Parent Context");
+      sections.push("");
+      // Truncate to avoid bloating the prompt
+      const maxLen = 3000;
+      if (parentJournal.length > maxLen) {
+        sections.push(parentJournal.slice(0, maxLen));
+        sections.push(`\n... (truncated, ${parentJournal.length - maxLen} chars omitted)`);
+      } else {
+        sections.push(parentJournal);
+      }
+      sections.push("");
+    }
+  }
+
+  // Sibling failure summaries (from unmerged branches of the same task)
+  const siblingFailures = getFailureSummaries(config.journalRepoPath, task.id);
+  if (siblingFailures.length > 0) {
+    sections.push("## Sibling Failures");
+    sections.push("");
+    sections.push("These are failure summaries from other tasks that may be relevant:");
+    sections.push("");
+    for (const sf of siblingFailures.slice(0, 5)) {
+      sections.push(`### T${sf.taskId}`);
+      sections.push(sf.content);
+      sections.push("");
+    }
+  }
+
   // Workspace conventions
   const agentsMd = loadAgentsMd(config.workspaceDir);
   if (agentsMd) {
@@ -94,6 +132,22 @@ function buildWorkPrompt(core: Core, task: Task, config: Config): string {
     sections.push(agentsMd);
     sections.push("");
   }
+
+  // Workspace paths
+  const journalPath = getWorktreePath(config.worktreeBaseDir, task.id, "journal")
+    + `/tasks/T${task.id}/`;
+  const codeWorktree = task.metadata["repo"]
+    ? getWorktreePath(config.worktreeBaseDir, task.id, "code")
+    : null;
+
+  sections.push("## Your Workspace");
+  sections.push("");
+  sections.push(`- **Journal**: \`${journalPath}\` — write observations, decisions, reasoning here`);
+  if (codeWorktree) {
+    sections.push(`- **Code**: \`${codeWorktree}\` — make code changes here`);
+  }
+  sections.push("- Colony files (AGENTS.md, etc.) are read-only shared resources.");
+  sections.push("");
 
   // Status update instructions
   sections.push("## How to Report Status");
@@ -169,8 +223,26 @@ function buildReviewPrompt(core: Core, task: Task, config: Config): string {
     sections.push("");
   }
 
-  // Code changes (git diff)
-  const diff = getTaskDiff(task, config.workspaceDir);
+  // Journal content from the task's branch
+  const journalContent = getJournalContent(config.journalRepoPath, task.id);
+  if (journalContent) {
+    sections.push("## Agent Journal");
+    sections.push("");
+    const maxJournalLen = 4000;
+    if (journalContent.length > maxJournalLen) {
+      sections.push(journalContent.slice(0, maxJournalLen));
+      sections.push(`\n... (truncated, ${journalContent.length - maxJournalLen} chars omitted)`);
+    } else {
+      sections.push(journalContent);
+    }
+    sections.push("");
+  }
+
+  // Code changes — prefer worktree branch diff, fall back to colony diff
+  const targetRepo = task.metadata["repo"] as string | undefined;
+  const diff = targetRepo
+    ? getTaskDiff(task, targetRepo)
+    : getTaskDiff(task, config.workspaceDir);
   if (diff) {
     sections.push("## Code Changes");
     sections.push("");
