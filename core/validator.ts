@@ -779,6 +779,12 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     case "TaskCanceled":
       return null;
 
+    case "TaskExhausted":
+    case "BudgetIncreased":
+    case "TaskRevived":
+    case "TaskReparented":
+      return null;
+
     default: {
       const neverEvent: never = event;
       return mkError(neverEvent, "unknown_event", "Unsupported event type.");
