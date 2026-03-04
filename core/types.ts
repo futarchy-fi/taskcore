@@ -527,8 +527,34 @@ export interface CostSummary {
   entries: CostSummaryEntry[];
 }
 
+export interface SnapshotRow {
+  sequence: number;
+  state: SystemState;
+  createdAt: number;
+}
+
+/**
+ * Persistence backend contract. Both SQLite and JSONL backends implement this.
+ * The core treats persistence as an opaque append-only event store with
+ * optional snapshot support.
+ */
+export interface Persistence {
+  appendEvent(event: Event): number;
+  loadEventsSince(sequence: number): EventEnvelope[];
+  loadTaskEvents(taskId: string): EventEnvelope[];
+  saveSnapshot(state: SystemState): void;
+  loadLatestSnapshot(): SnapshotRow | null;
+  rebuildState(reducer: (state: SystemState, event: Event) => SystemState): SystemState;
+  truncateAll(): void;
+  close(): void;
+  /** Reset internal sequence counter (used after corrupt-data recovery) */
+  resetSequence?(sequence: number): void;
+}
+
 export interface CoreOptions {
   dbPath: string;
+  eventLogDir?: string;
+  persistenceBackend?: "jsonl" | "sqlite";
   snapshotEvery?: number;
   clockPollMs?: number;
   invariantChecks?: boolean;

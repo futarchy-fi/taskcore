@@ -3,14 +3,10 @@ import {
   createInitialState,
   type Event,
   type EventEnvelope,
+  type Persistence,
+  type SnapshotRow,
   type SystemState,
 } from "./types.js";
-
-export interface SnapshotRow {
-  sequence: number;
-  state: SystemState;
-  createdAt: number;
-}
 
 interface EventRow {
   sequence: number;
@@ -26,7 +22,7 @@ interface SnapshotDbRow {
   created_at: number;
 }
 
-export class SQLitePersistence {
+export class SQLitePersistence implements Persistence {
   private readonly db: Database.Database;
 
   public constructor(dbPath: string) {

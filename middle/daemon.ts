@@ -27,8 +27,14 @@ function acquireLock(lockPath: string): void {
           process.kill(pid, 0); // Check if process is alive
           console.error(`[daemon] Another instance is running (PID ${pid}). Exiting.`);
           process.exit(1);
-        } catch {
-          // Process not running — stale lock
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === "EPERM") {
+            // Process IS running but owned by a different user — not stale
+            console.error(`[daemon] Another instance is running as a different user (PID ${pid}). Exiting.`);
+            process.exit(1);
+          }
+          // ESRCH — process not running, stale lock
           console.log(`[daemon] Removing stale lock file (PID ${pid})`);
         }
       }
@@ -103,14 +109,20 @@ async function main(): Promise<void> {
   const config = loadConfig();
   console.log("[daemon] Starting taskcore daemon");
   console.log(`[daemon]   port=${config.port}`);
+  console.log(`[daemon]   backend=${config.persistenceBackend}`);
   console.log(`[daemon]   db=${config.dbPath}`);
+  console.log(`[daemon]   eventLogDir=${config.eventLogDir}`);
   console.log(`[daemon]   workspace=${config.workspaceDir}`);
   console.log(`[daemon]   maxConcurrent=${config.maxConcurrent}`);
 
-  // Ensure data directory exists
+  // Ensure data directories exist
   const dbDir = path.dirname(config.dbPath);
   if (!fs.existsSync(dbDir)) {
     fs.mkdirSync(dbDir, { recursive: true });
+  }
+  if (config.persistenceBackend === "jsonl") {
+    fs.mkdirSync(config.eventLogDir, { recursive: true });
+    fs.mkdirSync(path.join(config.eventLogDir, "snapshots"), { recursive: true });
   }
 
   // Acquire lock
@@ -119,6 +131,8 @@ async function main(): Promise<void> {
   // Initialize core
   const core = new OrchestrationCore({
     dbPath: config.dbPath,
+    eventLogDir: config.eventLogDir,
+    persistenceBackend: config.persistenceBackend,
     invariantChecks: true,
     snapshotEvery: 50,
   });
