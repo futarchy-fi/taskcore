@@ -15,8 +15,12 @@ function envStr(key: string, fallback: string): string {
 export interface Config {
   /** HTTP listen port */
   port: number;
-  /** SQLite database path */
+  /** SQLite database path (kept for migration / sqlite backend) */
   dbPath: string;
+  /** JSONL event log directory */
+  eventLogDir: string;
+  /** Persistence backend: "jsonl" (default) or "sqlite" */
+  persistenceBackend: "jsonl" | "sqlite";
   /** Agent registry JSON path */
   agentRegistry: string;
   /** Workspace root directory */
@@ -59,9 +63,13 @@ export function loadConfig(): Config {
     envStr("OPENCLAW_STATE_DIR", `${process.env["HOME"]}/.openclaw/workspace`),
   );
 
+  const persistenceBackend = envStr("TASKCORE_BACKEND", "jsonl") as "jsonl" | "sqlite";
+
   return {
     port: envInt("ORCHESTRATOR_PORT", 18800),
     dbPath: envStr("ORCHESTRATOR_DB", `${workspaceDir}/data/taskcore.db`),
+    eventLogDir: envStr("TASKCORE_EVENT_LOG_DIR", `${workspaceDir}/data/taskcore`),
+    persistenceBackend,
     agentRegistry: envStr(
       "AGENT_REGISTRY",
       `${workspaceDir}/agents/registry.json`,
@@ -90,6 +98,6 @@ export function loadConfig(): Config {
     defaultAttemptBudgets: DEFAULT_ATTEMPT_BUDGETS,
     agentTimeoutMs: envInt("AGENT_TIMEOUT_MS", 600_000),
     disallowedAgent: envStr("DISALLOWED_ROUTED_AGENT", "hermes"),
-    disallowedAgentFallback: envStr("DISALLOWED_AGENT_FALLBACK", "orchestrator"),
+    disallowedAgentFallback: envStr("DISALLOWED_AGENT_FALLBACK", "overseer"),
   };
 }

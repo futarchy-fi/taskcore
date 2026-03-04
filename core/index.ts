@@ -1,5 +1,7 @@
+import * as path from "node:path";
 import { CoreClock } from "./clock.js";
 import { assertInvariants, checkInvariants } from "./invariants.js";
+import { JsonlPersistence } from "./jsonl-persistence.js";
 import { SQLitePersistence } from "./persistence.js";
 import { reduce } from "./reducer.js";
 import {
@@ -10,6 +12,7 @@ import {
   type CostSummary,
   type DependencyGraph,
   type Event,
+  type Persistence,
   type Phase,
   type Result,
   type SearchTreeNode,
@@ -106,7 +109,7 @@ function subtreeTasks(state: SystemState, rootTaskId: TaskId): Task[] {
 }
 
 export class OrchestrationCore implements Core {
-  private readonly persistence: SQLitePersistence;
+  private readonly persistence: Persistence;
   private readonly clock: CoreClock;
   private readonly snapshotEvery: number;
   private readonly invariantChecks: boolean;
@@ -114,7 +117,13 @@ export class OrchestrationCore implements Core {
   private state: SystemState;
 
   public constructor(options: CoreOptions) {
-    this.persistence = new SQLitePersistence(options.dbPath);
+    const backend = options.persistenceBackend ?? "sqlite";
+    if (backend === "jsonl") {
+      const eventLogDir = options.eventLogDir ?? path.dirname(options.dbPath);
+      this.persistence = new JsonlPersistence(eventLogDir);
+    } else {
+      this.persistence = new SQLitePersistence(options.dbPath);
+    }
     this.clock = new CoreClock();
     this.snapshotEvery = options.snapshotEvery ?? DEFAULT_SNAPSHOT_EVERY;
     this.invariantChecks = options.invariantChecks ?? true;
@@ -122,7 +131,17 @@ export class OrchestrationCore implements Core {
 
     this.state = this.restoreState();
     if (this.invariantChecks) {
-      assertInvariants(this.state);
+      const violations = checkInvariants(this.state);
+      if (violations.length > 0) {
+        // Save emergency snapshot so next restart doesn't replay from scratch
+        try {
+          this.persistence.saveSnapshot(this.state);
+          console.error(`[core] Emergency snapshot saved at seq ${this.state.sequence}`);
+        } catch (snapErr) {
+          console.error("[core] Failed to save emergency snapshot:", snapErr);
+        }
+        assertInvariants(this.state);
+      }
     }
   }
 
@@ -281,19 +300,26 @@ export class OrchestrationCore implements Core {
 
   private restoreState(): SystemState {
     const snapshot = this.persistence.loadLatestSnapshot();
-    if (!snapshot) {
-      return createInitialState();
+    const baseState = snapshot?.state ?? createInitialState();
+    const baseSequence = snapshot?.sequence ?? 0;
+
+    const events = this.persistence.loadEventsSince(baseSequence);
+    if (events.length === 0) {
+      return baseState;
     }
 
-    const events = this.persistence.loadEventsSince(snapshot.sequence);
-    let state = snapshot.state;
+    let state = baseState;
 
+    let skipped = 0;
     for (const envelope of events) {
       const result = reduce(state, envelope.event);
       if (!result.ok) {
-        throw new Error(
-          `Unable to restore state. Invalid event sequence at ${envelope.sequence}: ${result.error.message}`,
+        // Log and skip invalid events during replay (data corruption recovery)
+        console.error(
+          `[core] Skipping invalid event at seq ${envelope.sequence} (${envelope.event.type} on ${envelope.event.taskId}): ${result.error.message}`,
         );
+        skipped++;
+        continue;
       }
 
       state = result.value.state;
@@ -302,6 +328,20 @@ export class OrchestrationCore implements Core {
       if (lastEvent) {
         lastEvent.sequence = envelope.sequence;
       }
+    }
+
+    if (skipped > 0) {
+      console.error(`[core] Replay complete: ${skipped} invalid event(s) skipped`);
+    }
+
+    // Always re-number in-memory envelopes to be contiguous after replay.
+    // Handles skipped events, duplicate sequences, and other log corruption.
+    for (let i = 0; i < state.events.length; i++) {
+      state.events[i]!.sequence = i + 1;
+    }
+    state.sequence = state.events.length;
+    if (this.persistence.resetSequence) {
+      this.persistence.resetSequence(state.sequence);
     }
 
     if (this.clockPollMs > 0) {
