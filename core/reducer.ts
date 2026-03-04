@@ -706,6 +706,21 @@ function applyTaskRevived(state: SystemState, event: Extract<Event, { type: "Tas
   state.tasks[t.id] = t;
 }
 
+function applyMetadataUpdated(state: SystemState, event: Extract<Event, { type: "MetadataUpdated" }>, task: Task): void {
+  const t = deepCloneTask(task);
+
+  for (const [key, value] of Object.entries(event.patch)) {
+    if (value === null) {
+      delete t.metadata[key];
+    } else {
+      t.metadata[key] = value;
+    }
+  }
+
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
 function applyTaskReparented(state: SystemState, event: Extract<Event, { type: "TaskReparented" }>, task: Task): void {
   const t = deepCloneTask(task);
 
@@ -840,6 +855,9 @@ function applyUnchecked(state: SystemState, event: Event): void {
       break;
     case "TaskReparented":
       applyTaskReparented(state, event, task);
+      break;
+    case "MetadataUpdated":
+      applyMetadataUpdated(state, event, task);
       break;
     default: {
       const neverEvent: never = event;

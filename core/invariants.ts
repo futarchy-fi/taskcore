@@ -104,6 +104,10 @@ function assertTaskShape(task: Task, allTasks: Record<TaskId, Task>, violations:
     push(violations, "retry_wait_missing_retry_after", "retryWait requires retryAfter.", task.id);
   }
 
+  if (task.condition === "exhausted" && (task.leasedTo !== null || task.leaseExpiresAt !== null)) {
+    push(violations, "exhausted_dangling_lease", "Exhausted tasks must have leasedTo and leaseExpiresAt cleared.", task.id);
+  }
+
   if (task.condition !== "waiting" && task.waitState !== null) {
     push(violations, "dangling_wait_state", "waitState can only exist in waiting condition.", task.id);
   }
@@ -237,7 +241,7 @@ function checkEventMonotonicity(events: Array<{ sequence: number; event: Event }
     expectedSequence += 1;
 
     const { event } = envelope;
-    if (terminalSeen.has(event.taskId) && event.type !== "TaskCreated") {
+    if (terminalSeen.has(event.taskId) && event.type !== "TaskCreated" && event.type !== "TaskReparented" && event.type !== "TaskRevived" && event.type !== "MetadataUpdated") {
       push(
         violations,
         "terminal_absorption",
@@ -249,6 +253,9 @@ function checkEventMonotonicity(events: Array<{ sequence: number; event: Event }
 
     if (event.type === "TaskCompleted" || event.type === "TaskFailed" || event.type === "TaskBlocked" || event.type === "TaskCanceled") {
       terminalSeen.add(event.taskId);
+    }
+    if (event.type === "TaskRevived") {
+      terminalSeen.delete(event.taskId);
     }
 
     if (event.type === "LeaseGranted") {

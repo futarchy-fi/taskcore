@@ -695,7 +695,7 @@ test("Scenario E: execution -> too_complex -> re-analysis -> decompose", () => {
   assert.ok(task.attempts.execution.used >= 1);
 });
 
-test("Scenario F: task failure from budget exhaustion", () => {
+test("Scenario F: task exhaustion from budget exhaustion", () => {
   const prefix: Event[] = [
     createTask("T600", 1, {
       costBudget: 100,
@@ -760,15 +760,15 @@ test("Scenario F: task failure from budget exhaustion", () => {
 
   const clock = new CoreClock();
   const due = clock.collectDueEvents(state, 14);
-  const failEvent = due.find((event) => event.type === "TaskFailed" && event.taskId === "T600");
-  assert.ok(failEvent);
+  const exhaustEvent = due.find((event) => event.type === "TaskExhausted" && event.taskId === "T600");
+  assert.ok(exhaustEvent);
 
   for (const event of due) {
     state = mustReduce(state, event);
   }
 
-  assert.equal(state.tasks.T600?.terminal, "failed");
-  assert.ok(state.tasks.T600?.terminalSummary);
+  assert.equal(state.tasks.T600?.condition, "exhausted");
+  assert.equal(state.tasks.T600?.terminal, null);
 });
 
 test("Scenario G: session policy enforcement", () => {
@@ -993,7 +993,7 @@ test("Scenario K: WaitResolved redirect_to_analysis", () => {
   assert.equal(task.condition, "ready");
 });
 
-test("Scenario L: proactive cost exhaustion auto-fails task", () => {
+test("Scenario L: proactive cost exhaustion pauses task as exhausted", () => {
   const events: Event[] = [
     createTask("T1200", 1, { costBudget: 1 }),
     lease("T1200", 2, 1, "analysis", "analyst", "a-1200"),
@@ -1008,16 +1008,17 @@ test("Scenario L: proactive cost exhaustion auto-fails task", () => {
   let state = mustReplay(events);
   const clock = new CoreClock();
   const due = clock.collectDueEvents(state, 9);
-  const failEvent = due.find(
-    (event) => event.type === "TaskFailed" && event.taskId === "T1200" && event.reason === "cost_exhausted",
+  const exhaustEvent = due.find(
+    (event) => event.type === "TaskExhausted" && event.taskId === "T1200" && event.reason === "cost_exhausted",
   );
-  assert.ok(failEvent);
+  assert.ok(exhaustEvent);
 
   for (const event of due) {
     state = mustReduce(state, event);
   }
 
-  assert.equal(state.tasks.T1200?.terminal, "failed");
+  assert.equal(state.tasks.T1200?.condition, "exhausted");
+  assert.equal(state.tasks.T1200?.terminal, null);
 });
 
 test("Scenario M: ChildCostRecovered auto-emission and single-shot recovery", () => {
@@ -1384,7 +1385,7 @@ test("Scenario Q: AgentExited followup timeout schedules retry", () => {
   assert.equal(state.tasks.T1600?.lastAgentExitAt, null);
 });
 
-test("Scenario R: retryWait budget exhaustion fails before BackoffExpired", () => {
+test("Scenario R: retryWait budget exhaustion pauses before BackoffExpired", () => {
   let state = createInitialState();
   state = mustReduce(
     state,
@@ -1435,14 +1436,15 @@ test("Scenario R: retryWait budget exhaustion fails before BackoffExpired", () =
 
   const clock = new CoreClock();
   const due = clock.collectDueEvents(state, 10);
-  assert.ok(due.some((event) => event.type === "TaskFailed" && event.taskId === "T1700" && event.reason === "budget_exhausted"));
+  assert.ok(due.some((event) => event.type === "TaskExhausted" && event.taskId === "T1700" && event.reason === "budget_exhausted"));
   assert.equal(due.some((event) => event.type === "BackoffExpired" && event.taskId === "T1700"), false);
 
   for (const event of due) {
     state = mustReduce(state, event);
   }
 
-  assert.equal(state.tasks.T1700?.terminal, "failed");
+  assert.equal(state.tasks.T1700?.condition, "exhausted");
+  assert.equal(state.tasks.T1700?.terminal, null);
 });
 
 test("Scenario S: LeaseExpired auto-emission transitions leased task to retryWait", () => {
@@ -2442,4 +2444,195 @@ test("Scenario AH: review.waiting with all terminal children passes invariants b
 
   const violations = checkInvariants(state);
   assert.equal(violations.length, 0, JSON.stringify(violations));
+});
+
+// ---------------------------------------------------------------------------
+// TaskExhausted + BudgetIncreased scenario tests
+// ---------------------------------------------------------------------------
+
+test("Clock emits TaskExhausted (not TaskFailed) for attempt budget exhaustion", () => {
+  const events: Event[] = [
+    createTask("TEX100", 1, {
+      costBudget: 100,
+      attemptBudgets: {
+        analysis: { max: 6 },
+        decomposition: { max: 6 },
+        execution: { max: 1 },
+        review: { max: 6 },
+      },
+      skipAnalysis: true,
+    }),
+    lease("TEX100", 2, 1, "execution", "coder", "e-tex100"),
+    started("TEX100", 3, 1, "coder", "e-tex100"),
+    {
+      type: "RetryScheduled",
+      taskId: "TEX100",
+      ts: 4,
+      fenceToken: 1,
+      reason: "agent_crashed",
+      retryAfter: 5,
+      phase: "execution",
+      attemptNumber: 1,
+    },
+    {
+      type: "BackoffExpired",
+      taskId: "TEX100",
+      ts: 5,
+      phase: "execution",
+      source: { type: "core", id: "clock" },
+    },
+  ];
+
+  const state = mustReplay(events);
+  // execution.used=1, execution.max=1 → exhausted
+  assert.equal(state.tasks["TEX100"]!.condition, "ready");
+
+  const clock = new CoreClock();
+  const due = clock.collectDueEvents(state, 100);
+  const exhaustEvents = due.filter((e) => e.type === "TaskExhausted" && e.taskId === "TEX100");
+  assert.equal(exhaustEvents.length, 1, "Should emit TaskExhausted");
+  assert.equal((exhaustEvents[0] as { reason: string }).reason, "budget_exhausted");
+
+  // Verify no TaskFailed is emitted
+  const failEvents = due.filter((e) => e.type === "TaskFailed" && e.taskId === "TEX100");
+  assert.equal(failEvents.length, 0, "Should NOT emit TaskFailed");
+});
+
+test("Clock emits TaskExhausted for cost exhaustion", () => {
+  const events: Event[] = [
+    createTask("TEX101", 1, {
+      costBudget: 2,
+      attemptBudgets: {
+        analysis: { max: 6 },
+        decomposition: { max: 6 },
+        execution: { max: 6 },
+        review: { max: 6 },
+      },
+      skipAnalysis: true,
+    }),
+    lease("TEX101", 2, 1, "execution", "coder", "e-tex101"),
+    started("TEX101", 3, 1, "coder", "e-tex101"),
+    exited("TEX101", 4, 1, "coder", "e-tex101", 2),
+    {
+      type: "RetryScheduled",
+      taskId: "TEX101",
+      ts: 5,
+      fenceToken: 1,
+      reason: "agent_crashed",
+      retryAfter: 6,
+      phase: "execution",
+      attemptNumber: 1,
+    },
+    {
+      type: "BackoffExpired",
+      taskId: "TEX101",
+      ts: 6,
+      phase: "execution",
+      source: { type: "core", id: "clock" },
+    },
+  ];
+
+  const state = mustReplay(events);
+  // cost.consumed=2, cost.allocated=2 → remaining=0
+  assert.equal(computeCostRemaining(state.tasks["TEX101"]!.cost), 0);
+
+  const clock = new CoreClock();
+  const due = clock.collectDueEvents(state, 100);
+  const exhaustEvents = due.filter((e) => e.type === "TaskExhausted" && e.taskId === "TEX101");
+  assert.equal(exhaustEvents.length, 1, "Should emit TaskExhausted for cost");
+  assert.equal((exhaustEvents[0] as { reason: string }).reason, "cost_exhausted");
+});
+
+test("Clock skips already-exhausted tasks", () => {
+  const events: Event[] = [
+    createTask("TEX102", 1, {
+      costBudget: 100,
+      attemptBudgets: {
+        analysis: { max: 6 },
+        decomposition: { max: 6 },
+        execution: { max: 1 },
+        review: { max: 6 },
+      },
+      skipAnalysis: true,
+    }),
+    {
+      type: "TaskExhausted",
+      taskId: "TEX102",
+      ts: 2,
+      reason: "budget_exhausted",
+      phase: "execution",
+      source: { type: "core", id: "clock" },
+    },
+  ];
+
+  const state = mustReplay(events);
+  assert.equal(state.tasks["TEX102"]!.condition, "exhausted");
+
+  const clock = new CoreClock();
+  const due = clock.collectDueEvents(state, 100);
+  const taskEvents = due.filter((e) => e.taskId === "TEX102");
+  assert.equal(taskEvents.length, 0, "Clock should skip exhausted tasks");
+});
+
+test("Full lifecycle: exhaust → budget increase → dispatch → complete", () => {
+  const events: Event[] = [
+    createTask("TEX103", 1, {
+      costBudget: 100,
+      attemptBudgets: {
+        analysis: { max: 6 },
+        decomposition: { max: 6 },
+        execution: { max: 1 },
+        review: { max: 6 },
+      },
+      skipAnalysis: true,
+    }),
+    // Exhaust via clock path
+    {
+      type: "TaskExhausted",
+      taskId: "TEX103",
+      ts: 2,
+      reason: "budget_exhausted",
+      phase: "execution",
+      source: { type: "core", id: "clock" },
+    },
+  ];
+
+  let state = mustReplay(events);
+
+  // Verify exhausted
+  assert.equal(state.tasks["TEX103"]!.condition, "exhausted");
+  let v = checkInvariants(state);
+  assert.equal(v.length, 0, `Pre-budget invariants: ${JSON.stringify(v)}`);
+
+  // Increase budget
+  state = mustReduce(state, {
+    type: "BudgetIncreased",
+    taskId: "TEX103",
+    ts: 3,
+    attemptBudgetIncrease: { execution: { max: 4 } },
+    costBudgetIncrease: 0,
+    reason: "retry fix",
+    source: { type: "middle", id: "daemon" },
+  });
+
+  assert.equal(state.tasks["TEX103"]!.condition, "ready");
+  v = checkInvariants(state);
+  assert.equal(v.length, 0, `Post-budget invariants: ${JSON.stringify(v)}`);
+
+  // Dispatch: lease → start → work complete → complete
+  state = mustReduce(state, lease("TEX103", 4, 1, "execution", "coder", "e-tex103-2"));
+  state = mustReduce(state, started("TEX103", 5, 1, "coder", "e-tex103-2"));
+  state = mustReduce(state, exited("TEX103", 6, 1, "coder", "e-tex103-2", 1));
+  state = mustReduce(state, transition(
+    "TEX103", 7, "execution", "active", "review", "ready", "work_complete", 1, "coder", "e-tex103-2",
+  ));
+  state = mustReduce(state, lease("TEX103", 8, 2, "review", "reviewer", "r-tex103"));
+  state = mustReduce(state, started("TEX103", 9, 2, "reviewer", "r-tex103"));
+  state = mustReduce(state, reviewVerdict("TEX103", 10, 2, "reviewer", "r-tex103", "approve"));
+  state = mustReduce(state, reviewPolicy("TEX103", 11, "approved"));
+  state = mustReduce(state, complete("TEX103", 12));
+
+  assert.equal(state.tasks["TEX103"]!.terminal, "done");
+  v = checkInvariants(state);
+  assert.equal(v.length, 0, `Final invariants: ${JSON.stringify(v)}`);
 });

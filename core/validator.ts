@@ -20,6 +20,7 @@ const CORE_ONLY_EVENTS = new Set<EventType>([
   "DependencySatisfied",
   "ChildCostRecovered",
   "CheckpointTriggered",
+  "TaskExhausted",
 ]);
 
 const MIDDLE_ONLY_EVENTS = new Set<EventType>(["ReviewPolicyMet"]);
@@ -328,6 +329,84 @@ function validateWaitAction(event: Extract<Event, { type: "WaitResolved" }>): Va
   return null;
 }
 
+function validateTaskReparented(
+  state: SystemState,
+  event: Extract<Event, { type: "TaskReparented" }>,
+  task: Task,
+): ValidationError | null {
+  // Stale guard: oldParentId and oldRootId must match current task state
+  if (event.oldParentId !== task.parentId) {
+    return mkError(event, "stale_parent", "TaskReparented.oldParentId does not match current parentId.", {
+      expected: task.parentId,
+      got: event.oldParentId,
+    });
+  }
+  if (event.oldRootId !== task.rootId) {
+    return mkError(event, "stale_root", "TaskReparented.oldRootId does not match current rootId.", {
+      expected: task.rootId,
+      got: event.oldRootId,
+    });
+  }
+
+  // Self-reparent
+  if (event.taskId === event.newParentId) {
+    return mkError(event, "self_reparent", "Task cannot be reparented under itself.");
+  }
+
+  // New parent must exist
+  const newParent = state.tasks[event.newParentId];
+  if (!newParent) {
+    return mkError(event, "parent_missing", `New parent task ${event.newParentId} does not exist.`);
+  }
+
+  // newRootId must match new parent's rootId
+  if (event.newRootId !== newParent.rootId) {
+    return mkError(event, "invalid_root", "TaskReparented.newRootId must match new parent rootId.", {
+      newRootId: event.newRootId,
+      parentRootId: newParent.rootId,
+    });
+  }
+
+  // Cycle detection: walk ancestors from newParentId up; reject if taskId found
+  let cursor: Task | undefined = newParent;
+  const visited = new Set<string>();
+  while (cursor && cursor.parentId !== null) {
+    if (cursor.parentId === event.taskId) {
+      return mkError(event, "cycle_detected", "Reparenting would create a cycle in the parent chain.");
+    }
+    if (visited.has(cursor.id)) {
+      break; // existing cycle in data, don't loop forever
+    }
+    visited.add(cursor.id);
+    cursor = state.tasks[cursor.parentId];
+  }
+
+  return null;
+}
+
+const VALID_PRIORITIES = new Set(["backlog", "low", "medium", "high", "critical"]);
+
+function validateMetadataUpdated(event: Extract<Event, { type: "MetadataUpdated" }>): ValidationError | null {
+  if (!event.patch || typeof event.patch !== "object" || Object.keys(event.patch).length === 0) {
+    return mkError(event, "empty_patch", "MetadataUpdated.patch must be a non-empty object.");
+  }
+
+  if (!nonEmptyText(event.reason)) {
+    return mkError(event, "invalid_reason", "MetadataUpdated.reason must be non-empty.");
+  }
+
+  // Validate well-known fields
+  if ("priority" in event.patch && event.patch["priority"] !== null) {
+    if (!VALID_PRIORITIES.has(event.patch["priority"] as string)) {
+      return mkError(event, "invalid_priority", "priority must be one of: backlog, low, medium, high, critical.", {
+        got: event.patch["priority"],
+      });
+    }
+  }
+
+  return null;
+}
+
 function validateCommonTaskRules(task: Task, event: Event): ValidationError | null {
   if (task.terminal !== null) {
     return mkError(event, "terminal_absorption", "Cannot apply non-creation events to a terminal task.");
@@ -346,6 +425,27 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     return taskOrError;
   }
   const task = taskOrError;
+
+  // TaskReparented bypasses terminal check — it's structural, not lifecycle
+  if (event.type === "TaskReparented") {
+    return validateTaskReparented(state, event, task);
+  }
+
+  // MetadataUpdated bypasses terminal check — metadata is informational
+  if (event.type === "MetadataUpdated") {
+    return validateMetadataUpdated(event);
+  }
+
+  // TaskRevived requires terminal state — it reverts a failed/blocked task back to active
+  if (event.type === "TaskRevived") {
+    if (!task.terminal) {
+      return mkError(event, "not_terminal", "TaskRevived requires task to be in a terminal state (failed/blocked).");
+    }
+    if (task.terminal !== "failed" && task.terminal !== "blocked") {
+      return mkError(event, "invalid_terminal", "TaskRevived only works on failed or blocked tasks, not " + task.terminal + ".");
+    }
+    return null;
+  }
 
   const commonError = validateCommonTaskRules(task, event);
   if (commonError) {
@@ -644,6 +744,34 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       }
       if (!nonEmptyText(event.reason) || !nonEmptyText(event.reasonCode)) {
         return mkError(event, "invalid_block_reason", "TaskBlocked requires reason and reasonCode.");
+      }
+      return null;
+    }
+
+    case "TaskExhausted": {
+      if (task.condition !== "ready" && task.condition !== "retryWait") {
+        return mkError(event, "invalid_condition", "TaskExhausted requires ready or retryWait condition.");
+      }
+      if (task.phase !== event.phase) {
+        return mkError(event, "phase_mismatch", "TaskExhausted.phase must match current task phase.");
+      }
+      return null;
+    }
+
+    case "BudgetIncreased": {
+      if (event.costBudgetIncrease < 0) {
+        return mkError(event, "invalid_cost_increase", "BudgetIncreased.costBudgetIncrease must be >= 0.");
+      }
+      if (!nonEmptyText(event.reason)) {
+        return mkError(event, "invalid_reason", "BudgetIncreased.reason must be non-empty.");
+      }
+      if (event.attemptBudgetIncrease) {
+        for (const phase of ["analysis", "decomposition", "execution", "review"] as const) {
+          const entry = event.attemptBudgetIncrease[phase];
+          if (entry && !isPositiveInt(entry.max)) {
+            return mkError(event, "invalid_attempt_budget", `BudgetIncreased attempt budget max for ${phase} must be a positive integer.`);
+          }
+        }
       }
       return null;
     }
