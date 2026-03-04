@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { OrchestrationCore } from "../core/index.js";
 import type { RetryScheduled } from "../core/types.js";
 import { loadConfig } from "./config.js";
-import { createHttpServer } from "./http.js";
+import { createHttpServer, cleanupPendingDecompositions } from "./http.js";
 import { createDispatcher, flushNotificationDigest } from "./dispatcher.js";
 import { exportState } from "./state-export.js";
 import { initJournalRepo } from "./journal.js";
@@ -182,6 +182,8 @@ async function main(): Promise<void> {
       } else if (result.value > 0) {
         console.log(`[daemon] Tick processed ${result.value} auto-event(s)`);
       }
+      // Sweep pending decomposition sessions for tasks that went terminal or changed phase
+      cleanupPendingDecompositions(core);
     } catch (err) {
       console.error("[daemon] Tick exception:", err);
     }

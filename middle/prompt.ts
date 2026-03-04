@@ -159,33 +159,14 @@ function buildWorkPrompt(core: Core, task: Task, config: Config, overrides?: Pro
   sections.push("- Colony files (AGENTS.md, etc.) are read-only shared resources.");
   sections.push("");
 
-  // Status update instructions
-  sections.push("## How to Report Status");
-  sections.push("");
-  sections.push("When done, report your status:");
-  sections.push("");
-  sections.push("```bash");
-  sections.push(`# Work complete → submit for review:`);
-  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
-  sections.push(`  -H 'Content-Type: application/json' \\`);
-  sections.push(`  -d '{"status": "review", "evidence": "Description of what you did"}'`);
-  sections.push("");
-  sections.push(`# Blocked → cannot proceed:`);
-  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
-  sections.push(`  -H 'Content-Type: application/json' \\`);
-  sections.push(`  -d '{"status": "blocked", "evidence": "What is blocking you"}'`);
-  sections.push("```");
-  sections.push("");
-
-  // Behavioral rules
-  sections.push("## Rules");
-  sections.push("");
-  sections.push("- Focus ONLY on this task. Do not work on other tasks.");
-  sections.push("- Report `review` when work is complete and ready for review.");
-  sections.push("- Report `blocked` if you cannot proceed, with a clear explanation.");
-  sections.push("- Do not mark your own work as `done` — only reviewers do that.");
-  sections.push("- Commit your changes with the prefix `T" + task.id + "` in the commit message.");
-  sections.push("");
+  // Phase-specific instructions
+  if (task.phase === "analysis") {
+    appendAnalysisInstructions(sections, task, config);
+  } else if (task.phase === "decomposition") {
+    appendDecompositionInstructions(sections, task, config);
+  } else {
+    appendExecutionInstructions(sections, task, config);
+  }
 
   return sections.join("\n");
 }
@@ -310,6 +291,153 @@ function buildReviewPrompt(core: Core, task: Task, config: Config): string {
   sections.push("");
 
   return sections.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Phase-specific instructions
+// ---------------------------------------------------------------------------
+
+function appendAnalysisInstructions(sections: string[], task: Task, config: Config): void {
+  sections.push("## Your Role: Analyst");
+  sections.push("");
+  sections.push("You are analyzing this task to decide the best approach. Your job is NOT to do the work — it is to decide HOW the work should be done.");
+  sections.push("");
+  sections.push("Consider:");
+  sections.push("- Is this task simple enough to execute directly by a single agent?");
+  sections.push("- Is it complex enough that it should be decomposed into smaller subtasks?");
+  sections.push("- Is it impossible, blocked, or missing critical information?");
+  if (task.failureSummaries.length > 0) {
+    sections.push("- Previous attempts have failed (see above). What went wrong? Should we try a different approach or decompose differently?");
+  }
+  if (task.approachHistory.length > 0) {
+    sections.push("");
+    sections.push("### Previous Approaches");
+    sections.push("");
+    for (const approach of task.approachHistory) {
+      sections.push(`- **v${approach.version}**: ${approach.description} — outcome: ${approach.outcome}`);
+      if (approach.failureSummary) {
+        sections.push(`  Failed: ${approach.failureSummary}`);
+      }
+    }
+    sections.push("");
+  }
+  sections.push("");
+  sections.push("## How to Report Your Decision");
+  sections.push("");
+  sections.push("Choose ONE of these options:");
+  sections.push("");
+  sections.push("```bash");
+  sections.push(`# Option 1: Execute directly (task is simple enough for one agent)`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
+  sections.push(`  -H 'Content-Type: application/json' \\`);
+  sections.push(`  -d '{"status": "execute"}'`);
+  sections.push("");
+  sections.push(`# Option 2: Decompose into subtasks (task is too complex for one agent)`);
+  sections.push(`# Start a decomposition session — the response will guide you through adding subtasks one at a time:`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/decompose/start`);
+  sections.push("");
+  sections.push(`# Option 3: Block (cannot proceed, missing info or impossible)`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
+  sections.push(`  -H 'Content-Type: application/json' \\`);
+  sections.push(`  -d '{"status": "blocked", "evidence": "Why this cannot proceed"}'`);
+  sections.push("```");
+  sections.push("");
+  sections.push("## Rules");
+  sections.push("");
+  sections.push("- Do NOT do the actual work. Your job is to analyze and decide.");
+  sections.push("- Write your analysis in the journal before submitting your decision.");
+  sections.push("- If previous attempts failed, explain what should change this time.");
+  sections.push("- Prefer `execute` for tasks a single agent can handle in one session.");
+  sections.push("- Prefer `decompose` for tasks that need multiple independent work streams.");
+  sections.push("");
+}
+
+function appendDecompositionInstructions(sections: string[], task: Task, config: Config): void {
+  const costRemaining = task.cost.allocated - task.cost.consumed - task.cost.childAllocated + task.cost.childRecovered;
+
+  sections.push("## Your Role: Decomposer");
+  sections.push("");
+  sections.push("You are breaking this task into smaller, independent subtasks. Each subtask will be assigned to an agent and executed separately.");
+  sections.push("");
+  sections.push(`**Cost budget remaining**: ${costRemaining} (you must allocate cost to each child from this budget)`);
+  sections.push(`**Decomposition version**: ${task.decompositionVersion + 1}` + (task.decompositionVersion > 0 ? " (re-decomposition — previous attempt failed)" : ""));
+  sections.push("");
+  if (task.approachHistory.length > 0) {
+    sections.push("### Previous Decompositions");
+    sections.push("");
+    for (const approach of task.approachHistory) {
+      sections.push(`- **v${approach.version}**: ${approach.description} — outcome: ${approach.outcome}`);
+      if (approach.failureSummary) {
+        sections.push(`  Failed: ${approach.failureSummary}`);
+      }
+    }
+    sections.push("");
+    sections.push("**Do not repeat the same decomposition.** Use a different strategy.");
+    sections.push("");
+  }
+  sections.push("## Guidelines");
+  sections.push("");
+  sections.push("- Each subtask should be completable by a single agent in one session");
+  sections.push("- Subtasks should be as independent as possible");
+  sections.push("- Allocate cost proportional to expected complexity (total must not exceed " + costRemaining + ")");
+  sections.push("- Use `skipAnalysis: true` for straightforward subtasks, `false` for complex ones");
+  sections.push("- Set dependencies between subtasks when order matters");
+  sections.push("");
+  sections.push("## How to Submit Your Decomposition");
+  sections.push("");
+  sections.push("Use the incremental decompose CLI — it guides you step by step:");
+  sections.push("");
+  sections.push("```bash");
+  sections.push(`# Step 1: Start a decomposition session`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/decompose/start`);
+  sections.push("");
+  sections.push(`# Step 2: Add children one at a time (repeat for each subtask)`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/decompose/add-child \\`);
+  sections.push(`  -H 'Content-Type: application/json' \\`);
+  sections.push(`  -d '{"title": "Subtask title", "description": "...", "costAllocation": 10, "skipAnalysis": true}'`);
+  sections.push("");
+  sections.push(`# Step 3: Commit when all children are added`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/decompose/commit \\`);
+  sections.push(`  -H 'Content-Type: application/json' \\`);
+  sections.push(`  -d '{"approach": "Brief description of your decomposition strategy"}'`);
+  sections.push("```");
+  sections.push("");
+  sections.push("Each response includes guidance for the next step. Optional child fields: `assignee`, `reviewer`, `dependsOnSiblings` (0-based sibling indices).");
+  sections.push("");
+  sections.push("## Rules");
+  sections.push("");
+  sections.push("- Do NOT do the actual work. Your job is to plan and decompose.");
+  sections.push("- Write your decomposition rationale in the journal.");
+  sections.push("- Each child must have a clear, self-contained description.");
+  sections.push("- Total child cost allocations must not exceed " + costRemaining + ".");
+  sections.push("");
+}
+
+function appendExecutionInstructions(sections: string[], task: Task, config: Config): void {
+  sections.push("## How to Report Status");
+  sections.push("");
+  sections.push("When done, report your status:");
+  sections.push("");
+  sections.push("```bash");
+  sections.push(`# Work complete → submit for review:`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
+  sections.push(`  -H 'Content-Type: application/json' \\`);
+  sections.push(`  -d '{"status": "review", "evidence": "Description of what you did"}'`);
+  sections.push("");
+  sections.push(`# Blocked → cannot proceed:`);
+  sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`);
+  sections.push(`  -H 'Content-Type: application/json' \\`);
+  sections.push(`  -d '{"status": "blocked", "evidence": "What is blocking you"}'`);
+  sections.push("```");
+  sections.push("");
+  sections.push("## Rules");
+  sections.push("");
+  sections.push("- Focus ONLY on this task. Do not work on other tasks.");
+  sections.push("- Report `review` when work is complete and ready for review.");
+  sections.push("- Report `blocked` if you cannot proceed, with a clear explanation.");
+  sections.push("- Do not mark your own work as `done` — only reviewers do that.");
+  sections.push("- Commit your changes with the prefix `T" + task.id + "` in the commit message.");
+  sections.push("");
 }
 
 // ---------------------------------------------------------------------------
