@@ -31,6 +31,21 @@ import type { Config } from "./config.js";
 import { loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
 
 // ---------------------------------------------------------------------------
+// Priority helpers
+// ---------------------------------------------------------------------------
+
+const PRIORITY_RANK: Record<string, number> = {
+  critical: 0, high: 1, medium: 2, low: 3, backlog: 4,
+};
+
+/** Return the higher of two priorities (lower rank number = higher priority). */
+function maxPriority(a: string, b: string): string {
+  const ra = PRIORITY_RANK[a] ?? 2;
+  const rb = PRIORITY_RANK[b] ?? 2;
+  return ra <= rb ? a : b;
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -100,6 +115,7 @@ interface PendingChild {
   skipAnalysis: boolean;
   assignee: string | undefined;
   reviewer: string | undefined;
+  priority: string | undefined;
   dependsOnSiblings: number[];
 }
 
@@ -1277,6 +1293,7 @@ function handleDecomposeAddChild(
       skipAnalysis?: boolean;
       assignee?: string;
       reviewer?: string;
+      priority?: string;
       dependsOnSiblings?: number[];
     };
 
@@ -1325,6 +1342,7 @@ function handleDecomposeAddChild(
       skipAnalysis: b.skipAnalysis ?? false,
       assignee: b.assignee,
       reviewer: b.reviewer,
+      priority: b.priority,
       dependsOnSiblings: b.dependsOnSiblings ?? [],
     });
 
@@ -1490,7 +1508,8 @@ function handleDecomposeCommit(
       const metadata: Record<string, unknown> = {};
       if (child.assignee) metadata["assignee"] = child.assignee;
       if (child.reviewer) metadata["reviewer"] = child.reviewer;
-      metadata["priority"] = parentPriority;
+      const childPriority = ("priority" in child ? (child as { priority?: string }).priority : undefined) ?? "medium";
+      metadata["priority"] = maxPriority(parentPriority, childPriority);
 
       childSpecs.push({
         taskId: childId,
@@ -1709,7 +1728,8 @@ function handleDecompose(
       const metadata: Record<string, unknown> = {};
       if (child.assignee) metadata["assignee"] = child.assignee;
       if (child.reviewer) metadata["reviewer"] = child.reviewer;
-      metadata["priority"] = parentPriority;
+      const childPriority = ("priority" in child ? (child as { priority?: string }).priority : undefined) ?? "medium";
+      metadata["priority"] = maxPriority(parentPriority, childPriority);
 
       childSpecs.push({
         taskId: childId,
