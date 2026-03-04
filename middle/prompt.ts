@@ -14,6 +14,11 @@ import { getWorktreePath } from "./worktree.js";
 // Public API
 // ---------------------------------------------------------------------------
 
+export interface PromptOverrides {
+  journalWorktreePath?: string | null;
+  codeWorktreePath?: string | null;
+}
+
 /**
  * Build a prompt for an agent working on a task.
  *
@@ -24,6 +29,7 @@ export function buildPrompt(
   taskId: TaskId,
   mode: "work" | "review",
   config: Config,
+  overrides?: PromptOverrides,
 ): string {
   const task = core.getTask(taskId);
   if (!task) return `Error: Task ${taskId} not found`;
@@ -31,14 +37,14 @@ export function buildPrompt(
   if (mode === "review") {
     return buildReviewPrompt(core, task, config);
   }
-  return buildWorkPrompt(core, task, config);
+  return buildWorkPrompt(core, task, config, overrides);
 }
 
 // ---------------------------------------------------------------------------
 // Work prompt
 // ---------------------------------------------------------------------------
 
-function buildWorkPrompt(core: Core, task: Task, config: Config): string {
+function buildWorkPrompt(core: Core, task: Task, config: Config, overrides?: PromptOverrides): string {
   const sections: string[] = [];
 
   // Header
@@ -133,12 +139,14 @@ function buildWorkPrompt(core: Core, task: Task, config: Config): string {
     sections.push("");
   }
 
-  // Workspace paths
-  const journalPath = getWorktreePath(config.worktreeBaseDir, task.id, "journal")
-    + `/tasks/T${task.id}/`;
-  const codeWorktree = task.metadata["repo"]
-    ? getWorktreePath(config.worktreeBaseDir, task.id, "code")
-    : null;
+  // Workspace paths — use actual worktree paths when available
+  const journalBase = overrides?.journalWorktreePath
+    ?? getWorktreePath(config.worktreeBaseDir, task.id, "journal");
+  const journalPath = `${journalBase}/tasks/T${task.id}/`;
+  const codeWorktree = overrides?.codeWorktreePath
+    ?? (task.metadata["repo"]
+      ? getWorktreePath(config.worktreeBaseDir, task.id, "code")
+      : null);
 
   sections.push("## Your Workspace");
   sections.push("");

@@ -16,7 +16,7 @@ export function createWorktree(
   branch: string,
   startPoint?: string,
 ): string {
-  fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+  ensureDir(path.dirname(worktreePath));
 
   const args = ["worktree", "add", worktreePath, branch];
   if (startPoint) {
@@ -56,7 +56,7 @@ export function removeWorktree(
   } catch {
     // Force cleanup if git worktree remove fails
     try {
-      fs.rmSync(worktreePath, { recursive: true, force: true });
+      removeDir(worktreePath);
       git(repoPath, ["worktree", "prune"]);
     } catch {
       // Best effort
@@ -141,7 +141,7 @@ export function cleanupStaleWorktrees(baseDir: string): number {
     if (!stat.isDirectory()) continue;
 
     try {
-      fs.rmSync(fullPath, { recursive: true, force: true });
+      removeDir(fullPath);
       cleaned++;
     } catch {
       // Best effort
@@ -159,6 +159,7 @@ export function cleanupStaleWorktrees(baseDir: string): number {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Run a git command. */
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, {
     cwd,
@@ -169,4 +170,14 @@ function git(cwd: string, args: string[]): string {
       GIT_TERMINAL_PROMPT: "0",
     },
   });
+}
+
+/** mkdir -p */
+function ensureDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+/** rm -rf */
+function removeDir(target: string): void {
+  fs.rmSync(target, { recursive: true, force: true });
 }
