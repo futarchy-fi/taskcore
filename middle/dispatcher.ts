@@ -171,6 +171,24 @@ function classifyAgentFailure(
 }
 
 // ---------------------------------------------------------------------------
+// Agent spawn wrapper — run agents as a different OS user if configured
+// ---------------------------------------------------------------------------
+
+function spawnAgent(
+  config: Config,
+  command: string,
+  args: string[],
+  options: Parameters<typeof spawn>[2],
+): ChildProcess {
+  if (config.agentRunAsUser) {
+    // Wrap with sudo to run as the configured user
+    const sudoArgs = ["-n", "-u", config.agentRunAsUser, "-E", command, ...args];
+    return spawn("sudo", sudoArgs, options);
+  }
+  return spawn(command, args, options);
+}
+
+// ---------------------------------------------------------------------------
 // Telegram notifications — batched digest
 // ---------------------------------------------------------------------------
 
@@ -788,7 +806,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       spawnEnv["CODE_WORKTREE"] = codeWorktreePath;
     }
 
-    const child = spawn(config.agentCommand, args, {
+    const child = spawnAgent(config, config.agentCommand, args, {
       cwd: config.workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
       env: spawnEnv,
@@ -1144,7 +1162,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
 
     console.log(`[dispatcher] T${task.id} sending status nudge to session ${originalRun.sessionId.slice(0, 8)}`);
 
-    const child = spawn(config.agentCommand, args, {
+    const child = spawnAgent(config, config.agentCommand, args, {
       cwd: config.workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
       env: {

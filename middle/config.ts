@@ -41,6 +41,8 @@ export interface Config {
   lifecycleFile: string;
   /** Agent spawn command */
   agentCommand: string;
+  /** OS user to spawn agents as (via sudo). Empty = inherit from daemon. */
+  agentRunAsUser: string;
   /** Telegram notification target */
   telegramTarget: string;
   /** Default cost budget for new tasks */
@@ -96,6 +98,7 @@ export function loadConfig(): Config {
       `${workspaceDir}/data/task-dashboard/task_run_lifecycle.jsonl`,
     ),
     agentCommand: envStr("AGENT_COMMAND", "openclaw"),
+    agentRunAsUser: envStr("AGENT_RUN_AS_USER", ""),  // spawn agents as this OS user (via sudo)
     telegramTarget: envStr("TELEGRAM_TARGET", ""),
     defaultCostBudget: envInt("DEFAULT_COST_BUDGET", 100),
     defaultContextBudget: envInt("DEFAULT_CONTEXT_BUDGET", 200),
