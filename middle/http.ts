@@ -1416,7 +1416,7 @@ function handleDecomposeCommit(
         phase: "decomposition",
         leaseTimeout: 300_000,
         sessionId: ctx.sessionId,
-        sessionType: "continued",
+        sessionType: "fresh",
         contextBudget: config.defaultContextBudget,
       };
       err = submitOrError(core, lg);
@@ -1630,7 +1630,7 @@ function handleDecompose(
         phase: "decomposition",
         leaseTimeout: 300_000,
         sessionId: ctx.sessionId,
-        sessionType: "continued",
+        sessionType: "fresh",
         contextBudget: config.defaultContextBudget,
       };
       err = submitOrError(core, lg);
