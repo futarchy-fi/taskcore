@@ -380,7 +380,7 @@ function appendDecompositionInstructions(sections: string[], task: Task, config:
   sections.push("- Each subtask should be completable by a single agent in one session");
   sections.push("- Subtasks should be as independent as possible");
   sections.push("- Allocate cost proportional to expected complexity (total must not exceed " + costRemaining + ")");
-  sections.push("- Use `skipAnalysis: true` for straightforward subtasks, `false` for complex ones");
+  sections.push("- Leave `skipAnalysis` unset (defaults to false) — the analyst evaluates feasibility before execution. Only set `skipAnalysis: true` for trivial subtasks.");
   sections.push("- Set dependencies between subtasks when order matters");
   sections.push("");
   sections.push("## How to Submit Your Decomposition");
@@ -394,7 +394,7 @@ function appendDecompositionInstructions(sections: string[], task: Task, config:
   sections.push(`# Step 2: Add children one at a time (repeat for each subtask)`);
   sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/decompose/add-child \\`);
   sections.push(`  -H 'Content-Type: application/json' \\`);
-  sections.push(`  -d '{"title": "Subtask title", "description": "...", "costAllocation": 10, "skipAnalysis": true}'`);
+  sections.push(`  -d '{"title": "Subtask title", "description": "...", "costAllocation": 10}'`);
   sections.push("");
   sections.push(`# Step 3: Commit when all children are added`);
   sections.push(`curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/decompose/commit \\`);
