@@ -623,6 +623,9 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
   }
 
   function runOnce(): void {
+    // Reap active runs whose tasks have gone terminal (e.g. cancelled via API)
+    reapTerminalRuns();
+
     const dispatchable = core.getDispatchable();
     if (dispatchable.length === 0) return;
 
@@ -1176,6 +1179,22 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     child.on("close", (code, sig) => {
       handleChildExit(nudgeRun, code ?? -1, sig, stdout, stderr);
     });
+  }
+
+  /**
+   * Kill agent processes for tasks that went terminal outside the dispatcher
+   * (e.g. cancelled via HTTP API, blocked, or re-decomposed).
+   */
+  function reapTerminalRuns(): void {
+    for (const [taskId, run] of activeRuns) {
+      const task = core.getTask(taskId);
+      if (!task || task.terminal !== null) {
+        console.log(`[dispatcher] Reaping T${taskId} (${run.agentId}) — task is ${task?.terminal ?? "missing"}`);
+        if (run.killTimer) clearTimeout(run.killTimer);
+        run.process.kill("SIGTERM");
+        // handleChildExit will fire on process close and clean up activeRuns
+      }
+    }
   }
 
   function stopAll(): void {
