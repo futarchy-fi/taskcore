@@ -142,7 +142,9 @@ function buildWorkPrompt(core: Core, task: Task, config: Config): string {
 
   sections.push("## Your Workspace");
   sections.push("");
-  sections.push(`- **Journal**: \`${journalPath}\` — write observations, decisions, reasoning here`);
+  sections.push(`- **Journal**: \`${journalPath}\` — write your work here`);
+  sections.push(`  - \`journal.md\` is special: the reviewer sees it first, before anything else. Put your main findings, reasoning, and conclusions there.`);
+  sections.push(`  - You can create additional files (reports, data, analysis) in this directory. The reviewer can browse them but won't see them automatically.`);
   if (codeWorktree) {
     sections.push(`- **Code**: \`${codeWorktree}\` — make code changes here`);
   }
