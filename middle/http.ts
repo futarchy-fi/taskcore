@@ -2,11 +2,15 @@ import * as http from "node:http";
 import type { Core } from "../core/index.js";
 import type {
   AgentContext,
+  AgentStarted,
   AttemptBudgetMaxInput,
   BudgetIncreased,
+  DecompositionChildSpec,
+  DecompositionCreated,
   Dependency,
   Event,
   FailureSummary,
+  LeaseGranted,
   MetadataUpdated,
   ReviewPolicyMet,
   ReviewVerdictSubmitted,
@@ -71,6 +75,42 @@ interface TaskCreateBody {
   costBudget?: number;
   dependsOn?: string | string[];
 }
+
+interface DecomposeBody {
+  children: Array<{
+    title: string;
+    description: string;
+    costAllocation: number;
+    skipAnalysis?: boolean;
+    assignee?: string;
+    reviewer?: string;
+    dependsOnSiblings?: number[];
+  }>;
+  approach?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Incremental decomposition (multi-step CLI)
+// ---------------------------------------------------------------------------
+
+interface PendingChild {
+  title: string;
+  description: string;
+  costAllocation: number;
+  skipAnalysis: boolean;
+  assignee: string | undefined;
+  reviewer: string | undefined;
+  dependsOnSiblings: number[];
+}
+
+interface PendingDecomposition {
+  taskId: string;
+  startedAt: number;
+  approach: string;
+  children: PendingChild[];
+}
+
+const pendingDecompositions = new Map<string, PendingDecomposition>();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -267,6 +307,10 @@ function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[]
     { method: "POST", pattern: "/tasks/:id/reparent", handler: handleReparent(core) },
     { method: "POST", pattern: "/tasks/:id/revive", handler: handleRevive(core) },
     { method: "POST", pattern: "/tasks/:id/budget", handler: handleBudgetIncrease(core) },
+    { method: "POST", pattern: "/tasks/:id/decompose/start", handler: handleDecomposeStart(core) },
+    { method: "POST", pattern: "/tasks/:id/decompose/add-child", handler: handleDecomposeAddChild(core) },
+    { method: "POST", pattern: "/tasks/:id/decompose/commit", handler: handleDecomposeCommit(core, config) },
+    { method: "POST", pattern: "/tasks/:id/decompose", handler: handleDecompose(core, config) },
     { method: "PATCH", pattern: "/tasks/:id/metadata", handler: handleMetadataUpdate(core, registry) },
     { method: "GET", pattern: "/attention", handler: handleAttention(core) },
     { method: "GET", pattern: "/attention/telegram", handler: handleAttentionTelegram(core) },
@@ -560,7 +604,7 @@ function handleStatusUpdate(
         return applyExecuteTransition(core, task, fenceToken, ctx, now);
 
       case "decompose":
-        return { status: 501, body: { error: "not_implemented", message: "Decompose via status not yet supported" } };
+        return applyDecomposeTransition(core, task, fenceToken, ctx, now);
 
       case "cancel":
         return applyCancelTransition(core, task, now, b.evidence);
@@ -1088,6 +1132,632 @@ function applyExecuteTransition(
   return {
     status: 200,
     body: { ok: true, taskId: task.id, transition: "analysis.active → execution.ready" },
+  };
+}
+
+function applyDecomposeTransition(
+  core: Core,
+  task: Task,
+  fenceToken: number,
+  ctx: AgentContext,
+  ts: number,
+): RouteResult {
+  if (task.phase !== "analysis" || task.condition !== "active") {
+    return {
+      status: 409,
+      body: {
+        error: "invalid_state",
+        message: `Task must be in analysis.active for decompose, got ${task.phase}.${task.condition}`,
+      },
+    };
+  }
+
+  const transition: PhaseTransition = {
+    type: "PhaseTransition",
+    taskId: task.id,
+    ts,
+    from: { phase: "analysis", condition: "active" },
+    to: { phase: "decomposition", condition: "ready" },
+    reasonCode: "decision_decompose",
+    reason: "Analysis complete, decomposing into subtasks",
+    fenceToken,
+    agentContext: ctx,
+  };
+
+  const err = submitOrError(core, transition);
+  if (err) return err;
+
+  return {
+    status: 200,
+    body: { ok: true, taskId: task.id, transition: "analysis.active → decomposition.ready" },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// POST /tasks/:id/decompose/start — begin incremental decomposition session
+// ---------------------------------------------------------------------------
+
+function handleDecomposeStart(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, _body) => {
+    const taskId = params["id"]!;
+    const task = core.getTask(taskId);
+
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+    if (task.terminal) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+
+    // Accept from analysis.active or decomposition.active
+    if (
+      !((task.phase === "analysis" && task.condition === "active") ||
+        (task.phase === "decomposition" && task.condition === "active"))
+    ) {
+      return {
+        status: 409,
+        body: {
+          error: "invalid_state",
+          message: `Task must be in analysis.active or decomposition.active, got ${task.phase}.${task.condition}`,
+        },
+      };
+    }
+
+    // Idempotent: return existing session if one exists
+    const existing = pendingDecompositions.get(taskId);
+    if (existing) {
+      const costRemaining = computeCostRemaining(task);
+      const usedCost = existing.children.reduce((s, c) => s + c.costAllocation, 0);
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          taskId,
+          session: "resumed",
+          budget: costRemaining,
+          budgetRemaining: costRemaining - usedCost,
+          childrenSoFar: existing.children.length,
+          decompositionVersion: task.decompositionVersion + 1,
+          guidance: buildAddChildGuidance(taskId),
+        },
+      };
+    }
+
+    const costRemaining = computeCostRemaining(task);
+
+    pendingDecompositions.set(taskId, {
+      taskId,
+      startedAt: Date.now(),
+      approach: "",
+      children: [],
+    });
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        session: "created",
+        budget: costRemaining,
+        budgetRemaining: costRemaining,
+        decompositionVersion: task.decompositionVersion + 1,
+        guidance: buildAddChildGuidance(taskId),
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/decompose/add-child — add one child to pending session
+function handleDecomposeAddChild(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const pending = pendingDecompositions.get(taskId);
+
+    if (!pending) {
+      return {
+        status: 409,
+        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call POST /tasks/${taskId}/decompose/start first.` },
+      };
+    }
+
+    const task = core.getTask(taskId);
+    if (!task) {
+      pendingDecompositions.delete(taskId);
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const b = body as {
+      title?: string;
+      description?: string;
+      costAllocation?: number;
+      skipAnalysis?: boolean;
+      assignee?: string;
+      reviewer?: string;
+      dependsOnSiblings?: number[];
+    };
+
+    // Validate required fields
+    if (!b.title || !b.title.trim()) {
+      return { status: 400, body: { error: "missing_title", message: "title is required" } };
+    }
+    if (!b.description || !b.description.trim()) {
+      return { status: 400, body: { error: "missing_description", message: "description is required" } };
+    }
+    if (b.costAllocation == null || b.costAllocation <= 0) {
+      return { status: 400, body: { error: "invalid_cost", message: "costAllocation must be > 0" } };
+    }
+
+    // Validate sibling indices
+    if (b.dependsOnSiblings) {
+      for (const idx of b.dependsOnSiblings) {
+        if (idx < 0 || idx >= pending.children.length) {
+          return {
+            status: 400,
+            body: { error: "invalid_sibling_index", message: `dependsOnSiblings index ${idx} is out of range (0..${pending.children.length - 1})` },
+          };
+        }
+      }
+    }
+
+    // Validate cumulative cost
+    const costRemaining = computeCostRemaining(task);
+    const usedCost = pending.children.reduce((s, c) => s + c.costAllocation, 0);
+    const newTotal = usedCost + b.costAllocation;
+    if (newTotal > costRemaining) {
+      return {
+        status: 422,
+        body: {
+          error: "cost_exceeded",
+          message: `Adding ${b.costAllocation} would bring total to ${newTotal}, exceeding budget ${costRemaining}`,
+        },
+      };
+    }
+
+    const childIndex = pending.children.length;
+    pending.children.push({
+      title: b.title.trim(),
+      description: b.description.trim(),
+      costAllocation: b.costAllocation,
+      skipAnalysis: b.skipAnalysis ?? false,
+      assignee: b.assignee,
+      reviewer: b.reviewer,
+      dependsOnSiblings: b.dependsOnSiblings ?? [],
+    });
+
+    const childrenSummary = pending.children.map((c, i) => ({
+      index: i,
+      title: c.title,
+      costAllocation: c.costAllocation,
+    }));
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        childIndex,
+        childrenSoFar: pending.children.length,
+        budgetRemaining: costRemaining - newTotal,
+        children: childrenSummary,
+        guidance: `Child ${childIndex} added ("${b.title.trim()}"). Add another child or commit the decomposition:\n` +
+          `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/add-child -H 'Content-Type: application/json' -d '{...}'\n` +
+          `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/commit -H 'Content-Type: application/json' -d '{"approach": "your strategy"}'`,
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/decompose/commit — finalize decomposition
+function handleDecomposeCommit(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const pending = pendingDecompositions.get(taskId);
+
+    if (!pending) {
+      return {
+        status: 409,
+        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call POST /tasks/${taskId}/decompose/start first.` },
+      };
+    }
+
+    if (pending.children.length === 0) {
+      return {
+        status: 400,
+        body: { error: "no_children", message: "At least one child must be added before committing" },
+      };
+    }
+
+    const b = body as { approach?: string };
+    const approach = b.approach ?? (pending.approach || "Decomposed via incremental CLI");
+
+    // Delegate to the one-shot handler logic by constructing a DecomposeBody
+    // and reusing handleDecompose's internals. Instead, we directly inline the
+    // same logic to avoid coupling, since we already have the pending state.
+
+    let task = core.getTask(taskId);
+    if (!task) {
+      pendingDecompositions.delete(taskId);
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+    if (task.terminal) {
+      pendingDecompositions.delete(taskId);
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+
+    const now = Date.now();
+
+    // Transition from analysis.active if needed (same logic as handleDecompose)
+    if (task.phase === "analysis" && task.condition === "active") {
+      const fenceToken = task.currentFenceToken;
+      const ctx = agentContextFor(task);
+
+      const pt: PhaseTransition = {
+        type: "PhaseTransition", taskId, ts: now,
+        from: { phase: "analysis", condition: "active" },
+        to: { phase: "decomposition", condition: "ready" },
+        reasonCode: "decision_decompose",
+        reason: approach,
+        fenceToken, agentContext: ctx,
+      };
+      let err = submitOrError(core, pt);
+      if (err) { pendingDecompositions.delete(taskId); return err; }
+
+      const newFence = fenceToken + 1;
+      const lg: LeaseGranted = {
+        type: "LeaseGranted", taskId, ts: now + 1,
+        fenceToken: newFence,
+        agentId: ctx.agentId,
+        phase: "decomposition",
+        leaseTimeout: 300_000,
+        sessionId: ctx.sessionId,
+        sessionType: "continued",
+        contextBudget: config.defaultContextBudget,
+      };
+      err = submitOrError(core, lg);
+      if (err) { pendingDecompositions.delete(taskId); return err; }
+
+      const agentStart: AgentStarted = {
+        type: "AgentStarted", taskId, ts: now + 2,
+        fenceToken: newFence,
+        agentContext: ctx,
+      };
+      err = submitOrError(core, agentStart);
+      if (err) { pendingDecompositions.delete(taskId); return err; }
+
+      task = core.getTask(taskId)!;
+    } else if (task.phase !== "decomposition" || task.condition !== "active") {
+      pendingDecompositions.delete(taskId);
+      return {
+        status: 409,
+        body: {
+          error: "invalid_state",
+          message: `Task must be in analysis.active or decomposition.active, got ${task.phase}.${task.condition}`,
+        },
+      };
+    }
+
+    // Task is now in decomposition.active — create children
+    const fenceToken = task.currentFenceToken;
+    const ctx = agentContextFor(task);
+    const version = task.decompositionVersion + 1;
+
+    // Validate total cost doesn't exceed remaining budget
+    const costRemaining = computeCostRemaining(task);
+    const totalChildCost = pending.children.reduce((s, c) => s + c.costAllocation, 0);
+    if (totalChildCost > costRemaining) {
+      pendingDecompositions.delete(taskId);
+      return {
+        status: 422,
+        body: {
+          error: "cost_exceeded",
+          message: `Total child cost (${totalChildCost}) exceeds parent remaining budget (${costRemaining})`,
+        },
+      };
+    }
+
+    // Generate unique child IDs
+    const baseId = parseInt(nextTaskId(core), 10);
+    const childIdMap: Record<number, string> = {};
+    const childSpecs: DecompositionChildSpec[] = [];
+
+    for (let i = 0; i < pending.children.length; i++) {
+      const childId = String(baseId + i);
+      childIdMap[i] = childId;
+      const child = pending.children[i]!;
+
+      const deps: Dependency[] = [];
+      for (const sibIdx of child.dependsOnSiblings) {
+        const depTargetId = childIdMap[sibIdx];
+        if (depTargetId) {
+          deps.push({
+            id: `dep-${childId}-on-${depTargetId}`,
+            type: "task",
+            target: depTargetId,
+            blocking: true,
+            timing: "before_start",
+            status: "pending",
+          });
+        }
+      }
+
+      const metadata: Record<string, unknown> = {};
+      if (child.assignee) metadata["assignee"] = child.assignee;
+      if (child.reviewer) metadata["reviewer"] = child.reviewer;
+
+      childSpecs.push({
+        taskId: childId,
+        title: child.title,
+        description: child.description,
+        costAllocation: child.costAllocation,
+        skipAnalysis: child.skipAnalysis,
+        dependencies: deps,
+        metadata,
+      });
+    }
+
+    // Submit DecompositionCreated
+    const decomp: DecompositionCreated = {
+      type: "DecompositionCreated",
+      taskId, ts: now + 3,
+      fenceToken,
+      version,
+      children: childSpecs,
+      checkpoints: [],
+      completionRule: "and",
+      agentContext: ctx,
+    };
+
+    let err = submitOrError(core, decomp);
+    if (err) { pendingDecompositions.delete(taskId); return err; }
+
+    // Transition parent to review.waiting
+    const waitTransition: PhaseTransition = {
+      type: "PhaseTransition",
+      taskId, ts: now + 4,
+      from: { phase: "decomposition", condition: "active" },
+      to: { phase: "review", condition: "waiting" },
+      reasonCode: "children_created",
+      reason: `Decomposed into ${pending.children.length} subtasks`,
+      fenceToken,
+      agentContext: ctx,
+    };
+
+    err = submitOrError(core, waitTransition);
+    if (err) { pendingDecompositions.delete(taskId); return err; }
+
+    // Clean up pending session
+    pendingDecompositions.delete(taskId);
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        children: childSpecs.map(c => ({ id: c.taskId, title: c.title, costAllocation: c.costAllocation })),
+        decompositionVersion: version,
+        transition: "→ review.waiting",
+      },
+    };
+  };
+}
+
+// Helpers for incremental decomposition
+export function cleanupPendingDecompositions(core: Core): void {
+  for (const [taskId] of pendingDecompositions) {
+    const task = core.getTask(taskId);
+    if (
+      !task ||
+      task.terminal !== null ||
+      (task.phase !== "analysis" && task.phase !== "decomposition")
+    ) {
+      pendingDecompositions.delete(taskId);
+    }
+  }
+}
+
+function computeCostRemaining(task: Task): number {
+  return task.cost.allocated - task.cost.consumed - task.cost.childAllocated + task.cost.childRecovered;
+}
+
+function buildAddChildGuidance(taskId: string): string {
+  return `Add children one at a time:\n` +
+    `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/add-child \\\n` +
+    `    -H 'Content-Type: application/json' \\\n` +
+    `    -d '{"title": "...", "description": "...", "costAllocation": 10, "skipAnalysis": true}'\n\n` +
+    `Optional fields: assignee, reviewer, dependsOnSiblings (array of sibling indices, 0-based).\n` +
+    `When done adding children, commit:\n` +
+    `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/commit \\\n` +
+    `    -H 'Content-Type: application/json' \\\n` +
+    `    -d '{"approach": "brief description of decomposition strategy"}'`;
+}
+
+// ---------------------------------------------------------------------------
+// POST /tasks/:id/decompose — one-shot decomposition endpoint (kept for compatibility)
+// ---------------------------------------------------------------------------
+
+function handleDecompose(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as DecomposeBody;
+
+    if (!b.children || !Array.isArray(b.children) || b.children.length === 0) {
+      return { status: 400, body: { error: "missing_children", message: "children array required with at least one child" } };
+    }
+
+    let task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+    if (task.terminal) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+
+    const now = Date.now();
+
+    // Accept from analysis.active or decomposition.active
+    if (task.phase === "analysis" && task.condition === "active") {
+      // Chain internal events: analysis.active → decomposition.ready → leased → active
+      const fenceToken = task.currentFenceToken;
+      const ctx = agentContextFor(task);
+
+      // 1. PhaseTransition to decomposition.ready
+      const pt: PhaseTransition = {
+        type: "PhaseTransition", taskId, ts: now,
+        from: { phase: "analysis", condition: "active" },
+        to: { phase: "decomposition", condition: "ready" },
+        reasonCode: "decision_decompose",
+        reason: b.approach ?? "Decomposing into subtasks",
+        fenceToken, agentContext: ctx,
+      };
+      let err = submitOrError(core, pt);
+      if (err) return err;
+
+      // 2. LeaseGranted for decomposition phase
+      const newFence = fenceToken + 1;
+      const lg: LeaseGranted = {
+        type: "LeaseGranted", taskId, ts: now + 1,
+        fenceToken: newFence,
+        agentId: ctx.agentId,
+        phase: "decomposition",
+        leaseTimeout: 300_000,
+        sessionId: ctx.sessionId,
+        sessionType: "continued",
+        contextBudget: config.defaultContextBudget,
+      };
+      err = submitOrError(core, lg);
+      if (err) return err;
+
+      // 3. AgentStarted
+      const agentStart: AgentStarted = {
+        type: "AgentStarted", taskId, ts: now + 2,
+        fenceToken: newFence,
+        agentContext: ctx,
+      };
+      err = submitOrError(core, agentStart);
+      if (err) return err;
+
+      // Re-fetch task after state changes
+      task = core.getTask(taskId)!;
+    } else if (task.phase !== "decomposition" || task.condition !== "active") {
+      return {
+        status: 409,
+        body: {
+          error: "invalid_state",
+          message: `Task must be in analysis.active or decomposition.active, got ${task.phase}.${task.condition}`,
+        },
+      };
+    }
+
+    // Task is now in decomposition.active — create children
+    const fenceToken = task.currentFenceToken;
+    const ctx = agentContextFor(task);
+    const version = task.decompositionVersion + 1;
+
+    // Validate total cost doesn't exceed remaining budget
+    const costRemaining = task.cost.allocated - task.cost.consumed - task.cost.childAllocated + task.cost.childRecovered;
+    const totalChildCost = b.children.reduce((sum, c) => sum + c.costAllocation, 0);
+    if (totalChildCost > costRemaining) {
+      return {
+        status: 422,
+        body: {
+          error: "cost_exceeded",
+          message: `Total child cost (${totalChildCost}) exceeds parent remaining budget (${costRemaining})`,
+        },
+      };
+    }
+
+    // Generate unique child IDs (sequential from next available)
+    const baseId = parseInt(nextTaskId(core), 10);
+    const childIdMap: Record<number, string> = {};
+    const childSpecs: DecompositionChildSpec[] = [];
+
+    for (let i = 0; i < b.children.length; i++) {
+      const childId = String(baseId + i);
+      childIdMap[i] = childId;
+      const child = b.children[i]!;
+
+      // Build dependencies from sibling indices
+      const deps: Dependency[] = [];
+      if (child.dependsOnSiblings) {
+        for (const sibIdx of child.dependsOnSiblings) {
+          const depTargetId = childIdMap[sibIdx];
+          if (depTargetId) {
+            deps.push({
+              id: `dep-${childId}-on-${depTargetId}`,
+              type: "task",
+              target: depTargetId,
+              blocking: true,
+              timing: "before_start",
+              status: "pending",
+            });
+          }
+        }
+      }
+
+      const metadata: Record<string, unknown> = {};
+      if (child.assignee) metadata["assignee"] = child.assignee;
+      if (child.reviewer) metadata["reviewer"] = child.reviewer;
+
+      childSpecs.push({
+        taskId: childId,
+        title: child.title,
+        description: child.description,
+        costAllocation: child.costAllocation,
+        skipAnalysis: child.skipAnalysis ?? false,
+        dependencies: deps,
+        metadata,
+      });
+    }
+
+    // Submit DecompositionCreated
+    const decomp: DecompositionCreated = {
+      type: "DecompositionCreated",
+      taskId, ts: now + 3,
+      fenceToken,
+      version,
+      children: childSpecs,
+      checkpoints: [],
+      completionRule: "and",
+      agentContext: ctx,
+    };
+
+    let err = submitOrError(core, decomp);
+    if (err) return err;
+
+    // Transition parent to review.waiting (waits for children to complete)
+    const waitTransition: PhaseTransition = {
+      type: "PhaseTransition",
+      taskId, ts: now + 4,
+      from: { phase: "decomposition", condition: "active" },
+      to: { phase: "review", condition: "waiting" },
+      reasonCode: "children_created",
+      reason: `Decomposed into ${b.children.length} subtasks`,
+      fenceToken,
+      agentContext: ctx,
+    };
+
+    err = submitOrError(core, waitTransition);
+    if (err) return err;
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        children: childSpecs.map(c => ({ id: c.taskId, title: c.title, costAllocation: c.costAllocation })),
+        decompositionVersion: version,
+        transition: "→ review.waiting",
+      },
+    };
   };
 }
 

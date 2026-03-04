@@ -17,7 +17,7 @@ import type {
   TaskCompleted,
 } from "../core/types.js";
 import type { Config } from "./config.js";
-import { autoAnalysis } from "./analysis.js";
+// autoAnalysis removed — all tasks go through real analysis unless skipAnalysis:true at creation
 import { buildPrompt } from "./prompt.js";
 import { loadRegistry as loadRegistryShared } from "./registry.js";
 import {
@@ -665,15 +665,6 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     const phase = task.phase;
     if (!phase) return;
 
-    // Handle analysis phase — auto-transition for assigned tasks
-    if (phase === "analysis") {
-      const autoTransitioned = autoAnalysis(core, task, config);
-      if (autoTransitioned) {
-        console.log(`[dispatcher] Auto-transitioned T${task.id} analysis → execution`);
-        return; // Will be picked up next cycle as execution.ready
-      }
-    }
-
     // Determine agent
     const agentId = selectAgent(task, phase);
     if (!agentId) {
@@ -861,6 +852,8 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     if (phase === "review") {
       agent = reviewer ?? null;
     } else if (phase === "analysis") {
+      agent = assignee ?? "analyst";
+    } else if (phase === "decomposition") {
       agent = assignee ?? "analyst";
     } else {
       agent = assignee ?? null;
