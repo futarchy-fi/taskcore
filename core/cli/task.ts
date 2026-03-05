@@ -1,0 +1,1707 @@
+#!/usr/bin/env node
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const PORT = Number.parseInt(process.env["ORCHESTRATOR_PORT"] ?? "18800", 10);
+const BASE_URL = `http://127.0.0.1:${Number.isFinite(PORT) ? PORT : 18800}`;
+
+interface ApiResponse<T = unknown> {
+  status: number;
+  body: T;
+}
+
+interface TaskContext {
+  taskId: string;
+  phase: string | null;
+  fenceToken: number;
+  sessionId: string;
+  journalPath: string;
+  codeWorktree: string | null;
+  claimedAt: number;
+  reviewNotes?: string[];
+}
+
+type FlagValue = boolean | string | string[];
+
+interface ParsedFlags {
+  positionals: string[];
+  flags: Record<string, FlagValue>;
+}
+
+class CliError extends Error {
+  code: number;
+
+  constructor(message: string, code = 1) {
+    super(message);
+    this.code = code;
+  }
+}
+
+class ApiError extends Error {
+  status: number;
+  body: unknown;
+
+  constructor(status: number, body: unknown) {
+    const bodyObj = asRecord(body);
+    const msg = bodyObj?.["message"];
+    const fallback = typeof msg === "string" ? msg : `API error (${status})`;
+    super(fallback);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asArray<T = unknown>(value: unknown): T[] {
+  return Array.isArray(value) ? (value as T[]) : [];
+}
+
+function formatMoney(value: unknown): string {
+  const n = asNumber(value);
+  if (n === null) return "n/a";
+  return `$${n.toFixed(2)}`;
+}
+
+function formatIso(ts: unknown): string {
+  const n = asNumber(ts);
+  if (n === null) return "n/a";
+  return new Date(n).toISOString().replace("T", " ").replace(".000Z", " UTC");
+}
+
+function normalizeTaskId(raw: string): string {
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^T(\d+)$/i);
+  if (match) return match[1]!;
+  return trimmed;
+}
+
+function parseFlags(argv: string[]): ParsedFlags {
+  const positionals: string[] = [];
+  const flags: Record<string, FlagValue> = {};
+
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (!token.startsWith("--")) {
+      positionals.push(token);
+      continue;
+    }
+
+    if (token === "--") {
+      for (let j = i + 1; j < argv.length; j++) positionals.push(argv[j]!);
+      break;
+    }
+
+    const eq = token.indexOf("=");
+    let key = token.slice(2);
+    let value: FlagValue = true;
+
+    if (eq >= 0) {
+      key = token.slice(2, eq);
+      value = token.slice(eq + 1);
+    } else {
+      const next = argv[i + 1];
+      if (next && !next.startsWith("--")) {
+        value = next;
+        i += 1;
+      }
+    }
+
+    const existing = flags[key];
+    if (existing === undefined) {
+      flags[key] = value;
+    } else if (Array.isArray(existing)) {
+      existing.push(String(value));
+      flags[key] = existing;
+    } else {
+      flags[key] = [String(existing), String(value)];
+    }
+  }
+
+  return { positionals, flags };
+}
+
+function getFlagString(flags: Record<string, FlagValue>, key: string): string | undefined {
+  const value = flags[key];
+  if (value === undefined || value === false) return undefined;
+  if (Array.isArray(value)) return value[value.length - 1];
+  if (value === true) return undefined;
+  return value;
+}
+
+function getFlagBool(flags: Record<string, FlagValue>, key: string): boolean {
+  const value = flags[key];
+  if (value === undefined) return false;
+  if (value === true) return true;
+  if (value === false) return false;
+  if (Array.isArray(value)) {
+    const last = value[value.length - 1]?.toLowerCase();
+    return last === "1" || last === "true" || last === "yes" || last === "on";
+  }
+  const normalized = value.toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function getFlagList(flags: Record<string, FlagValue>, key: string): string[] {
+  const value = flags[key];
+  if (value === undefined || value === false || value === true) return [];
+  const raw = Array.isArray(value) ? value : [value];
+  const out: string[] = [];
+  for (const entry of raw) {
+    for (const part of entry.split(",")) {
+      const trimmed = part.trim();
+      if (trimmed) out.push(trimmed);
+    }
+  }
+  return out;
+}
+
+function parseDurationMs(raw: string | undefined, fallbackMs: number): number {
+  if (!raw) return fallbackMs;
+  const text = raw.trim().toLowerCase();
+  const match = text.match(/^(\d+)(ms|s|m|h)?$/);
+  if (!match) {
+    throw new CliError(`Invalid duration: ${raw}. Use formats like 10m, 30m, 1h.`, 1);
+  }
+  const amount = Number.parseInt(match[1]!, 10);
+  const unit = match[2] ?? "m";
+  const multiplier = unit === "h" ? 3_600_000
+    : unit === "m" ? 60_000
+    : unit === "s" ? 1_000
+    : 1;
+  return amount * multiplier;
+}
+
+function findTaskFile(startDir: string): string | null {
+  let current = path.resolve(startDir);
+
+  while (true) {
+    const candidate = path.join(current, ".task");
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      return candidate;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  return null;
+}
+
+function readTaskContext(): { filePath: string | null; context: TaskContext | null } {
+  const taskFile = findTaskFile(process.cwd());
+  if (!taskFile) return { filePath: null, context: null };
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(taskFile, "utf-8")) as unknown;
+    const obj = asRecord(parsed);
+    if (!obj) return { filePath: taskFile, context: null };
+
+    const taskId = asString(obj["taskId"]);
+    const phase = asString(obj["phase"]);
+    const fenceToken = asNumber(obj["fenceToken"]);
+    const sessionId = asString(obj["sessionId"]);
+    const journalPath = asString(obj["journalPath"]);
+    const codeWorktree = asString(obj["codeWorktree"]);
+    const claimedAt = asNumber(obj["claimedAt"]);
+
+    if (!taskId || fenceToken === null || !sessionId || !journalPath || claimedAt === null) {
+      return { filePath: taskFile, context: null };
+    }
+
+    return {
+      filePath: taskFile,
+      context: {
+        taskId,
+        phase,
+        fenceToken,
+        sessionId,
+        journalPath,
+        codeWorktree,
+        claimedAt,
+        reviewNotes: asArray<string>(obj["reviewNotes"]),
+      },
+    };
+  } catch {
+    return { filePath: taskFile, context: null };
+  }
+}
+
+function writeTaskContext(taskContext: TaskContext, roots: string[]): void {
+  const content = JSON.stringify(taskContext, null, 2) + "\n";
+  for (const root of roots) {
+    if (!root) continue;
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, ".task"), content, "utf-8");
+  }
+}
+
+function clearTaskContextFile(): void {
+  const { filePath } = readTaskContext();
+  if (filePath && fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
+}
+
+function requireAgentId(): string {
+  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  if (!agentId) {
+    throw new CliError("TASKCORE_AGENT_ID is required for this command.", 3);
+  }
+  return agentId;
+}
+
+function currentTaskId(explicit?: string): string {
+  if (explicit) return normalizeTaskId(explicit);
+
+  const { context } = readTaskContext();
+  if (context?.taskId) return normalizeTaskId(context.taskId);
+
+  const envTaskId = process.env["TASK_ID"]?.trim();
+  if (envTaskId) return normalizeTaskId(envTaskId);
+
+  throw new CliError("No active task context. Claim a task first or pass a task id.", 1);
+}
+
+async function httpRequest(method: "GET" | "POST" | "PATCH", urlPath: string, body?: unknown): Promise<ApiResponse> {
+  return await new Promise((resolve, reject) => {
+    const url = new URL(urlPath, BASE_URL);
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname + url.search,
+        method,
+        headers: payload
+          ? {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+          }
+          : {},
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf-8");
+          if (!raw.trim()) {
+            resolve({ status: res.statusCode ?? 500, body: {} });
+            return;
+          }
+
+          try {
+            resolve({ status: res.statusCode ?? 500, body: JSON.parse(raw) });
+          } catch {
+            resolve({ status: res.statusCode ?? 500, body: raw });
+          }
+        });
+      },
+    );
+
+    req.on("error", reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+async function apiRequest(method: "GET" | "POST" | "PATCH", pathName: string, body?: unknown): Promise<Record<string, unknown>> {
+  let response: ApiResponse;
+  try {
+    response = await httpRequest(method, pathName, body);
+  } catch (err) {
+    throw new CliError(`Unable to reach daemon at ${BASE_URL}: ${String(err)}`, 2);
+  }
+
+  const responseObj = asRecord(response.body);
+  if (response.status < 200 || response.status >= 300) {
+    throw new ApiError(response.status, responseObj ?? response.body);
+  }
+
+  return responseObj ?? {};
+}
+
+function printTable(rows: string[][]): void {
+  if (rows.length === 0) return;
+
+  const widths: number[] = [];
+  for (const row of rows) {
+    row.forEach((cell, idx) => {
+      widths[idx] = Math.max(widths[idx] ?? 0, cell.length);
+    });
+  }
+
+  for (const row of rows) {
+    const line = row
+      .map((cell, idx) => cell.padEnd(widths[idx] ?? cell.length))
+      .join("  ");
+    process.stdout.write(line + "\n");
+  }
+}
+
+function priorityRank(priority: string): number {
+  switch (priority) {
+    case "critical": return 0;
+    case "high": return 1;
+    case "medium": return 2;
+    case "low": return 3;
+    case "backlog": return 4;
+    default: return 5;
+  }
+}
+
+function toTaskListEntry(value: unknown): Record<string, unknown> | null {
+  const t = asRecord(value);
+  if (!t) return null;
+  if (asString(t["id"]) === null) return null;
+  return t;
+}
+
+function getString(obj: Record<string, unknown>, key: string, fallback = ""): string {
+  const value = obj[key];
+  return typeof value === "string" ? value : fallback;
+}
+
+function getNumber(obj: Record<string, unknown>, key: string, fallback = 0): number {
+  const value = obj[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function printHelp(): void {
+  const text = [
+    "task CLI",
+    "",
+    "Usage:",
+    "  task list [filters]",
+    "  task show <id> [--events] [--children] [--deps]",
+    "  task events <id> [--last N]",
+    "  task attention [--format telegram]",
+    "  task create <title> --description <desc> [options]",
+    "  task claim <id>",
+    "  task release [--reason <reason>] [--worked]",
+    "  task extend [--duration 15m|30m|1h]",
+    "  task submit <evidence>",
+    "  task complete <evidence>",
+    "  task block <reason>",
+    "  task cost <amount>",
+    "  task update <message>",
+    "  task analyze",
+    "  task decide <execute|decompose>",
+    "  task decompose <start|add|commit|cancel> ...",
+    "  task review <read|note|approve|reject|request-changes> ...",
+    "  task journal <read|write|write-file> ...",
+    "  task worktree",
+    "  task revive <id> [--reason <reason>]",
+    "  task cancel <id> [--reason <reason>]",
+    "  task budget <id> [--cost N] [--attempts phase:max,...]",
+    "  task metadata <id> <key> <value>",
+    "  task reparent <id> --parent <parent-id>",
+    "  task incident <summary> --severity <...> --category <...>",
+    "",
+    "Global:",
+    "  --json   Print raw JSON response when available",
+  ].join("\n");
+  process.stdout.write(text + "\n");
+}
+
+function ensureText(input: string | undefined, name: string): string {
+  if (!input || !input.trim()) {
+    throw new CliError(`${name} is required.`, 1);
+  }
+  return input.trim();
+}
+
+async function getTask(taskId: string): Promise<Record<string, unknown>> {
+  const body = await apiRequest("GET", `/tasks/${normalizeTaskId(taskId)}`);
+  const task = asRecord(body["task"]);
+  if (!task) throw new CliError(`Malformed task response for ${taskId}.`, 2);
+  return task;
+}
+
+async function getTaskEvents(taskId: string): Promise<Record<string, unknown>[]> {
+  const body = await apiRequest("GET", `/tasks/${normalizeTaskId(taskId)}/events`);
+  return asArray<unknown>(body["events"])
+    .map((event) => asRecord(event))
+    .filter((event): event is Record<string, unknown> => event !== null);
+}
+
+function printTaskOverview(task: Record<string, unknown>, includeDeps: boolean, childRows: Array<Record<string, unknown>>): void {
+  const id = getString(task, "id");
+  const title = getString(task, "title", "(untitled)");
+  const phase = getString(task, "phase", "terminal");
+  const condition = getString(task, "condition", getString(task, "terminal", "unknown"));
+  const priority = getString(asRecord(task["metadata"]) ?? {}, "priority", "medium");
+  const assignee = getString(asRecord(task["metadata"]) ?? {}, "assignee", "-");
+  const reviewer = getString(asRecord(task["metadata"]) ?? {}, "reviewer", "-");
+
+  process.stdout.write(`--- T${id}: ${title} ---\n`);
+  process.stdout.write(`Priority:    ${priority}\n`);
+  process.stdout.write(`Phase:       ${phase}\n`);
+  process.stdout.write(`Condition:   ${condition}\n`);
+  process.stdout.write(`Assignee:    ${assignee || "-"}\n`);
+  process.stdout.write(`Reviewer:    ${reviewer || "-"}\n`);
+
+  const parentId = asString(task["parentId"]);
+  if (parentId) {
+    process.stdout.write(`Parent:      T${parentId}\n`);
+  }
+
+  process.stdout.write(`\nCreated:     ${formatIso(task["createdAt"])}\n`);
+  process.stdout.write(`Updated:     ${formatIso(task["updatedAt"])}\n`);
+
+  process.stdout.write("\n## Description\n");
+  process.stdout.write(getString(task, "description", "(none)") + "\n");
+
+  const attemptsObj = asRecord(task["attempts"]);
+  if (attemptsObj) {
+    process.stdout.write("\n## Attempts\n");
+    for (const phaseKey of ["analysis", "decomposition", "execution", "review"]) {
+      const phaseAttempts = asRecord(attemptsObj[phaseKey]);
+      if (!phaseAttempts) continue;
+      const used = getNumber(phaseAttempts, "used", 0);
+      const max = getNumber(phaseAttempts, "max", 0);
+      process.stdout.write(`  ${phaseKey.padEnd(12)} ${used}/${max} used\n`);
+    }
+  }
+
+  const costObj = asRecord(task["cost"]);
+  if (costObj) {
+    const allocated = asNumber(costObj["allocated"]);
+    const consumed = asNumber(costObj["consumed"]);
+    const childAllocated = asNumber(costObj["childAllocated"]);
+    const childRecovered = asNumber(costObj["childRecovered"]);
+    const remaining = (allocated ?? 0) - (consumed ?? 0) - (childAllocated ?? 0) + (childRecovered ?? 0);
+
+    process.stdout.write("\n## Cost\n");
+    process.stdout.write(`  Allocated: ${formatMoney(allocated)}\n`);
+    process.stdout.write(`  Consumed:  ${formatMoney(consumed)}\n`);
+    process.stdout.write(`  Remaining: ${formatMoney(remaining)}\n`);
+  }
+
+  const failures = asArray<unknown>(task["failureSummaries"])
+    .map((entry) => asRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null);
+  if (failures.length > 0) {
+    process.stdout.write("\n## Previous Failures\n");
+    failures.forEach((failure, idx) => {
+      const whatFailed = getString(failure, "whatFailed", "(unknown)");
+      const learned = getString(failure, "whatWasLearned", "");
+      process.stdout.write(`  - Attempt ${idx + 1}: ${whatFailed}\n`);
+      if (learned) process.stdout.write(`    Learned: ${learned}\n`);
+    });
+  }
+
+  const reviewState = asRecord(task["reviewState"]);
+  const verdicts = asArray<unknown>(reviewState?.["verdicts"])
+    .map((entry) => asRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null);
+  if (verdicts.length > 0) {
+    process.stdout.write("\n## Review Feedback\n");
+    for (const verdict of verdicts) {
+      const round = getNumber(verdict, "round", 0);
+      const reviewerId = getString(verdict, "reviewer", "reviewer");
+      const value = getString(verdict, "verdict", "unknown");
+      const reasoning = getString(verdict, "reasoning", "");
+      process.stdout.write(`  Round ${round} (${reviewerId}): ${value}\n`);
+      if (reasoning) process.stdout.write(`  \"${reasoning}\"\n`);
+    }
+  }
+
+  if (includeDeps) {
+    const deps = asArray<unknown>(task["dependencies"])
+      .map((entry) => asRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    process.stdout.write("\n## Dependencies\n");
+    if (deps.length === 0) {
+      process.stdout.write("  (none)\n");
+    } else {
+      for (const dep of deps) {
+        const target = getString(dep, "target", "?");
+        const status = getString(dep, "status", "unknown");
+        process.stdout.write(`  T${target} (${status})\n`);
+      }
+    }
+  }
+
+  process.stdout.write("\n## Children\n");
+  if (childRows.length === 0) {
+    process.stdout.write("  (none)\n");
+  } else {
+    for (const child of childRows) {
+      const cid = getString(child, "id");
+      const ctitle = getString(child, "title", "(untitled)");
+      const cphase = getString(child, "phase", "terminal");
+      const ccondition = getString(child, "condition", getString(child, "terminal", "unknown"));
+      process.stdout.write(`  T${cid} ${ctitle} [${cphase}.${ccondition}]\n`);
+    }
+  }
+}
+
+async function cmdList(argv: string[], jsonMode: boolean): Promise<void> {
+  const { flags } = parseFlags(argv);
+  const body = await apiRequest("GET", "/tasks?full=true");
+  const tasks = asArray<unknown>(body["tasks"])
+    .map((task) => toTaskListEntry(task))
+    .filter((task): task is Record<string, unknown> => task !== null);
+
+  const phaseFilter = getFlagString(flags, "phase");
+  const conditionFilter = getFlagString(flags, "condition");
+  const terminalFilter = getFlagString(flags, "terminal");
+  const assigneeFilter = getFlagString(flags, "assignee");
+  const priorityFilter = getFlagString(flags, "priority");
+  const parentFilter = getFlagString(flags, "parent");
+  const mine = getFlagBool(flags, "mine");
+  const limitRaw = getFlagString(flags, "limit");
+  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : null;
+
+  const myAgent = process.env["TASKCORE_AGENT_ID"]?.trim();
+
+  const filtered = tasks
+    .filter((task) => {
+      const metadata = asRecord(task["metadata"]) ?? {};
+      if (phaseFilter && getString(task, "phase") !== phaseFilter) return false;
+      if (conditionFilter && getString(task, "condition") !== conditionFilter) return false;
+      if (terminalFilter && getString(task, "terminal") !== terminalFilter) return false;
+      if (!terminalFilter && getString(task, "terminal")) return false;
+      if (assigneeFilter && getString(metadata, "assignee") !== assigneeFilter) return false;
+      if (priorityFilter && getString(metadata, "priority", "medium") !== priorityFilter) return false;
+      if (parentFilter && getString(task, "parentId") !== normalizeTaskId(parentFilter)) return false;
+      if (mine && myAgent && getString(metadata, "assignee") !== myAgent) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const pa = priorityRank(getString(asRecord(a["metadata"]) ?? {}, "priority", "medium"));
+      const pb = priorityRank(getString(asRecord(b["metadata"]) ?? {}, "priority", "medium"));
+      if (pa !== pb) return pa - pb;
+      return getNumber(b, "updatedAt") - getNumber(a, "updatedAt");
+    });
+
+  const shown = Number.isInteger(limit) && (limit ?? 0) > 0
+    ? filtered.slice(0, limit ?? 0)
+    : filtered;
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ total: filtered.length, shown: shown.length, tasks: shown }, null, 2) + "\n");
+    return;
+  }
+
+  const rows: string[][] = [["ID", "Priority", "Phase", "Condition", "Assignee", "Title"]];
+  for (const task of shown) {
+    const metadata = asRecord(task["metadata"]) ?? {};
+    rows.push([
+      `T${getString(task, "id")}`,
+      getString(metadata, "priority", "medium"),
+      getString(task, "phase", "terminal"),
+      getString(task, "condition", getString(task, "terminal", "unknown")),
+      getString(metadata, "assignee", "-"),
+      getString(task, "title", "(untitled)"),
+    ]);
+  }
+
+  printTable(rows);
+  process.stdout.write(`\nShowing ${shown.length} of ${filtered.length} tasks\n`);
+  process.stdout.write("Hint: run `task show <id>` for full details.\n");
+}
+
+async function cmdShow(argv: string[], jsonMode: boolean): Promise<void> {
+  const { positionals, flags } = parseFlags(argv);
+  const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+  const task = await getTask(taskId);
+
+  const includeEvents = getFlagBool(flags, "events");
+  const includeChildren = getFlagBool(flags, "children");
+  const includeDeps = getFlagBool(flags, "deps");
+
+  const children: Record<string, unknown>[] = [];
+  if (includeChildren) {
+    const childrenBody = await apiRequest("GET", `/tasks?parentId=${encodeURIComponent(taskId)}&full=true`);
+    for (const entry of asArray<unknown>(childrenBody["tasks"])) {
+      const child = asRecord(entry);
+      if (child) children.push(child);
+    }
+  }
+
+  const events = includeEvents ? await getTaskEvents(taskId) : [];
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ task, children, events }, null, 2) + "\n");
+    return;
+  }
+
+  printTaskOverview(task, includeDeps, children);
+
+  if (includeEvents) {
+    process.stdout.write("\n## Events\n");
+    for (const event of events) {
+      const ts = getNumber(event, "ts");
+      const type = getString(event, "type", "unknown");
+      process.stdout.write(`  ${formatIso(ts)}  ${type}\n`);
+    }
+  }
+}
+
+async function cmdEvents(argv: string[], jsonMode: boolean): Promise<void> {
+  const { positionals, flags } = parseFlags(argv);
+  const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+  const events = await getTaskEvents(taskId);
+
+  const lastRaw = getFlagString(flags, "last");
+  const lastN = lastRaw ? Number.parseInt(lastRaw, 10) : null;
+  const shown = Number.isInteger(lastN) && (lastN ?? 0) > 0
+    ? events.slice(Math.max(0, events.length - (lastN ?? 0)))
+    : events;
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ taskId, events: shown }, null, 2) + "\n");
+    return;
+  }
+
+  for (const event of shown) {
+    const ts = formatIso(event["ts"]);
+    const type = getString(event, "type", "unknown");
+    process.stdout.write(`[${ts}] ${type}\n`);
+  }
+}
+
+async function cmdAttention(argv: string[], jsonMode: boolean): Promise<void> {
+  const { flags } = parseFlags(argv);
+  const format = getFlagString(flags, "format");
+
+  if (format === "telegram") {
+    const body = await apiRequest("GET", "/attention/telegram");
+    if (jsonMode) {
+      process.stdout.write(JSON.stringify(body, null, 2) + "\n");
+      return;
+    }
+    process.stdout.write((asString(body["text"]) ?? "") + "\n");
+    return;
+  }
+
+  const body = await apiRequest("GET", "/attention");
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(body, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Blocked:   ${String(body["blocked"] ?? 0)}\n`);
+  process.stdout.write(`Failed:    ${String(body["failed"] ?? 0)}\n`);
+  process.stdout.write(`Stalled:   ${String(body["stalled"] ?? 0)}\n`);
+  process.stdout.write(`Exhausted: ${String(body["exhausted"] ?? 0)}\n`);
+
+  const tasksObj = asRecord(body["tasks"]);
+  if (!tasksObj) return;
+
+  for (const key of ["blocked", "failed", "stalled", "exhausted"]) {
+    const list = asArray<unknown>(tasksObj[key])
+      .map((entry) => asRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    if (list.length === 0) continue;
+
+    process.stdout.write(`\n${key.toUpperCase()}:\n`);
+    for (const task of list) {
+      process.stdout.write(`  T${getString(task, "id")} [${getString(task, "priority", "medium")}] ${getString(task, "title")}\n`);
+    }
+  }
+}
+
+function parseDependsOn(flags: Record<string, FlagValue>): string[] {
+  return getFlagList(flags, "depends-on").map((id) => normalizeTaskId(id));
+}
+
+async function cmdCreate(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+
+  const { positionals, flags } = parseFlags(argv);
+  const title = ensureText(positionals[0], "title");
+  const description = ensureText(getFlagString(flags, "description"), "--description");
+
+  const body: Record<string, unknown> = {
+    title,
+    description,
+  };
+
+  const assignee = getFlagString(flags, "assignee");
+  const reviewer = getFlagString(flags, "reviewer");
+  const consulted = getFlagString(flags, "consulted");
+  const priority = getFlagString(flags, "priority");
+  const informed = getFlagList(flags, "informed");
+  const dependsOn = parseDependsOn(flags);
+  const repo = getFlagString(flags, "repo");
+  const baseBranch = getFlagString(flags, "base-branch");
+
+  if (assignee) body["assignee"] = assignee;
+  if (reviewer) body["reviewer"] = reviewer;
+  if (consulted) body["consulted"] = consulted;
+  if (priority) body["priority"] = priority;
+  if (informed.length > 0) body["informed"] = informed;
+  if (dependsOn.length > 0) body["dependsOn"] = dependsOn;
+  if (repo) body["repo"] = repo;
+  if (baseBranch) body["baseBranch"] = baseBranch;
+
+  const response = await apiRequest("POST", "/tasks", body);
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  const taskId = getString(response, "taskId", "?");
+  process.stdout.write(`Created T${taskId}: ${title}\n`);
+  process.stdout.write(`Phase: ${getString(response, "phase", "analysis")}, Condition: ${getString(response, "condition", "ready")}\n`);
+  if (assignee) process.stdout.write(`Dispatcher will auto-assign to ${assignee}.\n`);
+  if (dependsOn.length > 0) process.stdout.write(`Waiting on ${dependsOn.map((id) => `T${id}`).join(", ")} before starting.\n`);
+  process.stdout.write(`Hint: task show ${taskId}\n`);
+}
+
+async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
+  const agentId = requireAgentId();
+  const { positionals } = parseFlags(argv);
+  const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/claim`, {
+    agentId,
+    source: "task-cli",
+  });
+
+  const task = asRecord(response["task"]);
+  if (!task) throw new CliError("Malformed claim response: missing task payload.", 2);
+
+  const workspace = asRecord(response["workspace"]);
+  const journalWorktree = asString(workspace?.["journalWorktree"]);
+  const journalPath = asString(workspace?.["journalPath"]);
+  const codeWorktree = asString(workspace?.["codeWorktree"]);
+
+  const sessionId = ensureText(asString(response["sessionId"]) ?? "", "sessionId");
+  const fenceToken = asNumber(response["fenceToken"]);
+  if (fenceToken === null) throw new CliError("Malformed claim response: missing fenceToken.", 2);
+
+  const context: TaskContext = {
+    taskId,
+    phase: asString(task["phase"]),
+    fenceToken,
+    sessionId,
+    journalPath: journalPath ?? "",
+    codeWorktree: codeWorktree ?? null,
+    claimedAt: Date.now(),
+    reviewNotes: [],
+  };
+
+  const roots: string[] = [];
+  if (journalWorktree) roots.push(journalWorktree);
+  if (codeWorktree) roots.push(codeWorktree);
+  if (roots.length > 0 && journalPath) {
+    writeTaskContext(context, roots);
+  }
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`--- Claimed T${taskId}: ${getString(task, "title", "(untitled)")} ---\n`);
+  const leaseTimeout = asNumber(response["leaseTimeout"]);
+  if (leaseTimeout !== null) {
+    process.stdout.write(`Lease: ${Math.round(leaseTimeout / 60000)} min (extend with \`task extend\`)\n`);
+  }
+  process.stdout.write(`Fence: ${fenceToken}\n`);
+
+  process.stdout.write("\n## Description\n");
+  process.stdout.write(getString(task, "description", "(none)") + "\n");
+
+  process.stdout.write("\n## Your Workspace\n");
+  if (journalPath) process.stdout.write(`  Journal: ${journalPath}\n`);
+  if (codeWorktree) {
+    process.stdout.write(`  Code:    ${codeWorktree}\n\n`);
+    process.stdout.write(`  cd ${codeWorktree}\n`);
+  }
+
+  const failures = asArray<unknown>(task["failureSummaries"])
+    .map((entry) => asRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null);
+  if (failures.length > 0) {
+    process.stdout.write(`\n## Previous Attempts (${failures.length} failed)\n`);
+    failures.forEach((failure, idx) => {
+      process.stdout.write(`  - Attempt ${idx + 1}: ${getString(failure, "whatFailed", "(unknown)")}\n`);
+      const learned = getString(failure, "whatWasLearned", "");
+      if (learned) process.stdout.write(`    Learned: ${learned}\n`);
+    });
+  }
+
+  const reviewState = asRecord(task["reviewState"]);
+  const verdicts = asArray<unknown>(reviewState?.["verdicts"])
+    .map((entry) => asRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null);
+  if (verdicts.length > 0) {
+    process.stdout.write("\n## Review Feedback\n");
+    for (const verdict of verdicts) {
+      process.stdout.write(`  Round ${getNumber(verdict, "round", 0)} (${getString(verdict, "reviewer", "reviewer")}): ${getString(verdict, "verdict", "unknown")}\n`);
+      const reasoning = getString(verdict, "reasoning", "");
+      if (reasoning) process.stdout.write(`  \"${reasoning}\"\n`);
+    }
+  }
+
+  const parentJournal = asString(response["parentJournal"]);
+  if (parentJournal) {
+    process.stdout.write("\n## Parent Context\n");
+    process.stdout.write(parentJournal + "\n");
+  }
+
+  const siblingFailures = asArray<unknown>(response["siblingFailures"])
+    .map((entry) => asRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null);
+  if (siblingFailures.length > 0) {
+    process.stdout.write("\n## Sibling Failures\n");
+    for (const sibling of siblingFailures.slice(0, 5)) {
+      process.stdout.write(`  T${getString(sibling, "taskId", "?")}: ${getString(sibling, "summary", "") || getString(sibling, "content", "")}`.trim() + "\n");
+    }
+  }
+
+  const workspaceConventions = asString(response["workspaceConventions"]);
+  if (workspaceConventions) {
+    process.stdout.write("\n## Workspace Conventions\n");
+    process.stdout.write(workspaceConventions + "\n");
+  }
+
+  process.stdout.write("\n## What To Do Next\n");
+  process.stdout.write("  1. Read the code in the worktree\n");
+  process.stdout.write("  2. Write observations to your journal:\n");
+  process.stdout.write("       task journal write \"Starting analysis...\"\n");
+  process.stdout.write("  3. When done:\n");
+  process.stdout.write("       task submit \"Description of what you did\"\n");
+  process.stdout.write("  4. If blocked:\n");
+  process.stdout.write("       task block \"What is preventing progress\"\n");
+}
+
+function sourceFor(agentId: string): Record<string, string> {
+  return { type: "agent", id: agentId };
+}
+
+async function cmdRelease(argv: string[], jsonMode: boolean): Promise<void> {
+  const agentId = requireAgentId();
+  const { flags } = parseFlags(argv);
+  const taskId = currentTaskId();
+  const task = await getTask(taskId);
+
+  const fenceToken = getNumber(task, "currentFenceToken", -1);
+  const phase = getString(task, "phase", "execution");
+  if (fenceToken < 0) throw new CliError(`Task ${taskId} has no active lease to release.`, 1);
+
+  const reason = getFlagString(flags, "reason") ?? "Released by task CLI";
+  const worked = getFlagBool(flags, "worked");
+
+  const payload = {
+    type: "LeaseReleased",
+    taskId,
+    ts: Date.now(),
+    fenceToken,
+    reason,
+    phase,
+    workPerformed: worked,
+    source: sourceFor(agentId),
+  };
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/events`, payload);
+  clearTaskContextFile();
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Released T${taskId}.\n`);
+}
+
+async function cmdExtend(argv: string[], jsonMode: boolean): Promise<void> {
+  const agentId = requireAgentId();
+  const { flags } = parseFlags(argv);
+  const taskId = currentTaskId();
+  const task = await getTask(taskId);
+
+  const fenceToken = getNumber(task, "currentFenceToken", -1);
+  if (fenceToken < 0) throw new CliError(`Task ${taskId} has no active lease to extend.`, 1);
+
+  const duration = parseDurationMs(getFlagString(flags, "duration"), 15 * 60_000);
+
+  const payload = {
+    type: "LeaseExtended",
+    taskId,
+    ts: Date.now(),
+    fenceToken,
+    leaseTimeout: duration,
+    source: sourceFor(agentId),
+  };
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/events`, payload);
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Extended lease for T${taskId} by ${Math.round(duration / 60000)} min.\n`);
+}
+
+async function cmdSubmit(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const evidence = ensureText(argv.join(" "), "evidence");
+  const taskId = currentTaskId();
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+    status: "review",
+    evidence,
+  });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Submitted T${taskId} for review.\n`);
+  process.stdout.write("Your work will be reviewed.\n");
+}
+
+async function cmdComplete(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const evidence = ensureText(argv.join(" "), "evidence");
+  const taskId = currentTaskId();
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+    status: "done",
+    evidence,
+  });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Completed T${taskId}.\n`);
+}
+
+async function cmdBlock(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const reason = ensureText(argv.join(" "), "reason");
+  const taskId = currentTaskId();
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+    status: "blocked",
+    blocker: reason,
+  });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Blocked T${taskId}.\n`);
+}
+
+async function cmdCost(argv: string[], jsonMode: boolean): Promise<void> {
+  const agentId = requireAgentId();
+  const amountRaw = argv[0];
+  const amount = amountRaw ? Number(amountRaw) : NaN;
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new CliError("Amount must be a non-negative number.", 1);
+  }
+
+  const taskId = currentTaskId();
+  const task = await getTask(taskId);
+  const fenceToken = getNumber(task, "currentFenceToken", -1);
+  if (fenceToken < 0) throw new CliError(`Task ${taskId} has no active lease token.`, 1);
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/events`, {
+    type: "CostReported",
+    taskId,
+    ts: Date.now(),
+    fenceToken,
+    reportedCost: amount,
+    source: sourceFor(agentId),
+  });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Reported ${formatMoney(amount)} for T${taskId}.\n`);
+}
+
+async function cmdUpdate(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const message = ensureText(argv.join(" "), "message");
+  const taskId = currentTaskId();
+
+  const journalRes = await apiRequest("POST", `/tasks/${taskId}/journal`, { entry: message });
+  const metadataRes = await apiRequest("PATCH", `/tasks/${taskId}/metadata`, {
+    last_update: message,
+    last_update_at: new Date().toISOString(),
+    reason: "progress update via task CLI",
+  });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ journal: journalRes, metadata: metadataRes }, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Recorded progress update for T${taskId}.\n`);
+}
+
+async function cmdAnalyze(jsonMode: boolean): Promise<void> {
+  const taskId = currentTaskId();
+  const task = await getTask(taskId);
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ task }, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`--- Analysis: T${taskId} — ${getString(task, "title", "(untitled)")} ---\n\n`);
+  process.stdout.write("## Task Description\n");
+  process.stdout.write(getString(task, "description", "(none)") + "\n");
+
+  const failures = asArray<unknown>(task["failureSummaries"])
+    .map((entry) => asRecord(entry))
+    .filter((entry): entry is Record<string, unknown> => entry !== null);
+  if (failures.length > 0) {
+    process.stdout.write(`\n## Previous Approaches (${failures.length} failed)\n`);
+    failures.forEach((failure, idx) => {
+      process.stdout.write(`  v${idx + 1}: ${getString(failure, "whatFailed", "(unknown)")}\n`);
+    });
+  }
+
+  process.stdout.write("\n## Considerations\n");
+  process.stdout.write("  - Is this simple enough for a single agent?\n");
+  process.stdout.write("  - Should it be decomposed into subtasks?\n");
+  process.stdout.write("  - Is it blocked or missing information?\n");
+
+  process.stdout.write("\n## Your Decision\n");
+  process.stdout.write("  task decide execute\n");
+  process.stdout.write("  task decide decompose\n");
+  process.stdout.write("  task block \"reason\"\n");
+}
+
+async function cmdDecide(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const decision = argv[0]?.trim();
+  if (decision !== "execute" && decision !== "decompose") {
+    throw new CliError("Usage: task decide <execute|decompose>", 1);
+  }
+
+  const taskId = currentTaskId();
+  const status = decision === "execute" ? "execute" : "decompose";
+  const response = await apiRequest("POST", `/tasks/${taskId}/status`, { status });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  if (decision === "execute") {
+    process.stdout.write(`Decision recorded: T${taskId} will execute directly.\n`);
+  } else {
+    process.stdout.write(`Decision recorded: T${taskId} will be decomposed.\n`);
+  }
+}
+
+function parseSiblingDeps(raw: string[]): number[] {
+  const indices = raw.map((value) => Number.parseInt(value, 10));
+  for (const idx of indices) {
+    if (!Number.isInteger(idx) || idx < 0) {
+      throw new CliError("--depends-on must contain non-negative sibling indices.", 1);
+    }
+  }
+  return indices;
+}
+
+async function cmdDecompose(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const sub = argv[0];
+  const args = argv.slice(1);
+  const taskId = currentTaskId();
+
+  switch (sub) {
+    case "start": {
+      const response = await apiRequest("POST", `/tasks/${taskId}/decompose/start`, {});
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+
+      process.stdout.write(`--- Decomposition: T${taskId} ---\n`);
+      process.stdout.write(`Budget remaining: ${formatMoney(response["budgetRemaining"])}\n`);
+      process.stdout.write(`Children so far: ${String(response["childrenSoFar"] ?? 0)}\n\n`);
+      process.stdout.write(`task decompose add \"Child title\" --desc \"What this child should do\" --cost 10\n`);
+      return;
+    }
+
+    case "add": {
+      const { positionals, flags } = parseFlags(args);
+      const title = ensureText(positionals[0], "child title");
+      const desc = ensureText(getFlagString(flags, "desc"), "--desc");
+      const costRaw = getFlagString(flags, "cost");
+      const cost = costRaw ? Number(costRaw) : NaN;
+      if (!Number.isFinite(cost) || cost <= 0) {
+        throw new CliError("--cost must be a positive number.", 1);
+      }
+
+      const depends = parseSiblingDeps(getFlagList(flags, "depends-on"));
+
+      const body: Record<string, unknown> = {
+        title,
+        description: desc,
+        costAllocation: cost,
+      };
+
+      const assignee = getFlagString(flags, "assignee");
+      const reviewer = getFlagString(flags, "reviewer");
+      if (assignee) body["assignee"] = assignee;
+      if (reviewer) body["reviewer"] = reviewer;
+      if (depends.length > 0) body["dependsOnSiblings"] = depends;
+      if (getFlagBool(flags, "skip-analysis")) body["skipAnalysis"] = true;
+
+      const response = await apiRequest("POST", `/tasks/${taskId}/decompose/add-child`, body);
+
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+
+      process.stdout.write(`--- Child #${String(response["childIndex"] ?? "?")} added ---\n`);
+      process.stdout.write(`  Title: ${title}\n`);
+      process.stdout.write(`  Cost:  ${formatMoney(cost)}\n`);
+      process.stdout.write(`\nBudget remaining: ${formatMoney(response["budgetRemaining"])}\n`);
+      process.stdout.write("\nNext:\n");
+      process.stdout.write("  task decompose add \"Next title\" --desc \"...\" --cost N\n");
+      process.stdout.write("  task decompose commit \"Strategy description\"\n");
+      return;
+    }
+
+    case "commit": {
+      const strategy = ensureText(args.join(" "), "strategy description");
+      const response = await apiRequest("POST", `/tasks/${taskId}/decompose/commit`, { approach: strategy });
+
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+
+      process.stdout.write("--- Decomposition committed ---\n\n");
+      process.stdout.write(`Strategy: ${strategy}\n\n`);
+      const children = asArray<unknown>(response["children"])
+        .map((child) => asRecord(child))
+        .filter((child): child is Record<string, unknown> => child !== null);
+      process.stdout.write(`Created ${children.length} children:\n`);
+      for (const child of children) {
+        process.stdout.write(`  T${getString(child, "id", "?")}: ${getString(child, "title", "(untitled)")}  ${formatMoney(child["costAllocation"])}\n`);
+      }
+      return;
+    }
+
+    case "cancel": {
+      const response = await apiRequest("POST", `/tasks/${taskId}/decompose/cancel`, {});
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(`Canceled pending decomposition session for T${taskId}.\n`);
+      return;
+    }
+
+    default:
+      throw new CliError("Usage: task decompose <start|add|commit|cancel> ...", 1);
+  }
+}
+
+function ensureContextWithTaskId(taskId: string): TaskContext {
+  const info = readTaskContext();
+  if (!info.context || normalizeTaskId(info.context.taskId) !== normalizeTaskId(taskId)) {
+    return {
+      taskId,
+      phase: null,
+      fenceToken: 0,
+      sessionId: "",
+      journalPath: "",
+      codeWorktree: null,
+      claimedAt: Date.now(),
+      reviewNotes: [],
+    };
+  }
+  return info.context;
+}
+
+function persistReviewNotes(taskId: string, notes: string[]): void {
+  const { context, filePath } = readTaskContext();
+  if (!context || !filePath || normalizeTaskId(context.taskId) !== normalizeTaskId(taskId)) return;
+  context.reviewNotes = notes;
+  fs.writeFileSync(filePath, JSON.stringify(context, null, 2) + "\n", "utf-8");
+}
+
+function getReviewEvidence(taskId: string, explicit: string | null): string {
+  if (explicit && explicit.trim()) return explicit.trim();
+  const context = ensureContextWithTaskId(taskId);
+  const notes = context.reviewNotes ?? [];
+  if (notes.length === 0) return "Review completed.";
+  return notes.map((note, idx) => `${idx + 1}. ${note}`).join("\n");
+}
+
+async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+
+  const sub = argv[0];
+  const args = argv.slice(1);
+  const taskId = currentTaskId();
+
+  switch (sub) {
+    case "read": {
+      const response = await apiRequest("GET", `/tasks/${taskId}/review/context`);
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(getString(response, "text", "No review context available.") + "\n");
+      return;
+    }
+
+    case "note": {
+      const note = ensureText(args.join(" "), "note");
+      const response = await apiRequest("POST", `/tasks/${taskId}/review/note`, { note });
+
+      const notes = asArray<unknown>(response["notes"]).map((entry) => asString(entry)).filter((entry): entry is string => entry !== null);
+      persistReviewNotes(taskId, notes);
+
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+
+      process.stdout.write(`--- Note recorded (${notes.length} total) ---\n\n`);
+      process.stdout.write("Your notes so far:\n");
+      notes.forEach((entry, idx) => process.stdout.write(`  ${idx + 1}. ${entry}\n`));
+      process.stdout.write("\n  task review note \"Another observation\"\n");
+      process.stdout.write("  task review approve \"Summary\"\n");
+      process.stdout.write("  task review reject \"Reason\"\n");
+      process.stdout.write("  task review request-changes \"Feedback\"\n");
+      return;
+    }
+
+    case "approve": {
+      const evidence = getReviewEvidence(taskId, args.join(" "));
+      const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+        status: "done",
+        evidence,
+      });
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(`Approved T${taskId}.\n`);
+      return;
+    }
+
+    case "reject": {
+      const evidence = getReviewEvidence(taskId, args.join(" "));
+      const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+        status: "reject",
+        evidence,
+      });
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(`Rejected T${taskId}.\n`);
+      return;
+    }
+
+    case "request-changes": {
+      const evidence = getReviewEvidence(taskId, args.join(" "));
+      const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+        status: "pending",
+        evidence,
+      });
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write("--- Changes requested ---\n\n");
+      process.stdout.write(`T${taskId} returns to execution.\n`);
+      process.stdout.write(`Feedback: \"${evidence}\"\n`);
+      return;
+    }
+
+    default:
+      throw new CliError("Usage: task review <read|note|approve|reject|request-changes> ...", 1);
+  }
+}
+
+async function cmdJournal(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const sub = argv[0];
+  const args = argv.slice(1);
+  const taskId = currentTaskId();
+
+  switch (sub) {
+    case "read": {
+      const response = await apiRequest("GET", `/tasks/${taskId}/journal`);
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(getString(response, "content", "") + "\n");
+      return;
+    }
+
+    case "write": {
+      const entry = ensureText(args.join(" "), "journal entry");
+      const response = await apiRequest("POST", `/tasks/${taskId}/journal`, { entry });
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(`Journal updated for T${taskId}.\n`);
+      return;
+    }
+
+    case "write-file": {
+      const fileName = ensureText(args[0], "file name");
+      const content = ensureText(args.slice(1).join(" "), "file content");
+      const response = await apiRequest("POST", `/tasks/${taskId}/journal/file`, {
+        name: fileName,
+        content,
+      });
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(`Wrote ${fileName} to journal for T${taskId}.\n`);
+      return;
+    }
+
+    default:
+      throw new CliError("Usage: task journal <read|write|write-file> ...", 1);
+  }
+}
+
+function taskFromContextOrFail(): TaskContext {
+  const { context } = readTaskContext();
+  if (!context) throw new CliError("No .task context found in current directory tree.", 1);
+  return context;
+}
+
+function cmdWorktree(): void {
+  const context = taskFromContextOrFail();
+  process.stdout.write(`Journal: ${context.journalPath}\n`);
+  process.stdout.write(`Code:    ${context.codeWorktree ?? "(none)"}\n`);
+}
+
+async function cmdRevive(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const { positionals, flags } = parseFlags(argv);
+  const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+  const reason = getFlagString(flags, "reason") ?? "New approach available";
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/revive`, { reason });
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write(`Revived T${taskId}.\n`);
+}
+
+async function cmdCancel(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const { positionals, flags } = parseFlags(argv);
+  const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+  const reason = getFlagString(flags, "reason") ?? "No longer needed";
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/status`, { status: "cancel", evidence: reason });
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write(`Canceled T${taskId}.\n`);
+}
+
+function parseAttemptBudget(raw: string[]): Record<string, { max: number }> {
+  const out: Record<string, { max: number }> = {};
+  for (const entry of raw) {
+    const [phase, maxRaw] = entry.split(":");
+    const max = Number.parseInt(maxRaw ?? "", 10);
+    if (!phase || !Number.isInteger(max) || max <= 0) {
+      throw new CliError(`Invalid attempt budget '${entry}'. Use phase:max (e.g. execution:4).`, 1);
+    }
+    out[phase] = { max };
+  }
+  return out;
+}
+
+async function cmdBudget(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const { positionals, flags } = parseFlags(argv);
+  const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+
+  const costRaw = getFlagString(flags, "cost");
+  const attemptsRaw = getFlagList(flags, "attempts");
+
+  const body: Record<string, unknown> = {
+    reason: "budget updated via task CLI",
+  };
+
+  if (costRaw) {
+    const cost = Number(costRaw);
+    if (!Number.isFinite(cost) || cost <= 0) {
+      throw new CliError("--cost must be a positive number.", 1);
+    }
+    body["costBudgetIncrease"] = cost;
+  }
+
+  if (attemptsRaw.length > 0) {
+    body["attemptBudgetIncrease"] = parseAttemptBudget(attemptsRaw);
+  }
+
+  if (body["costBudgetIncrease"] === undefined && body["attemptBudgetIncrease"] === undefined) {
+    throw new CliError("Provide at least one of --cost or --attempts.", 1);
+  }
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/budget`, body);
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Updated budget for T${taskId}.\n`);
+}
+
+function parseMetadataValue(raw: string): unknown {
+  if (raw === "null") return null;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  const n = Number(raw);
+  if (Number.isFinite(n) && raw.trim() !== "") return n;
+  if (raw.includes(",")) {
+    return raw.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+  return raw;
+}
+
+async function cmdMetadata(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const taskId = normalizeTaskId(ensureText(argv[0], "task id"));
+  const key = ensureText(argv[1], "metadata key");
+  const value = ensureText(argv.slice(2).join(" "), "metadata value");
+
+  const patch: Record<string, unknown> = {
+    [key]: parseMetadataValue(value),
+    reason: "metadata updated via task CLI",
+  };
+
+  const response = await apiRequest("PATCH", `/tasks/${taskId}/metadata`, patch);
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write(`Updated metadata for T${taskId}.\n`);
+}
+
+async function cmdReparent(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const { positionals, flags } = parseFlags(argv);
+  const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+  const parent = normalizeTaskId(ensureText(getFlagString(flags, "parent"), "--parent"));
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/reparent`, { newParentId: parent });
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write(`Reparented T${taskId} under T${parent}.\n`);
+}
+
+async function cmdIncident(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const { positionals, flags } = parseFlags(argv);
+  const summary = ensureText(positionals.join(" "), "summary");
+  const severity = ensureText(getFlagString(flags, "severity"), "--severity");
+  const category = ensureText(getFlagString(flags, "category"), "--category");
+  const detail = getFlagString(flags, "detail");
+  const tags = getFlagList(flags, "tags");
+
+  const workspaceDir = process.env["WORKSPACE_DIR"]
+    ?? process.env["OPENCLAW_STATE_DIR"]
+    ?? path.join(os.homedir(), ".openclaw", "workspace");
+
+  const incidentDir = path.join(workspaceDir, "data", "incidents");
+  fs.mkdirSync(incidentDir, { recursive: true });
+
+  const incidentId = `INC-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const incident = {
+    id: incidentId,
+    ts: new Date().toISOString(),
+    severity,
+    category,
+    summary,
+    detail: detail ?? null,
+    tags,
+    source: "task-cli",
+  };
+
+  const date = new Date().toISOString().slice(0, 10);
+  fs.appendFileSync(path.join(incidentDir, `${date}.jsonl`), JSON.stringify(incident) + "\n", "utf-8");
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ incident_id: incidentId, status: "recorded" }, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write(`Incident recorded: ${incidentId}\n`);
+}
+
+function extractJsonFlag(argv: string[]): { jsonMode: boolean; args: string[] } {
+  let jsonMode = false;
+  const args: string[] = [];
+
+  for (const token of argv) {
+    if (token === "--json") {
+      jsonMode = true;
+      continue;
+    }
+    args.push(token);
+  }
+
+  return { jsonMode, args };
+}
+
+async function run(argv: string[]): Promise<void> {
+  const { jsonMode, args } = extractJsonFlag(argv);
+  const command = args[0];
+  const rest = args.slice(1);
+
+  if (!command || command === "help" || command === "--help" || command === "-h") {
+    printHelp();
+    return;
+  }
+
+  switch (command) {
+    case "list":
+      await cmdList(rest, jsonMode);
+      return;
+    case "show":
+      await cmdShow(rest, jsonMode);
+      return;
+    case "events":
+      await cmdEvents(rest, jsonMode);
+      return;
+    case "attention":
+      await cmdAttention(rest, jsonMode);
+      return;
+    case "create":
+      await cmdCreate(rest, jsonMode);
+      return;
+    case "claim":
+      await cmdClaim(rest, jsonMode);
+      return;
+    case "release":
+      await cmdRelease(rest, jsonMode);
+      return;
+    case "extend":
+      await cmdExtend(rest, jsonMode);
+      return;
+    case "submit":
+      await cmdSubmit(rest, jsonMode);
+      return;
+    case "complete":
+      await cmdComplete(rest, jsonMode);
+      return;
+    case "block":
+      await cmdBlock(rest, jsonMode);
+      return;
+    case "cost":
+      await cmdCost(rest, jsonMode);
+      return;
+    case "update":
+      await cmdUpdate(rest, jsonMode);
+      return;
+    case "analyze":
+      await cmdAnalyze(jsonMode);
+      return;
+    case "decide":
+      await cmdDecide(rest, jsonMode);
+      return;
+    case "decompose":
+      await cmdDecompose(rest, jsonMode);
+      return;
+    case "review":
+      await cmdReview(rest, jsonMode);
+      return;
+    case "journal":
+      await cmdJournal(rest, jsonMode);
+      return;
+    case "worktree":
+      cmdWorktree();
+      return;
+    case "revive":
+      await cmdRevive(rest, jsonMode);
+      return;
+    case "cancel":
+      await cmdCancel(rest, jsonMode);
+      return;
+    case "budget":
+      await cmdBudget(rest, jsonMode);
+      return;
+    case "metadata":
+      await cmdMetadata(rest, jsonMode);
+      return;
+    case "reparent":
+      await cmdReparent(rest, jsonMode);
+      return;
+    case "incident":
+      await cmdIncident(rest, jsonMode);
+      return;
+    default:
+      throw new CliError(`Unknown command: ${command}`, 1);
+  }
+}
+
+run(process.argv.slice(2)).catch((err: unknown) => {
+  if (err instanceof CliError) {
+    process.stderr.write(err.message + "\n");
+    process.exit(err.code);
+    return;
+  }
+
+  if (err instanceof ApiError) {
+    const body = asRecord(err.body);
+    if (body) {
+      const errorCode = asString(body["error"]);
+      const message = asString(body["message"]);
+      if (errorCode) {
+        process.stderr.write(`${errorCode}: ${message ?? "API request failed"}\n`);
+      } else if (message) {
+        process.stderr.write(`${message}\n`);
+      } else {
+        process.stderr.write(`${JSON.stringify(body)}\n`);
+      }
+    } else {
+      process.stderr.write(String(err.body) + "\n");
+    }
+    process.exit(2);
+    return;
+  }
+
+  process.stderr.write(`Unexpected error: ${String(err)}\n`);
+  process.exit(1);
+});

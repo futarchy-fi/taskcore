@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { OrchestrationCore } from "../../core/index.js";
 import { createHttpServer } from "../http.js";
 import { loadConfig, type Config } from "../config.js";
+import { initJournalRepo } from "../journal.js";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -15,6 +16,7 @@ import { loadConfig, type Config } from "../config.js";
 let server: http.Server;
 let core: OrchestrationCore;
 let dbPath: string;
+let tmpDir: string;
 let port: number;
 let config: Config;
 
@@ -55,9 +57,25 @@ function request(
 }
 
 async function setup(): Promise<void> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "taskcore-test-"));
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "taskcore-test-"));
   dbPath = path.join(tmpDir, "test.db");
   port = 18800 + Math.floor(Math.random() * 1000);
+  const journalRepoPath = path.join(tmpDir, "journal");
+  const worktreeBaseDir = path.join(tmpDir, "worktrees");
+  const workspaceDir = path.join(tmpDir, "workspace");
+  const agentRegistry = path.join(tmpDir, "registry.json");
+
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  fs.mkdirSync(path.join(workspaceDir, "data"), { recursive: true });
+  fs.writeFileSync(agentRegistry, JSON.stringify({
+    agents: [
+      { id: "coder", assignable: true, reviewer: true, consulted: true },
+      { id: "analyst", assignable: true, reviewer: true, consulted: true },
+      { id: "overseer", assignable: true, reviewer: true, consulted: true },
+      { id: "hermes", assignable: true, reviewer: true, consulted: true },
+    ],
+  }, null, 2));
+  initJournalRepo(journalRepoPath);
 
   core = new OrchestrationCore({
     dbPath,
@@ -69,6 +87,10 @@ async function setup(): Promise<void> {
     ...loadConfig(),
     port,
     dbPath,
+    agentRegistry,
+    workspaceDir,
+    journalRepoPath,
+    worktreeBaseDir,
     runtimeFile: "",
     lifecycleFile: "",
   };
@@ -83,7 +105,7 @@ async function teardown(): Promise<void> {
   server.close();
   core.close();
   try {
-    fs.unlinkSync(dbPath);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch {
     // Ignore
   }
@@ -422,5 +444,98 @@ describe("HTTP API", () => {
     taskRes = await request("GET", "/tasks/1");
     const finalTask = (taskRes.body as { task: { terminal: string | null } }).task;
     assert.equal(finalTask.terminal, "done");
+  });
+
+  test("claim creates workspace context and journal endpoints append/read", async () => {
+    await request("POST", "/tasks", {
+      title: "Claim workspace test",
+      description: "Verify claim returns workspace and journal routes work",
+      assignee: "coder",
+    });
+
+    const claimRes = await request("POST", "/tasks/1/claim", {
+      agentId: "coder",
+      source: "test",
+    });
+    assert.equal(claimRes.status, 200);
+    const claimBody = claimRes.body as { workspace?: { journalPath?: string | null } };
+    assert.ok(claimBody.workspace);
+    assert.ok(claimBody.workspace?.journalPath);
+
+    const writeRes = await request("POST", "/tasks/1/journal", {
+      entry: "Starting implementation",
+    });
+    assert.equal(writeRes.status, 200);
+
+    const readRes = await request("GET", "/tasks/1/journal");
+    assert.equal(readRes.status, 200);
+    const readBody = readRes.body as { content: string };
+    assert.ok(readBody.content.includes("Starting implementation"));
+  });
+
+  test("status done completes execution task directly when no reviewer is configured", async () => {
+    await request("POST", "/tasks", {
+      title: "Direct completion",
+      description: "No reviewer task can complete from execution",
+      assignee: "coder",
+      skipAnalysis: true,
+    });
+
+    await request("POST", "/tasks/1/events", {
+      type: "LeaseGranted",
+      taskId: "1",
+      ts: Date.now(),
+      fenceToken: 1,
+      agentId: "coder",
+      phase: "execution",
+      leaseTimeout: 600000,
+      sessionId: "s-direct",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    await request("POST", "/tasks/1/events", {
+      type: "AgentStarted",
+      taskId: "1",
+      ts: Date.now(),
+      fenceToken: 1,
+      agentContext: {
+        sessionId: "s-direct",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+
+    const doneRes = await request("POST", "/tasks/1/status", {
+      status: "done",
+      evidence: "Execution work complete",
+    });
+    assert.equal(doneRes.status, 200);
+
+    const taskRes = await request("GET", "/tasks/1");
+    const task = (taskRes.body as { task: { terminal: string | null } }).task;
+    assert.equal(task.terminal, "done");
+  });
+
+  test("decompose cancel clears pending incremental session", async () => {
+    await request("POST", "/tasks", {
+      title: "Cancel decompose",
+      description: "Check decompose cancel endpoint",
+      assignee: "coder",
+    });
+
+    await request("POST", "/tasks/1/claim", {
+      agentId: "coder",
+      source: "test",
+    });
+
+    const startRes = await request("POST", "/tasks/1/decompose/start");
+    assert.equal(startRes.status, 200);
+
+    const cancelRes = await request("POST", "/tasks/1/decompose/cancel");
+    assert.equal(cancelRes.status, 200);
+    const cancelBody = cancelRes.body as { canceled: boolean };
+    assert.equal(cancelBody.canceled, true);
   });
 });

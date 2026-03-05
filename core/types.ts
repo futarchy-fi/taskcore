@@ -225,6 +225,22 @@ export interface LeaseExpired extends BaseEvent {
   source: EventSource;
 }
 
+export interface LeaseReleased extends BaseEvent {
+  type: "LeaseReleased";
+  fenceToken: number;
+  reason: string;
+  phase: Phase;
+  workPerformed: boolean;
+  source: EventSource;
+}
+
+export interface LeaseExtended extends BaseEvent {
+  type: "LeaseExtended";
+  fenceToken: number;
+  leaseTimeout: Duration;
+  source: EventSource;
+}
+
 export interface AgentStarted extends BaseEvent {
   type: "AgentStarted";
   fenceToken: number;
@@ -237,6 +253,13 @@ export interface AgentExited extends BaseEvent {
   exitCode: number;
   reportedCost: number;
   agentContext: AgentContext;
+}
+
+export interface CostReported extends BaseEvent {
+  type: "CostReported";
+  fenceToken: number;
+  reportedCost: number;
+  source: EventSource;
 }
 
 export type PhaseTransitionReason =
@@ -381,7 +404,7 @@ export interface TaskCompleted extends BaseEvent {
 
 export interface TaskFailed extends BaseEvent {
   type: "TaskFailed";
-  reason: "budget_exhausted" | "cost_exhausted";
+  reason: "budget_exhausted" | "cost_exhausted" | "review_rejected";
   phase: Phase;
   summary: FailureSummary;
 }
@@ -443,8 +466,11 @@ export type Event =
   | TaskCreated
   | LeaseGranted
   | LeaseExpired
+  | LeaseReleased
+  | LeaseExtended
   | AgentStarted
   | AgentExited
+  | CostReported
   | PhaseTransition
   | WaitRequested
   | WaitResolved
