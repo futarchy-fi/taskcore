@@ -577,6 +577,7 @@ function handleClaimTask(
       return { status: 500, body: { error: "missing_task", message: `Task ${taskId} disappeared after claim` } };
     }
 
+    // The daemon owns worktree creation so the CLI can stay a pure HTTP client.
     const workspace = ensureTaskWorkspaces(config, updated);
     const parentJournal = updated.parentId
       ? getJournalContent(config.journalRepoPath, updated.parentId)

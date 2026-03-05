@@ -1137,16 +1137,50 @@ async function cmdDecompose(argv: string[], jsonMode: boolean): Promise<void> {
 
   switch (sub) {
     case "start": {
+      const task = await getTask(taskId);
       const response = await apiRequest("POST", `/tasks/${taskId}/decompose/start`, {});
       if (jsonMode) {
-        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        process.stdout.write(JSON.stringify({ task, ...response }, null, 2) + "\n");
         return;
       }
 
-      process.stdout.write(`--- Decomposition: T${taskId} ---\n`);
-      process.stdout.write(`Budget remaining: ${formatMoney(response["budgetRemaining"])}\n`);
-      process.stdout.write(`Children so far: ${String(response["childrenSoFar"] ?? 0)}\n\n`);
-      process.stdout.write(`task decompose add \"Child title\" --desc \"What this child should do\" --cost 10\n`);
+      process.stdout.write(`--- Decomposition: T${taskId} — ${getString(task, "title", "(untitled)")} ---\n\n`);
+      process.stdout.write("## Task Description\n");
+      process.stdout.write(getString(task, "description", "(none)") + "\n");
+
+      process.stdout.write("\n## Budget\n");
+      process.stdout.write(`  Remaining: ${formatMoney(response["budgetRemaining"])}\n`);
+      process.stdout.write("  You must allocate cost to each child from this budget.\n");
+
+      const approaches = asArray<unknown>(task["approachHistory"])
+        .map((entry) => asRecord(entry))
+        .filter((entry): entry is Record<string, unknown> => entry !== null);
+      process.stdout.write("\n## Previous Decompositions\n");
+      if (approaches.length === 0) {
+        process.stdout.write("  (none — first attempt)\n");
+      } else {
+        for (const approach of approaches) {
+          process.stdout.write(
+            `  v${String(approach["version"] ?? "?")}: ${getString(approach, "description", "decomposition")} — ${getString(approach, "outcome", "unknown")}\n`,
+          );
+          const failureSummary = getString(approach, "failureSummary", "");
+          if (failureSummary) {
+            process.stdout.write(`    Failed: ${failureSummary}\n`);
+          }
+        }
+      }
+
+      process.stdout.write("\n## Guidelines\n");
+      process.stdout.write("  - Each child should be completable by one agent in one session\n");
+      process.stdout.write("  - Children should be as independent as possible\n");
+      process.stdout.write("  - Use --depends-on when order matters (0-indexed sibling position)\n");
+      process.stdout.write("  - Leave assignee blank unless a specific agent is needed\n");
+
+      process.stdout.write("\n## Next Step\n");
+      process.stdout.write("  Add your first child:\n\n");
+      process.stdout.write("  task decompose add \"Child title\" \\\n");
+      process.stdout.write("    --desc \"What this child should do\" \\\n");
+      process.stdout.write("    --cost 10\n");
       return;
     }
 
