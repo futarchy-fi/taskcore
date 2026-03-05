@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Core } from "../core/index.js";
 import type {
   AgentContext,
@@ -381,6 +382,16 @@ interface DetectedStatus {
   evidence: string;
 }
 
+function taskcoreRootDir(): string {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const parentDir = path.dirname(moduleDir);
+  return path.basename(parentDir) === "dist" ? path.dirname(parentDir) : parentDir;
+}
+
+function taskCliPathEnv(): string {
+  return [taskcoreRootDir(), process.env["PATH"] ?? ""].filter(Boolean).join(path.delimiter);
+}
+
 /**
  * Parse agent stdout for review verdicts.
  *
@@ -399,7 +410,7 @@ function detectStatusFromOutput(
   phase: "analysis" | "execution" | "review",
   _task: Task,
 ): DetectedStatus | null {
-  // Only auto-detect for review phase — execution agents use task_update.py shim
+  // Only auto-detect for review phase — other phases report explicitly via task CLI.
   if (phase !== "review") return null;
 
   // Extract the text payload from agent JSON output
@@ -431,7 +442,7 @@ function detectStatusFromOutput(
     }
   }
 
-  // Strip fenced code blocks to avoid matching on curl templates / JSON payloads
+  // Strip fenced code blocks to avoid matching on command templates / JSON payloads
   // that the agent is quoting in its reasoning (not actual verdicts).
   const stripped = lower.replace(/```[\s\S]*?```/g, " [code-block] ");
 
@@ -796,7 +807,9 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     const spawnEnv: Record<string, string | undefined> = {
       ...process.env,
       TASK_ID: task.id,
+      TASKCORE_AGENT_ID: agentId,
       ORCHESTRATOR_PORT: String(config.port),
+      PATH: taskCliPathEnv(),
     };
     if (journalWorktreePath) {
       spawnEnv["JOURNAL_PATH"] = `${journalWorktreePath}/tasks/T${task.id}/`;
@@ -1054,7 +1067,7 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
             "warning",
             "retry-exhausted",
             `T${run.taskId} ${run.agentId} exhausted (budget depleted)`,
-            `Task "${taskAfterRetry.title}" ran out of budget. Needs manual budget increase via POST /tasks/${run.taskId}/budget.`,
+            `Task "${taskAfterRetry.title}" ran out of budget. Increase it with \`task budget ${run.taskId} --cost N\`.`,
             { taskId: run.taskId, agentId: run.agentId, phase: run.phase },
             [run.agentId, "exhausted"],
           );
@@ -1140,15 +1153,37 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
    * This doesn't burn a retry attempt; if the nudge also fails, the normal retry flow kicks in.
    */
   function spawnStatusNudge(originalRun: ActiveRun, task: Task): void {
-    const statusType = task.phase === "review" ? "done" : "review";
+    const nudgeCommands = task.phase === "review"
+      ? [
+        `task review approve "Brief summary of why this passes"`,
+        `task review request-changes "Specific feedback for the assignee"`,
+        `task review reject "Fundamental issue requiring re-analysis"`,
+      ]
+      : task.phase === "analysis"
+      ? [
+        "task decide execute",
+        "task decompose start",
+        `task block "Why this cannot proceed"`,
+      ]
+      : task.phase === "decomposition"
+      ? [
+        "task decompose start",
+        `task block "Why decomposition is blocked"`,
+      ]
+      : [
+        task.reviewConfig === null
+          ? `task complete "Brief summary of what you finished"`
+          : `task submit "Brief summary of what you finished"`,
+        `task block "What is blocking you"`,
+      ];
+
     const nudgeMessage = [
-      `Run this exact command now. Do not do anything else — just run this command:`,
+      `Report your status now using the task CLI. Do not do more work first.`,
+      `TASK_ID and TASKCORE_AGENT_ID are already set for this session.`,
       ``,
-      `curl -s -X POST http://127.0.0.1:${config.port}/tasks/${task.id}/status \\`,
-      `  -H 'Content-Type: application/json' \\`,
-      `  -d '{"status": "${statusType}", "evidence": "Brief summary of what you did"}'`,
+      `Run the command that matches the state you are already in:`,
       ``,
-      `Replace the evidence text with a short summary of what you actually did, then run it.`,
+      ...nudgeCommands,
     ].join("\n");
 
     const args = [
@@ -1167,7 +1202,9 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       env: {
         ...process.env,
         TASK_ID: task.id,
+        TASKCORE_AGENT_ID: originalRun.agentId,
         ORCHESTRATOR_PORT: String(config.port),
+        PATH: taskCliPathEnv(),
       },
     });
 

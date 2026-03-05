@@ -500,7 +500,7 @@ function handleClaimTask(
       ? b.agentId.trim()
       : typeof b.agent === "string" && b.agent.trim().length > 0
       ? b.agent.trim()
-      : "agent-mcp";
+      : "task-client";
 
     const fenceToken = task.currentFenceToken + 1;
     const sessionId = crypto.randomUUID();
@@ -513,7 +513,7 @@ function handleClaimTask(
     const modelId = typeof b.modelId === "string" && b.modelId.trim().length > 0
       ? b.modelId.trim()
       : "self-directed";
-    const claimSource = typeof b.source === "string" && b.source.trim().length > 0 ? b.source.trim() : "agent-mcp";
+    const claimSource = typeof b.source === "string" && b.source.trim().length > 0 ? b.source.trim() : "task-api";
 
     if (!Number.isInteger(leaseTimeout) || leaseTimeout <= 0) {
       return { status: 400, body: { error: "invalid_lease_timeout", message: "leaseTimeout must be a positive integer." } };
@@ -566,7 +566,7 @@ function handleClaimTask(
         claimSessionKey: null,
         claimSource,
       },
-      reason: "agent claimed task via MCP",
+      reason: "agent claimed task via task API",
       source: { type: "agent", id: agentId },
     };
     err = submitOrError(core, metadataUpdated);
@@ -1825,7 +1825,7 @@ function handleDecomposeAddChild(
     if (!pending) {
       return {
         status: 409,
-        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call POST /tasks/${taskId}/decompose/start first.` },
+        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call task decompose start first.` },
       };
     }
 
@@ -1910,8 +1910,8 @@ function handleDecomposeAddChild(
         budgetRemaining: costRemaining - newTotal,
         children: childrenSummary,
         guidance: `Child ${childIndex} added ("${b.title.trim()}"). Add another child or commit the decomposition:\n` +
-          `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/add-child -H 'Content-Type: application/json' -d '{...}'\n` +
-          `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/commit -H 'Content-Type: application/json' -d '{"approach": "your strategy"}'`,
+          `  task decompose add "Next title" --desc "What this child should do" --cost 10\n` +
+          `  task decompose commit "your strategy"`,
       },
     };
   };
@@ -1929,7 +1929,7 @@ function handleDecomposeCommit(
     if (!pending) {
       return {
         status: 409,
-        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call POST /tasks/${taskId}/decompose/start first.` },
+        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call task decompose start first.` },
       };
     }
 
@@ -2160,14 +2160,12 @@ function computeCostRemaining(task: Task): number {
 
 function buildAddChildGuidance(taskId: string): string {
   return `Add children one at a time:\n` +
-    `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/add-child \\\n` +
-    `    -H 'Content-Type: application/json' \\\n` +
-    `    -d '{"title": "...", "description": "...", "costAllocation": 10}'\n\n` +
+    `  task decompose add "Child title" \\\n` +
+    `    --desc "What this child should do" \\\n` +
+    `    --cost 10\n\n` +
     `Optional fields: assignee, reviewer, dependsOnSiblings (array of sibling indices, 0-based), skipAnalysis (default false — only set true for trivial tasks).\n` +
     `When done adding children, commit:\n` +
-    `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/commit \\\n` +
-    `    -H 'Content-Type: application/json' \\\n` +
-    `    -d '{"approach": "brief description of decomposition strategy"}'`;
+    `  task decompose commit "brief description of decomposition strategy"`;
 }
 
 // ---------------------------------------------------------------------------

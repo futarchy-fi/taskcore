@@ -13,7 +13,7 @@ taskcore takes a different approach: **tasks are event streams, not records.** E
 - **Invariant checking.** After every event, the system verifies 20+ structural invariants. If a bug would corrupt state, it's caught immediately — not discovered days later.
 - **Safe concurrency.** Fence tokens prevent stale agents from making conflicting updates. The core rejects events from agents that no longer hold the lease.
 
-The core is a pure TypeScript library with zero side effects. It doesn't spawn processes, make HTTP calls, or touch the filesystem (except SQLite). The middle layer adds the messy real-world stuff: process spawning, HTTP APIs, agent bridges.
+The core is a pure TypeScript library with zero side effects. It doesn't spawn processes, make HTTP calls, or touch the filesystem (except SQLite). The runtime layer adds the messy real-world stuff: process spawning, HTTP APIs, worktrees, journals, and the `task` CLI.
 
 ## Architecture
 
@@ -25,12 +25,12 @@ The core is a pure TypeScript library with zero side effects. It doesn't spawn p
     │  Pure state  │  Daemon      │
     │  machine     │  HTTP API    │
     │  (frozen)    │  Dispatcher  │
-    │              │  Bridges     │
+    │              │  Worktrees   │
     │  45 tests    │  9 tests     │
     └──────────────┴──────────────┘
          ▲                │
          │                ▼
-    Event log        Agent processes
+    Event log        task CLI / agents
     (SQLite)         (openclaw agent)
 ```
 
@@ -56,10 +56,15 @@ The bridge between the pure core and the real world.
 - **dispatcher.ts** — Priority-sorted dispatch, agent spawn, exit handling with exponential backoff
 - **analysis.ts** — Auto-analysis: tasks with an assignee skip straight to execution
 - **prompt.ts** — Prompt builder for work and review modes
-- **mcp-bridge.ts** — MCP stdio server (JSON-RPC 2.0) for agents that use MCP tools
-- **task-update-bridge.py** — CLI for agents to report status
-- **delegate-bridge.py** — CLI for agents to create subtasks
+- **journal.ts** — Task journal branches, merges, and failure-summary helpers
+- **worktree.ts** — Journal/code worktree lifecycle
+- **state-export.ts** — Dashboard compatibility export
 - **migrate.ts** — One-shot migration from legacy `tasks.json` format
+
+### CLI (`core/cli/` + repo root `task`)
+
+- **task.ts** — Agent/user CLI over the daemon HTTP API; manages `.task` context, journal, review, and decomposition workflows
+- **task** — Repo-local launcher that runs the built CLI or falls back to `tsx` in a source checkout
 
 ## Task Lifecycle
 
@@ -112,6 +117,7 @@ Default: `127.0.0.1:18800`
 | GET | `/health` | Health check + stats |
 | GET | `/tasks` | List tasks (filters: `?phase=`, `?condition=`, `?terminal=`, `?full=true`) |
 | GET | `/tasks/:id` | Get single task (full detail) |
+| POST | `/tasks/:id/claim` | Atomically lease and start a task for an agent |
 | GET | `/dispatchable` | List tasks ready for dispatch |
 | POST | `/tasks` | Create task |
 | POST | `/tasks/:id/events` | Submit raw event (fenced) |
@@ -151,6 +157,9 @@ curl -X POST http://127.0.0.1:18800/tasks \
 
 # Check task state
 curl http://127.0.0.1:18800/tasks/1
+
+# Explore the CLI from this checkout
+./task --help
 ```
 
 ### Environment Variables
@@ -163,6 +172,7 @@ curl http://127.0.0.1:18800/tasks/1
 | `WORKSPACE_DIR` | `~/.openclaw/workspace` | Workspace root |
 | `MAX_CONCURRENT` | 1 | Max concurrent agent dispatches |
 | `TICK_INTERVAL_MS` | 2000 | Core tick interval (auto-events) |
+| `DISPATCHER_ENABLED` | true | Enable built-in dispatcher loop (`true`/`false`) |
 | `DISPATCH_INTERVAL_MS` | 10000 | Dispatch loop interval |
 | `LEASE_TIMEOUT_MS` | 600000 | Default agent lease timeout |
 | `AGENT_TIMEOUT_MS` | 600000 | Max agent runtime before SIGKILL |
@@ -189,7 +199,7 @@ npm run migrate -- --tasks-file /path/to/tasks.json --db /path/to/taskcore.db
 
 ### Near Term
 - [ ] Worktree isolation for agents (each agent gets a git worktree)
-- [ ] Structured decomposition via core events (currently flat `delegate`)
+- [ ] Richer decomposition strategy/history as first-class core events
 - [ ] Dashboard direct integration (query taskcore API instead of exporter)
 - [ ] Snapshot pruning (keep only last N snapshots)
 

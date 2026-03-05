@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -f "$ROOT_DIR/dist/core/cli/task.js" ]; then
+  exec node "$ROOT_DIR/dist/core/cli/task.js" "$@"
+fi
+
+exec node --import tsx "$ROOT_DIR/core/cli/task.ts" "$@"

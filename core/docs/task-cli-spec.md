@@ -1,6 +1,6 @@
 # `task` CLI Specification
 
-> Status: Draft v1 — 2026-03-05
+> Status: Implemented v1 — 2026-03-05
 
 ## 1. Design Principles
 
@@ -21,8 +21,8 @@
    the `.task` context file at the worktree root. The agent works inside the
    worktree. Everything is scoped.
 
-5. **Replaces MCP entirely.** This CLI is the sole interface between agents and
-   taskcore. The MCP server (`openclaw-mcp-server.mjs`) is retired.
+5. **Retires the legacy bridge layer.** This CLI is the sole interface between
+   agents and taskcore.
 
 6. **Human-readable output first.** Agents consume the same text humans would
    read. `--json` flag reserved for future machine parsing.
@@ -171,7 +171,7 @@ These require `$TASKCORE_AGENT_ID`.
 
 #### `task create`
 
-Create a new task (replaces `delegate` MCP tool).
+Create a new task (replaces the legacy `delegate` flow).
 
 ```
 task create <title> --description <desc>
@@ -817,6 +817,7 @@ TypeScript, lives in the taskcore repo at `core/cli/`. Shares types with core.
 Compiles to a single executable via the existing build pipeline.
 
 Installed as `task` (symlink or bin entry in package.json).
+In a source checkout, `./task` is a repo-local launcher for the same CLI.
 
 ### Communication
 
@@ -843,13 +844,11 @@ cd "$WORKTREE"
 - 2: API error (daemon unreachable, task not found, invalid state transition)
 - 3: auth error (no TASKCORE_AGENT_ID when required)
 
-### MCP Cutover Plan
+### Cutover Status
 
-1. Build CLI with feature parity to MCP tools
-2. Update dispatcher to use `task` CLI in agent prompts instead of curl examples
-3. Update agent CLAUDE.md / AGENTS.md to reference `task` commands
-4. Remove MCP server from `.mcp.json`
-5. Delete `openclaw-mcp-server.mjs`
+1. `task` has feature parity with the retired bridge commands.
+2. Dispatcher prompts use `task` commands instead of raw HTTP examples.
+3. Legacy bridge entrypoints are removed from the runtime.
 
 ## 7. Open Questions
 
@@ -862,7 +861,6 @@ cd "$WORKTREE"
 3. **Offline mode**: Should the CLI cache task data for when the daemon is
    unreachable? (Probably not for v1.)
 
-4. **Dispatcher integration**: The dispatcher currently spawns `openclaw agent`.
-   Should it switch to having agents self-serve via `task claim` + `task submit`?
-   Or keep the dispatcher for auto-dispatch and have the CLI for self-directed
-   work?
+4. **Dispatcher integration**: The dispatcher currently auto-dispatches work.
+   Should it stay opinionated, or shift toward more self-directed claiming via
+   `task claim`?
