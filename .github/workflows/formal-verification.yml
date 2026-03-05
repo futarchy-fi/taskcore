@@ -1,0 +1,44 @@
+name: Formal Verification
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  formal:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download formal tools
+        shell: bash
+        run: |
+          mkdir -p .ci-tools
+          curl -fsSL -o .ci-tools/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          curl -fsSL -o .ci-tools/alloy.jar \
+            https://repo1.maven.org/maven2/org/alloytools/org.alloytools.alloy.dist/6.2.0/org.alloytools.alloy.dist-6.2.0.jar
+
+      - name: Run TLA+ specifications
+        shell: bash
+        run: |
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/task-lease.cfg core/spec/task-lease.tla
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/task-lifecycle.cfg core/spec/task-lifecycle.tla
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/task-cost-conservation.cfg core/spec/task-cost-conservation.tla
+
+      - name: Run Alloy checks
+        shell: bash
+        run: |
+          java -jar .ci-tools/alloy.jar exec core/spec/task-structure.als --command "check*" --output - --type none
