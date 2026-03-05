@@ -34,11 +34,11 @@ jobs:
       - name: Run TLA+ specifications
         shell: bash
         run: |
-          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/task-lease.cfg core/spec/task-lease.tla
-          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/task-lifecycle.cfg core/spec/task-lifecycle.tla
-          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/task-cost-conservation.cfg core/spec/task-cost-conservation.tla
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/TaskLeaseProtocol.cfg core/spec/TaskLeaseProtocol.tla
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/TaskLifecycle.cfg core/spec/TaskLifecycle.tla
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/TaskCostConservation.cfg core/spec/TaskCostConservation.tla
 
       - name: Run Alloy checks
         shell: bash
         run: |
-          java -jar .ci-tools/alloy.jar exec core/spec/task-structure.als --command "check*" --output - --type none
+          java -jar .ci-tools/alloy.jar exec --command "check*" --output - --type none core/spec/task-structure.als

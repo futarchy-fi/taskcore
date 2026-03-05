@@ -18,7 +18,8 @@ CONSTANTS
   Tasks,
   RootTask,
   NoneTask,
-  InitialAllocation
+  InitialAllocation,
+  MaxAmount
 
 VARIABLES
   alive,
@@ -28,12 +29,26 @@ VARIABLES
   childRecovered,
   parent
 
-Min(x, y) == IF x < y THEN x ELSE y
+Remaining(task) ==
+  allocated[task] - consumed[task] - childAllocated[task] + childRecovered[task]
 
-Remaining(task) == allocated[task] - consumed[task] - childAllocated[task] + childRecovered[task]
+RECURSIVE ConsumedSum(_), RemainingSum(_)
+ConsumedSum(tasks) ==
+  IF tasks = {}
+  THEN 0
+  ELSE LET t == CHOOSE x \in tasks: TRUE
+       IN consumed[t] + ConsumedSum(tasks \ {t})
+
+RemainingSum(tasks) ==
+  IF tasks = {}
+  THEN 0
+  ELSE LET t == CHOOSE x \in tasks: TRUE
+       IN Remaining(t) + RemainingSum(tasks \ {t})
 
 Init ==
-  /\ RootTask ∈ Tasks
+  /\ RootTask \in Tasks
+  /\ InitialAllocation \in Nat
+  /\ MaxAmount \in 1..InitialAllocation
   /\ alive = {RootTask}
   /\ allocated = [t \in Tasks |-> IF t = RootTask THEN InitialAllocation ELSE 0]
   /\ consumed = [t \in Tasks |-> 0]
@@ -42,18 +57,19 @@ Init ==
   /\ parent = [t \in Tasks |-> NoneTask]
 
 TypeInvariant ==
-  /\ RootTask ∈ Tasks
-  /\ parent ∈ [Tasks -> (Tasks ∪ {NoneTask})]
-  /\ allocated ∈ [Tasks -> Nat]
-  /\ consumed ∈ [Tasks -> Nat]
-  /\ childAllocated ∈ [Tasks -> Nat]
-  /\ childRecovered ∈ [Tasks -> Nat]
-  /\ alive ⊆ Tasks
-  /\ RootTask ∈ alive
-  /\ InitialAllocation >= 0
+  /\ RootTask \in Tasks
+  /\ parent \in [Tasks -> (Tasks \cup {NoneTask})]
+  /\ allocated \in [Tasks -> Nat]
+  /\ consumed \in [Tasks -> Nat]
+  /\ childAllocated \in [Tasks -> Nat]
+  /\ childRecovered \in [Tasks -> Nat]
+  /\ alive \subseteq Tasks
+  /\ RootTask \in alive
+  /\ InitialAllocation \in Nat
+  /\ MaxAmount \in 1..InitialAllocation
 
 AliveNonNegative ==
-  ∀ t ∈ alive:
+  \A t \in alive:
     /\ allocated[t] >= 0
     /\ consumed[t] >= 0
     /\ childAllocated[t] >= 0
@@ -61,24 +77,24 @@ AliveNonNegative ==
     /\ Remaining(t) >= 0
 
 ParentConsistency ==
-  ∀ t ∈ alive:
-    \/ t = RootTask => parent[t] = NoneTask
-    \/ (parent[t] ∈ alive /\ parent[t] # t)
+  \A t \in alive:
+    IF t = RootTask
+    THEN parent[t] = NoneTask
+    ELSE /\ parent[t] \in alive
+         /\ parent[t] # t
 
 CostConservation ==
-  LET totalConsumed == Sum({consumed[t] : t ∈ alive})
-      totalRemaining == Sum({Remaining(t) : t ∈ alive})
-      remainingRoot == allocated[RootTask]
-  IN
-    totalConsumed + totalRemaining = remainingRoot
+  LET totalConsumed == ConsumedSum(alive)
+      totalRemaining == RemainingSum(alive)
+  IN totalConsumed + totalRemaining = allocated[RootTask]
 
 CreateChild(parentTask, child, amount) ==
-  /\ parentTask ∈ alive
-  /\ child ∈ Tasks
-  /\ child ∉ alive
-  /\ amount ∈ Nat \ {0}
+  /\ parentTask \in alive
+  /\ child \in Tasks
+  /\ child \notin alive
+  /\ amount \in 1..MaxAmount
   /\ amount <= Remaining(parentTask)
-  /\ alive' = alive ∪ {child}
+  /\ alive' = alive \cup {child}
   /\ allocated' = [allocated EXCEPT ![child] = amount]
   /\ consumed' = consumed
   /\ childAllocated' = [childAllocated EXCEPT ![parentTask] = childAllocated[parentTask] + amount]
@@ -86,8 +102,8 @@ CreateChild(parentTask, child, amount) ==
   /\ parent' = [parent EXCEPT ![child] = parentTask]
 
 ReportCost(task, amount) ==
-  /\ task ∈ alive
-  /\ amount ∈ Nat \ {0}
+  /\ task \in alive
+  /\ amount \in 1..MaxAmount
   /\ amount <= Remaining(task)
   /\ alive' = alive
   /\ allocated' = allocated
@@ -97,11 +113,10 @@ ReportCost(task, amount) ==
   /\ parent' = parent
 
 RecoverFromChild(parentTask, child, amount) ==
-  /\ parentTask ∈ alive
+  /\ parentTask \in alive
+  /\ child \in alive
   /\ parent[child] = parentTask
-  /\ child ∈ alive
-  /\ amount ∈ Nat
-  /\ amount > 0
+  /\ amount \in 1..MaxAmount
   /\ LET recoverable == Remaining(child)
          recovered == IF amount <= recoverable THEN amount ELSE recoverable
      IN
@@ -112,14 +127,12 @@ RecoverFromChild(parentTask, child, amount) ==
        /\ childRecovered' = [childRecovered EXCEPT ![parentTask] = childRecovered[parentTask] + recovered]
        /\ parent' = parent
 
-Next == 
-  \/ ∃ p ∈ alive, c ∈ Tasks \ alive, a ∈ Nat: CreateChild(p, c, a)
-  \/ ∃ t ∈ alive, a ∈ Nat \ {0}: ReportCost(t, a)
-  \/ ∃ p ∈ alive, c ∈ alive, a ∈ Nat: RecoverFromChild(p, c, a)
+Next ==
+  \/ \E p \in alive, c \in Tasks \ alive, a \in 1..MaxAmount: CreateChild(p, c, a)
+  \/ \E t \in alive, a \in 1..MaxAmount: ReportCost(t, a)
+  \/ \E p \in alive, c \in alive, a \in 1..MaxAmount: RecoverFromChild(p, c, a)
 
 Spec ==
   Init /\ [][Next]_<<alive, allocated, consumed, childAllocated, childRecovered, parent>>
-
-THEOREM Spec => [](TypeInvariant /\ AliveNonNegative /\ CostConservation)
 
 ==============================================================================

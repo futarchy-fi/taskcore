@@ -28,12 +28,12 @@ fact NoCycles {
 
 // Parent-child consistency.
 fact ParentChildConsistency {
-  all t: Task | all c: t.children | c.parent = t
+  all t: Task | all c: Task | (c in t.children) iff (c.parent = t)
 }
 
 // Parent-child consistency is explicit as an assertion too, for command checks.
 assert parentChildConsistency {
-  all t: Task | all c: t.children | c.parent = t
+  all t: Task | all c: Task | (c in t.children) iff (c.parent = t)
 }
 
 // Root identity is stable down the tree.
@@ -66,8 +66,12 @@ assert costNonNegativity {
     remaining[t] >= 0
 }
 
+assert noCycles {
+  no t: Task | t in t.^parent
+}
+
 // Structural sanity checks.
 check parentChildConsistency for 5
 check rootIdConsistency for 5
 check costNonNegativity for 5
-check NoCycles for 5
+check noCycles for 5
