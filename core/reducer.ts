@@ -280,11 +280,37 @@ function applyLeaseExpired(state: SystemState, event: Extract<Event, { type: "Le
   state.tasks[t.id] = t;
 }
 
+function applyLeaseReleased(state: SystemState, event: Extract<Event, { type: "LeaseReleased" }>, task: Task): void {
+  const t = deepCloneTask(task);
+  t.condition = "ready";
+  t.leasedTo = null;
+  t.leaseExpiresAt = null;
+  t.retryAfter = null;
+  t.currentSessionId = null;
+  t.lastAgentExitAt = null;
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
+function applyLeaseExtended(state: SystemState, event: Extract<Event, { type: "LeaseExtended" }>, task: Task): void {
+  const t = deepCloneTask(task);
+  t.leaseExpiresAt = event.ts + event.leaseTimeout;
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
 function applyAgentStarted(state: SystemState, event: Extract<Event, { type: "AgentStarted" }>, task: Task): void {
   const t = deepCloneTask(task);
   t.condition = "active";
   t.currentSessionId = event.agentContext.sessionId;
   t.leaseExpiresAt = null;
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
+function applyCostReported(state: SystemState, event: Extract<Event, { type: "CostReported" }>, task: Task): void {
+  const t = deepCloneTask(task);
+  t.cost.consumed += event.reportedCost;
   t.updatedAt = event.ts;
   state.tasks[t.id] = t;
 }
@@ -787,11 +813,20 @@ function applyUnchecked(state: SystemState, event: Event): void {
     case "LeaseExpired":
       applyLeaseExpired(state, event, task);
       break;
+    case "LeaseReleased":
+      applyLeaseReleased(state, event, task);
+      break;
+    case "LeaseExtended":
+      applyLeaseExtended(state, event, task);
+      break;
     case "AgentStarted":
       applyAgentStarted(state, event, task);
       break;
     case "AgentExited":
       applyAgentExited(state, event, task);
+      break;
+    case "CostReported":
+      applyCostReported(state, event, task);
       break;
     case "PhaseTransition":
       applyPhaseTransition(state, event, task);

@@ -1,0 +1,57 @@
+name: Formal Verification
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  formal:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TLA_TOOLS_VERSION: "1.8.0"
+      ALLOY_VERSION: "6.2.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache formal tools
+        uses: actions/cache@v4
+        with:
+          path: .ci-tools
+          key: ${{ runner.os }}-formal-tools-${{ env.TLA_TOOLS_VERSION }}-${{ env.ALLOY_VERSION }}
+
+      - name: Download formal tools
+        shell: bash
+        run: |
+          mkdir -p .ci-tools
+          if [ ! -f .ci-tools/tla2tools.jar ]; then
+            curl -fsSL -o .ci-tools/tla2tools.jar \
+              https://github.com/tlaplus/tlaplus/releases/download/v${TLA_TOOLS_VERSION}/tla2tools.jar
+          fi
+          if [ ! -f .ci-tools/alloy.jar ]; then
+            curl -fsSL -o .ci-tools/alloy.jar \
+              https://repo1.maven.org/maven2/org/alloytools/org.alloytools.alloy.dist/${ALLOY_VERSION}/org.alloytools.alloy.dist-${ALLOY_VERSION}.jar
+          fi
+
+      - name: Run TLA+ specifications
+        shell: bash
+        run: |
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/TaskLeaseProtocol.cfg core/spec/TaskLeaseProtocol.tla
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/TaskLifecycle.cfg core/spec/TaskLifecycle.tla
+          java -cp .ci-tools/tla2tools.jar tlc2.TLC -config core/spec/TaskCostConservation.cfg core/spec/TaskCostConservation.tla
+
+      - name: Run Alloy checks
+        shell: bash
+        run: |
+          java -jar .ci-tools/alloy.jar exec --command "check*" --output - --type none core/spec/task-structure.als

@@ -2,6 +2,9 @@
   "name": "taskcore",
   "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "task": "dist/core/cli/task.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -9,7 +12,8 @@
     "test:middle": "tsx --test middle/test/*.test.ts",
     "test:all": "tsx --test core/test/*.test.ts middle/test/*.test.ts",
     "daemon": "node --import tsx middle/daemon.ts",
-    "migrate": "node --import tsx middle/migrate.ts"
+    "migrate": "node --import tsx middle/migrate.ts",
+    "task": "node --import tsx core/cli/task.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0"

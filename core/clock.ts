@@ -126,7 +126,11 @@ export class CoreClock {
         continue;
       }
 
-      if (task.condition === "leased" && task.leaseExpiresAt !== null && task.leaseExpiresAt <= now) {
+      if (
+        (task.condition === "leased" || task.condition === "active") &&
+        task.leaseExpiresAt !== null &&
+        task.leaseExpiresAt <= now
+      ) {
         const leaseExpired: LeaseExpired = {
           type: "LeaseExpired",
           taskId: task.id,

@@ -1,4 +1,7 @@
 import * as http from "node:http";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { Core } from "../core/index.js";
 import type {
   AgentContext,
@@ -21,6 +24,7 @@ import type {
   TaskCanceled,
   TaskCompleted,
   TaskCreated,
+  TaskFailed,
   TaskId,
   TaskReparented,
   TaskRevived,
@@ -28,7 +32,10 @@ import type {
 } from "../core/types.js";
 import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
 import type { Config } from "./config.js";
+import { buildPrompt } from "./prompt.js";
+import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent, taskBranch } from "./journal.js";
 import { loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
+import { createWorktree, getWorktreePath } from "./worktree.js";
 
 // ---------------------------------------------------------------------------
 // Priority helpers
@@ -64,7 +71,7 @@ interface RouteResult {
 }
 
 interface StatusUpdateBody {
-  status: "review" | "done" | "blocked" | "pending" | "execute" | "decompose" | "cancel";
+  status: "review" | "done" | "blocked" | "pending" | "execute" | "decompose" | "cancel" | "reject";
   evidence?: string;
   blocker?: string;
   stateRef?: StateRef;
@@ -75,6 +82,15 @@ interface StatusUpdateBody {
     assignee?: string;
     reviewer?: string;
   }>;
+}
+
+interface ClaimBody {
+  agentId?: string;
+  agent?: string;
+  leaseTimeout?: number;
+  contextBudget?: number;
+  modelId?: string;
+  source?: string;
 }
 
 interface TaskCreateBody {
@@ -89,6 +105,9 @@ interface TaskCreateBody {
   skipAnalysis?: boolean;
   costBudget?: number;
   dependsOn?: string | string[];
+  repo?: string;
+  baseBranch?: string;
+  base_branch?: string;
 }
 
 interface DecomposeBody {
@@ -192,6 +211,110 @@ function submitOrError(core: Core, event: Event): RouteResult | null {
 
 function defaultStateRef(): StateRef {
   return { branch: "main", commit: "0000000", parentCommit: "0000000" };
+}
+
+function truncateText(input: string, maxChars: number): string {
+  if (input.length <= maxChars) return input;
+  return `${input.slice(0, maxChars)}\n... (truncated, ${input.length - maxChars} chars omitted)`;
+}
+
+function loadWorkspaceConventions(config: Config): string | null {
+  const agentsPath = path.join(config.workspaceDir, "AGENTS.md");
+  try {
+    return fs.readFileSync(agentsPath, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+function ensureTaskWorkspaces(config: Config, task: Task): {
+  journalWorktree: string | null;
+  journalPath: string | null;
+  codeWorktree: string | null;
+  warnings: string[];
+} {
+  const warnings: string[] = [];
+  let journalWorktree: string | null = null;
+  let journalPath: string | null = null;
+  let codeWorktree: string | null = null;
+
+  try {
+    const jBranch = taskBranch(task.id);
+    const jPath = getWorktreePath(config.worktreeBaseDir, task.id, "journal");
+    createTaskBranch(config.journalRepoPath, task.id, task.parentId);
+    if (!fs.existsSync(jPath)) {
+      createWorktree(config.journalRepoPath, jPath, jBranch);
+    }
+    journalWorktree = jPath;
+    journalPath = `${path.join(jPath, "tasks", `T${task.id}`)}${path.sep}`;
+  } catch (err) {
+    warnings.push(`journal worktree setup failed: ${String(err)}`);
+  }
+
+  const targetRepo = task.metadata["repo"] as string | undefined;
+  if (targetRepo) {
+    try {
+      const cPath = getWorktreePath(config.worktreeBaseDir, task.id, "code");
+      const baseBranch = (task.metadata["base_branch"] as string | undefined) ?? "main";
+      const codeBranch = `task/T${task.id}`;
+      if (!fs.existsSync(cPath)) {
+        createWorktree(targetRepo, cPath, codeBranch, baseBranch);
+      }
+      codeWorktree = cPath;
+    } catch (err) {
+      warnings.push(`code worktree setup failed: ${String(err)}`);
+    }
+  }
+
+  return { journalWorktree, journalPath, codeWorktree, warnings };
+}
+
+function ensureJournalWorktreeForTask(config: Config, task: Task): {
+  journalWorktree: string;
+  taskDir: string;
+} {
+  const workspaces = ensureTaskWorkspaces(config, task);
+  if (!workspaces.journalWorktree) {
+    throw new Error(`No journal worktree available for T${task.id}`);
+  }
+  const taskDir = path.join(workspaces.journalWorktree, "tasks", `T${task.id}`);
+  fs.mkdirSync(taskDir, { recursive: true });
+  return { journalWorktree: workspaces.journalWorktree, taskDir };
+}
+
+function appendJournalEntry(config: Config, task: Task, entry: string): {
+  journalPath: string;
+  committed: boolean;
+} {
+  const { journalWorktree, taskDir } = ensureJournalWorktreeForTask(config, task);
+  const journalFile = path.join(taskDir, "journal.md");
+
+  if (!fs.existsSync(journalFile)) {
+    fs.writeFileSync(journalFile, `# T${task.id} Journal\n`, "utf-8");
+  }
+
+  const trimmed = entry.trim();
+  const stamp = new Date().toISOString();
+  const block = `\n\n## ${stamp}\n${trimmed}\n`;
+  fs.appendFileSync(journalFile, block, "utf-8");
+  commitJournal(journalWorktree, task.id, "journal update");
+
+  return { journalPath: `${taskDir}${path.sep}`, committed: true };
+}
+
+function writeJournalArtifact(config: Config, task: Task, name: string, content: string): {
+  journalPath: string;
+  filePath: string;
+} {
+  const { journalWorktree, taskDir } = ensureJournalWorktreeForTask(config, task);
+  const safeName = path.basename(name);
+  if (!safeName || safeName === "." || safeName === "..") {
+    throw new Error("Invalid file name");
+  }
+  const filePath = path.join(taskDir, safeName);
+  fs.writeFileSync(filePath, content, "utf-8");
+  commitJournal(journalWorktree, task.id, `journal artifact ${safeName}`);
+  return { journalPath: `${taskDir}${path.sep}`, filePath };
 }
 
 // ---------------------------------------------------------------------------
@@ -316,9 +439,15 @@ function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[]
     { method: "GET", pattern: "/tasks", handler: handleListTasks(core) },
     { method: "GET", pattern: "/tasks/:id", handler: handleGetTask(core) },
     { method: "GET", pattern: "/tasks/:id/events", handler: handleGetTaskEvents(core) },
+    { method: "GET", pattern: "/tasks/:id/journal", handler: handleGetTaskJournal(core, config) },
+    { method: "POST", pattern: "/tasks/:id/journal", handler: handleAppendTaskJournal(core, config) },
+    { method: "POST", pattern: "/tasks/:id/journal/file", handler: handleWriteTaskJournalFile(core, config) },
+    { method: "GET", pattern: "/tasks/:id/review/context", handler: handleReviewContext(core, config) },
+    { method: "POST", pattern: "/tasks/:id/review/note", handler: handleReviewNote(core) },
     { method: "GET", pattern: "/dispatchable", handler: handleDispatchable(core) },
     { method: "POST", pattern: "/tasks", handler: handleCreateTask(core, config, registry) },
     { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
+    { method: "POST", pattern: "/tasks/:id/claim", handler: handleClaimTask(core, config) },
     { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core) },
     { method: "POST", pattern: "/tasks/:id/reparent", handler: handleReparent(core) },
     { method: "POST", pattern: "/tasks/:id/revive", handler: handleRevive(core) },
@@ -326,11 +455,170 @@ function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[]
     { method: "POST", pattern: "/tasks/:id/decompose/start", handler: handleDecomposeStart(core) },
     { method: "POST", pattern: "/tasks/:id/decompose/add-child", handler: handleDecomposeAddChild(core) },
     { method: "POST", pattern: "/tasks/:id/decompose/commit", handler: handleDecomposeCommit(core, config) },
+    { method: "POST", pattern: "/tasks/:id/decompose/cancel", handler: handleDecomposeCancel(core) },
     { method: "POST", pattern: "/tasks/:id/decompose", handler: handleDecompose(core, config) },
     { method: "PATCH", pattern: "/tasks/:id/metadata", handler: handleMetadataUpdate(core, registry) },
     { method: "GET", pattern: "/attention", handler: handleAttention(core) },
     { method: "GET", pattern: "/attention/telegram", handler: handleAttentionTelegram(core) },
   ];
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+// POST /tasks/:id/claim — atomically lease+start+mark claim metadata
+function handleClaimTask(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as ClaimBody;
+
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+    if (task.terminal) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+    if (task.condition !== "ready") {
+      return {
+        status: 409,
+        body: {
+          error: "not_claimable",
+          message: `Task ${taskId} must be ready to claim, got ${task.phase}.${task.condition}`,
+        },
+      };
+    }
+    if (!task.phase) {
+      return { status: 409, body: { error: "terminal_task", message: `Task ${taskId} is terminal` } };
+    }
+
+    const agentId = typeof b.agentId === "string" && b.agentId.trim().length > 0
+      ? b.agentId.trim()
+      : typeof b.agent === "string" && b.agent.trim().length > 0
+      ? b.agent.trim()
+      : "agent-mcp";
+
+    const fenceToken = task.currentFenceToken + 1;
+    const sessionId = crypto.randomUUID();
+    const leaseTimeout = Number.isFinite(b.leaseTimeout ?? NaN)
+      ? Number(b.leaseTimeout)
+      : config.leaseTimeoutMs;
+    const contextBudget = Number.isFinite(b.contextBudget ?? NaN)
+      ? Number(b.contextBudget)
+      : config.defaultContextBudget;
+    const modelId = typeof b.modelId === "string" && b.modelId.trim().length > 0
+      ? b.modelId.trim()
+      : "self-directed";
+    const claimSource = typeof b.source === "string" && b.source.trim().length > 0 ? b.source.trim() : "agent-mcp";
+
+    if (!Number.isInteger(leaseTimeout) || leaseTimeout <= 0) {
+      return { status: 400, body: { error: "invalid_lease_timeout", message: "leaseTimeout must be a positive integer." } };
+    }
+    if (!Number.isInteger(contextBudget) || contextBudget <= 0) {
+      return { status: 400, body: { error: "invalid_context_budget", message: "contextBudget must be a positive integer." } };
+    }
+
+    const now = Date.now();
+    const lg: LeaseGranted = {
+      type: "LeaseGranted",
+      taskId,
+      ts: now,
+      fenceToken,
+      agentId,
+      phase: task.phase,
+      leaseTimeout,
+      sessionId,
+      sessionType: "fresh",
+      contextBudget,
+    };
+    let err = submitOrError(core, lg);
+    if (err) return err;
+
+    const agentContext: AgentContext = {
+      sessionId,
+      agentId,
+      memoryRef: null,
+      contextTokens: null,
+      modelId,
+    };
+    const started: AgentStarted = {
+      type: "AgentStarted",
+      taskId,
+      ts: now + 1,
+      fenceToken,
+      agentContext,
+    };
+    err = submitOrError(core, started);
+    if (err) return err;
+
+    const metadataUpdated: MetadataUpdated = {
+      type: "MetadataUpdated",
+      taskId,
+      ts: now + 2,
+      patch: {
+        claimedAt: nowIso(),
+        claimedBy: agentId,
+        claimSessionId: sessionId,
+        claimSessionKey: null,
+        claimSource,
+      },
+      reason: "agent claimed task via MCP",
+      source: { type: "agent", id: agentId },
+    };
+    err = submitOrError(core, metadataUpdated);
+    if (err) return err;
+
+    const updated = core.getTask(taskId);
+    if (!updated) {
+      return { status: 500, body: { error: "missing_task", message: `Task ${taskId} disappeared after claim` } };
+    }
+
+    // The daemon owns worktree creation so the CLI can stay a pure HTTP client.
+    const workspace = ensureTaskWorkspaces(config, updated);
+    const parentJournal = updated.parentId
+      ? getJournalContent(config.journalRepoPath, updated.parentId)
+      : null;
+    const siblingFailures = getFailureSummaries(config.journalRepoPath, updated.id).map((entry) => ({
+      taskId: entry.taskId,
+      content: truncateText(entry.content, 500),
+    }));
+    const workspaceConventions = loadWorkspaceConventions(config);
+
+    return {
+      status: 200,
+      body: {
+        claimed: true,
+        taskId,
+        sessionId,
+        fenceToken,
+        leaseTimeout,
+        task: {
+          id: updated.id,
+          title: updated.title,
+          description: updated.description,
+          phase: updated.phase,
+          priority: updated.metadata["priority"] ?? "medium",
+          assignee: updated.metadata["assignee"] ?? null,
+          reviewer: updated.metadata["reviewer"] ?? null,
+          consulted: updated.metadata["consulted"] ?? null,
+          parentId: updated.parentId,
+          failureSummaries: updated.failureSummaries,
+          reviewState: updated.reviewState,
+        },
+        workspace,
+        parentJournal: parentJournal ? truncateText(parentJournal, 3000) : null,
+        siblingFailures,
+        workspaceConventions,
+        reviewContext: updated.phase === "review" ? buildPrompt(core, updated.id, "review", config) : null,
+        warnings: workspace.warnings,
+        guidance: "Start a fresh context (/new) unless this task is tightly coupled to your previous context.",
+      },
+    };
+  };
 }
 
 // GET /health
@@ -428,6 +716,172 @@ function handleGetTaskEvents(
     }
 
     return { status: 200, body: { events } };
+  };
+}
+
+// GET /tasks/:id/journal
+function handleGetTaskJournal(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params) => {
+    const taskId = params["id"]!;
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const fromBranch = getJournalContent(config.journalRepoPath, taskId);
+    if (fromBranch !== null) {
+      return { status: 200, body: { taskId, content: fromBranch } };
+    }
+
+    const journalWorktree = getWorktreePath(config.worktreeBaseDir, taskId, "journal");
+    const journalFile = path.join(journalWorktree, "tasks", `T${taskId}`, "journal.md");
+    if (fs.existsSync(journalFile)) {
+      return { status: 200, body: { taskId, content: fs.readFileSync(journalFile, "utf-8") } };
+    }
+
+    return { status: 200, body: { taskId, content: "" } };
+  };
+}
+
+// POST /tasks/:id/journal
+function handleAppendTaskJournal(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const payload = body as { entry?: string };
+    const entry = typeof payload.entry === "string" ? payload.entry.trim() : "";
+    if (!entry) {
+      return { status: 400, body: { error: "missing_entry", message: "entry is required" } };
+    }
+
+    try {
+      const result = appendJournalEntry(config, task, entry);
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          taskId,
+          journalPath: result.journalPath,
+          committed: result.committed,
+        },
+      };
+    } catch (err) {
+      return { status: 500, body: { error: "journal_write_failed", message: String(err) } };
+    }
+  };
+}
+
+// POST /tasks/:id/journal/file
+function handleWriteTaskJournalFile(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const payload = body as { name?: string; content?: string };
+    const name = typeof payload.name === "string" ? payload.name.trim() : "";
+    if (!name) {
+      return { status: 400, body: { error: "missing_name", message: "name is required" } };
+    }
+    if (typeof payload.content !== "string") {
+      return { status: 400, body: { error: "missing_content", message: "content is required" } };
+    }
+
+    try {
+      const result = writeJournalArtifact(config, task, name, payload.content);
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          taskId,
+          journalPath: result.journalPath,
+          filePath: result.filePath,
+        },
+      };
+    } catch (err) {
+      return { status: 500, body: { error: "journal_file_write_failed", message: String(err) } };
+    }
+  };
+}
+
+// GET /tasks/:id/review/context
+function handleReviewContext(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params) => {
+    const taskId = params["id"]!;
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const notes = Array.isArray(task.metadata["review_notes"])
+      ? task.metadata["review_notes"]
+      : [];
+
+    return {
+      status: 200,
+      body: {
+        taskId,
+        phase: task.phase,
+        text: buildPrompt(core, taskId, "review", config),
+        notes,
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/review/note
+function handleReviewNote(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const payload = body as { note?: string };
+    const note = typeof payload.note === "string" ? payload.note.trim() : "";
+    if (!note) {
+      return { status: 400, body: { error: "missing_note", message: "note is required" } };
+    }
+
+    const existing = Array.isArray(task.metadata["review_notes"])
+      ? task.metadata["review_notes"].map((entry) => String(entry))
+      : [];
+    const notes = [...existing, note];
+
+    const event: MetadataUpdated = {
+      type: "MetadataUpdated",
+      taskId,
+      ts: Date.now(),
+      patch: { review_notes: notes },
+      reason: "review note added via API",
+      source: { type: "middle", id: "daemon" },
+    };
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    return { status: 200, body: { ok: true, taskId, notes } };
   };
 }
 
@@ -539,6 +993,8 @@ function handleCreateTask(
         consulted: b.consulted ?? null,
         priority: b.priority ?? "medium",
         informed: b.informed ?? null,
+        repo: b.repo ?? null,
+        base_branch: b.baseBranch ?? b.base_branch ?? null,
         createdBy: "http-api",
         createdAt: new Date().toISOString(),
       },
@@ -553,6 +1009,7 @@ function handleCreateTask(
       body: {
         taskId,
         status: "created",
+        phase: b.skipAnalysis ? "execution" : "analysis",
         assignee,
         priority: b.priority ?? "medium",
         parentId,
@@ -609,6 +1066,9 @@ function handleStatusUpdate(
 
       case "done":
         return applyDoneTransition(core, task, fenceToken, ctx, now, b.evidence, b.stateRef);
+
+      case "reject":
+        return applyRejectTransition(core, task, fenceToken, ctx, now, b.evidence);
 
       case "blocked":
         return applyBlockedTransition(core, task, now, b.blocker ?? b.evidence ?? "No reason provided");
@@ -920,12 +1380,30 @@ function applyDoneTransition(
   evidence?: string,
   stateRef?: StateRef,
 ): RouteResult {
+  if (task.phase === "execution" && task.condition === "active" && task.reviewConfig === null) {
+    const completed: TaskCompleted = {
+      type: "TaskCompleted",
+      taskId: task.id,
+      ts,
+      stateRef: stateRef ?? defaultStateRef(),
+    };
+    const err = submitOrError(core, completed);
+    if (err) return err;
+
+    notifyInformed(task, "✅ Done");
+
+    return {
+      status: 200,
+      body: { ok: true, taskId: task.id, transition: "execution.active → done" },
+    };
+  }
+
   if (task.phase !== "review" || task.condition !== "active") {
     return {
       status: 409,
       body: {
         error: "invalid_state",
-        message: `Task must be in review.active for done, got ${task.phase}.${task.condition}`,
+        message: `Task must be in review.active for done (or execution.active without reviewer), got ${task.phase}.${task.condition}`,
       },
     };
   }
@@ -974,6 +1452,77 @@ function applyDoneTransition(
   return {
     status: 200,
     body: { ok: true, taskId: task.id, transition: "review.active → done" },
+  };
+}
+
+/** reject: review.active → failed */
+function applyRejectTransition(
+  core: Core,
+  task: Task,
+  fenceToken: number,
+  ctx: AgentContext,
+  ts: number,
+  evidence?: string,
+): RouteResult {
+  if (task.phase !== "review" || task.condition !== "active") {
+    return {
+      status: 409,
+      body: {
+        error: "invalid_state",
+        message: `Task must be in review.active for reject, got ${task.phase}.${task.condition}`,
+      },
+    };
+  }
+
+  const round = task.reviewState?.round ?? 1;
+
+  const verdict: ReviewVerdictSubmitted = {
+    type: "ReviewVerdictSubmitted",
+    taskId: task.id,
+    ts,
+    fenceToken,
+    reviewer: ctx.agentId,
+    round,
+    verdict: "reject",
+    reasoning: evidence ?? "Rejected",
+    agentContext: ctx,
+  };
+  let err = submitOrError(core, verdict);
+  if (err) return err;
+
+  const policyMet: ReviewPolicyMet = {
+    type: "ReviewPolicyMet",
+    taskId: task.id,
+    ts: ts + 1,
+    outcome: "escalated",
+    summary: evidence ?? "Rejected by reviewer",
+    source: { type: "middle", id: "daemon" },
+  };
+  err = submitOrError(core, policyMet);
+  if (err) return err;
+
+  const failed: TaskFailed = {
+    type: "TaskFailed",
+    taskId: task.id,
+    ts: ts + 2,
+    reason: "review_rejected",
+    phase: "review",
+    summary: {
+      childId: null,
+      approach: "review phase",
+      whatFailed: evidence ?? "Rejected by reviewer",
+      whatWasLearned: "Reviewer rejected the submission.",
+      artifactRef: null,
+    },
+  };
+  err = submitOrError(core, failed);
+  if (err) return err;
+
+  notifyInformed(task, "❌ Rejected", evidence ?? "Rejected by reviewer");
+
+  return {
+    status: 200,
+    body: { ok: true, taskId: task.id, transition: "review.active → failed" },
   };
 }
 
@@ -1563,6 +2112,29 @@ function handleDecomposeCommit(
         children: childSpecs.map(c => ({ id: c.taskId, title: c.title, costAllocation: c.costAllocation })),
         decompositionVersion: version,
         transition: "→ review.waiting",
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/decompose/cancel — discard pending decomposition session
+function handleDecomposeCancel(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params) => {
+    const taskId = params["id"]!;
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+
+    const existed = pendingDecompositions.delete(taskId);
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        canceled: existed,
       },
     };
   };

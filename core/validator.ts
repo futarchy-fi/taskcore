@@ -498,11 +498,40 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "LeaseExpired": {
-      if (task.condition !== "leased") {
-        return mkError(event, "invalid_condition", "LeaseExpired requires leased condition.");
+      if (task.condition !== "leased" && task.condition !== "active") {
+        return mkError(event, "invalid_condition", "LeaseExpired requires leased or active condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "LeaseExpired fence token mismatch.");
+      }
+      return null;
+    }
+
+    case "LeaseReleased": {
+      if (task.condition !== "leased" && task.condition !== "active") {
+        return mkError(event, "invalid_condition", "LeaseReleased requires leased or active condition.");
+      }
+      if (event.fenceToken !== task.currentFenceToken) {
+        return mkError(event, "stale_fence_token", "LeaseReleased fence token mismatch.");
+      }
+      if (event.phase !== task.phase) {
+        return mkError(event, "phase_mismatch", "LeaseReleased.phase must match current task phase.");
+      }
+      if (!nonEmptyText(event.reason)) {
+        return mkError(event, "missing_release_reason", "LeaseReleased.reason must be non-empty.");
+      }
+      return null;
+    }
+
+    case "LeaseExtended": {
+      if (task.condition !== "leased" && task.condition !== "active") {
+        return mkError(event, "invalid_condition", "LeaseExtended requires leased or active condition.");
+      }
+      if (event.fenceToken !== task.currentFenceToken) {
+        return mkError(event, "stale_fence_token", "LeaseExtended fence token mismatch.");
+      }
+      if (!isPositiveInt(event.leaseTimeout)) {
+        return mkError(event, "invalid_lease_timeout", "LeaseExtended.leaseTimeout must be a positive integer duration.");
       }
       return null;
     }
@@ -529,6 +558,19 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       }
       if (event.reportedCost < 0) {
         return mkError(event, "invalid_cost", "AgentExited.reportedCost must be >= 0.");
+      }
+      return null;
+    }
+
+    case "CostReported": {
+      if (task.condition !== "active" && task.condition !== "leased") {
+        return mkError(event, "invalid_condition", "CostReported requires leased or active condition.");
+      }
+      if (event.fenceToken !== task.currentFenceToken) {
+        return mkError(event, "stale_fence_token", "CostReported fence token mismatch.");
+      }
+      if (event.reportedCost < 0) {
+        return mkError(event, "invalid_cost", "CostReported.reportedCost must be >= 0.");
       }
       return null;
     }
