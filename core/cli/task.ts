@@ -266,6 +266,12 @@ function requireAgentId(): string {
   return agentId;
 }
 
+/** Extract agent role from instance ID: "claude.3" → "claude", "coder" → "coder" */
+function agentRole(agentId: string): string {
+  const dot = agentId.indexOf(".");
+  return dot >= 0 ? agentId.slice(0, dot) : agentId;
+}
+
 function currentTaskId(explicit?: string): string {
   if (explicit) return normalizeTaskId(explicit);
 
@@ -596,7 +602,7 @@ async function cmdList(argv: string[], jsonMode: boolean): Promise<void> {
       if (assigneeFilter && getString(metadata, "assignee") !== assigneeFilter) return false;
       if (priorityFilter && getString(metadata, "priority", "medium") !== priorityFilter) return false;
       if (parentFilter && getString(task, "parentId") !== normalizeTaskId(parentFilter)) return false;
-      if (mine && myAgent && getString(metadata, "assignee") !== myAgent) return false;
+      if (mine && myAgent && getString(metadata, "assignee") !== agentRole(myAgent)) return false;
       return true;
     })
     .sort((a, b) => {
@@ -923,6 +929,8 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
   if (codeWorktree) {
     process.stdout.write(`  Code:    ${codeWorktree}\n\n`);
     process.stdout.write(`  cd ${codeWorktree}\n`);
+  } else if (journalWorktree) {
+    process.stdout.write(`\n  cd ${journalWorktree}\n`);
   }
 
   const failures = asArray<unknown>(task["failureSummaries"])
