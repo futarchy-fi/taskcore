@@ -4,7 +4,8 @@ import { OrchestrationCore } from "../core/index.js";
 import type { RetryScheduled } from "../core/types.js";
 import { loadConfig } from "./config.js";
 import { createHttpServer, cleanupPendingDecompositions } from "./http.js";
-import { createDispatcher, flushNotificationDigest } from "./dispatcher.js";
+// Dispatcher removed — agents claim their own tasks via CLI.
+// import { createDispatcher, flushNotificationDigest } from "./dispatcher.js";
 import { exportState } from "./state-export.js";
 import { initJournalRepo } from "./journal.js";
 import { cleanupStaleWorktrees } from "./worktree.js";
@@ -161,9 +162,6 @@ async function main(): Promise<void> {
     console.error("[daemon] Worktree cleanup failed (non-fatal):", err);
   }
 
-  // Create dispatcher
-  const dispatcher = createDispatcher(core, config);
-
   // Start HTTP server
   const server = createHttpServer(core, config);
   await new Promise<void>((resolve) => {
@@ -189,15 +187,6 @@ async function main(): Promise<void> {
     }
   }, config.tickIntervalMs);
 
-  // Dispatch loop
-  const dispatchInterval = setInterval(() => {
-    try {
-      dispatcher.runOnce();
-    } catch (err) {
-      console.error("[daemon] Dispatch exception:", err);
-    }
-  }, config.dispatchIntervalMs);
-
   // State export loop (dashboard compatibility)
   try {
     exportState(core, config);
@@ -222,17 +211,10 @@ async function main(): Promise<void> {
     console.log(`\n[daemon] Received ${signal}, shutting down...`);
 
     clearInterval(tickInterval);
-    clearInterval(dispatchInterval);
     clearInterval(exportInterval);
 
     // Stop accepting new connections
     server.close();
-
-    // Flush any pending notification digest
-    flushNotificationDigest();
-
-    // Kill active agents
-    dispatcher.stopAll();
 
     // Final tick to process any pending events
     try {
@@ -253,9 +235,8 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
 
-  console.log("[daemon] Ready. Tick every %dms, dispatch every %dms",
+  console.log("[daemon] Ready. Tick every %dms, no dispatcher (agents claim via CLI)",
     config.tickIntervalMs,
-    config.dispatchIntervalMs,
   );
 }
 
