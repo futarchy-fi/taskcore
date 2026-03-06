@@ -94,15 +94,6 @@ function lease(
     sessionId,
     sessionType,
     contextBudget: 1024,
-  };
-}
-
-function started(taskId: string, ts: number, fenceToken: number, agentId: string, sessionId: string): Event {
-  return {
-    type: "AgentStarted",
-    taskId,
-    ts,
-    fenceToken,
     agentContext: {
       sessionId,
       agentId,
@@ -271,27 +262,22 @@ test("Scenario A: review reject -> revise -> approve", () => {
   const events: Event[] = [
     createTask("T100", 1, { reviewConfig: reviewConfigRequired() }),
     lease("T100", 2, 1, "analysis", "analyst", "a-1"),
-    started("T100", 3, 1, "analyst", "a-1"),
     transition("T100", 4, "analysis", "active", "execution", "ready", "decision_execute", 1, "analyst", "a-1"),
 
     lease("T100", 5, 2, "execution", "coder", "e-1"),
-    started("T100", 6, 2, "coder", "e-1"),
     exited("T100", 7, 2, "coder", "e-1", 2),
     transition("T100", 8, "execution", "active", "review", "ready", "work_complete", 2, "coder", "e-1"),
 
     lease("T100", 9, 3, "review", "reviewer", "r-1"),
-    started("T100", 10, 3, "reviewer", "r-1"),
     reviewVerdict("T100", 11, 3, "reviewer", "r-1", "changes_requested"),
     reviewPolicy("T100", 12, "changes_requested"),
     transition("T100", 13, "review", "active", "execution", "ready", "changes_requested", 3, "reviewer", "r-1"),
 
     lease("T100", 14, 4, "execution", "coder", "e-2"),
-    started("T100", 15, 4, "coder", "e-2"),
     exited("T100", 16, 4, "coder", "e-2", 1),
     transition("T100", 17, "execution", "active", "review", "ready", "work_complete", 4, "coder", "e-2"),
 
     lease("T100", 18, 5, "review", "reviewer", "r-2"),
-    started("T100", 19, 5, "reviewer", "r-2"),
     reviewVerdict("T100", 20, 5, "reviewer", "r-2", "approve"),
     reviewPolicy("T100", 21, "approved"),
     complete("T100", 22),
@@ -309,11 +295,9 @@ test("Scenario B: decomposition -> children complete -> integration review -> do
   const prefix: Event[] = [
     createTask("T200", 1, { reviewConfig: reviewConfigRequired(), costBudget: 50 }),
     lease("T200", 2, 1, "analysis", "analyst", "a-200"),
-    started("T200", 3, 1, "analyst", "a-200"),
     transition("T200", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-200"),
 
     lease("T200", 5, 2, "decomposition", "decomposer", "d-200"),
-    started("T200", 6, 2, "decomposer", "d-200"),
     {
       type: "DecompositionCreated",
       taskId: "T200",
@@ -353,21 +337,17 @@ test("Scenario B: decomposition -> children complete -> integration review -> do
     transition("T200", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-200"),
 
     lease("T201", 9, 1, "execution", "coder", "e-201"),
-    started("T201", 10, 1, "coder", "e-201"),
     exited("T201", 11, 1, "coder", "e-201", 2),
     transition("T201", 12, "execution", "active", "review", "ready", "work_complete", 1, "coder", "e-201"),
     lease("T201", 13, 2, "review", "reviewer", "r-201"),
-    started("T201", 14, 2, "reviewer", "r-201"),
     reviewVerdict("T201", 15, 2, "reviewer", "r-201", "approve"),
     reviewPolicy("T201", 16, "approved"),
     complete("T201", 17),
 
     lease("T202", 18, 1, "execution", "coder", "e-202"),
-    started("T202", 19, 1, "coder", "e-202"),
     exited("T202", 20, 1, "coder", "e-202", 2),
     transition("T202", 21, "execution", "active", "review", "ready", "work_complete", 1, "coder", "e-202"),
     lease("T202", 22, 2, "review", "reviewer", "r-202"),
-    started("T202", 23, 2, "reviewer", "r-202"),
     reviewVerdict("T202", 24, 2, "reviewer", "r-202", "approve"),
     reviewPolicy("T202", 25, "approved"),
     complete("T202", 26),
@@ -402,7 +382,6 @@ test("Scenario B: decomposition -> children complete -> integration review -> do
 
   const suffix: Event[] = [
     lease("T200", 32, 3, "review", "reviewer", "r-200"),
-    started("T200", 33, 3, "reviewer", "r-200"),
     reviewVerdict("T200", 34, 3, "reviewer", "r-200", "approve"),
     reviewPolicy("T200", 35, "approved"),
     complete("T200", 36),
@@ -424,11 +403,9 @@ test("Scenario C: cost conservation across tree", () => {
   const events: Event[] = [
     createTask("T300", 1, { costBudget: 50 }),
     lease("T300", 2, 1, "analysis", "analyst", "a-300"),
-    started("T300", 3, 1, "analyst", "a-300"),
     transition("T300", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-300"),
 
     lease("T300", 5, 2, "decomposition", "decomposer", "d-300"),
-    started("T300", 6, 2, "decomposer", "d-300"),
     {
       type: "DecompositionCreated",
       taskId: "T300",
@@ -466,7 +443,6 @@ test("Scenario C: cost conservation across tree", () => {
     transition("T300", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-300"),
 
     lease("T301", 9, 1, "execution", "coder", "e-301"),
-    started("T301", 10, 1, "coder", "e-301"),
     exited("T301", 11, 1, "coder", "e-301", 3),
     complete("T301", 12),
     {
@@ -479,7 +455,6 @@ test("Scenario C: cost conservation across tree", () => {
     },
 
     lease("T302", 14, 1, "execution", "coder", "e-302"),
-    started("T302", 15, 1, "coder", "e-302"),
     exited("T302", 16, 1, "coder", "e-302", 5),
     complete("T302", 17),
     {
@@ -512,11 +487,9 @@ test("Scenario D: checkpoint triggers parent re-analysis", () => {
   const prefix: Event[] = [
     createTask("T400", 1, { reviewConfig: reviewConfigRequired(), costBudget: 40 }),
     lease("T400", 2, 1, "analysis", "analyst", "a-400"),
-    started("T400", 3, 1, "analyst", "a-400"),
     transition("T400", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-400"),
 
     lease("T400", 5, 2, "decomposition", "decomposer", "d-400"),
-    started("T400", 6, 2, "decomposer", "d-400"),
     {
       type: "DecompositionCreated",
       taskId: "T400",
@@ -554,7 +527,6 @@ test("Scenario D: checkpoint triggers parent re-analysis", () => {
     transition("T400", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-400"),
 
     lease("T401", 9, 1, "execution", "coder", "e-401"),
-    started("T401", 10, 1, "coder", "e-401"),
     exited("T401", 11, 1, "coder", "e-401", 2),
     complete("T401", 12),
   ];
@@ -578,14 +550,11 @@ test("Scenario D: checkpoint triggers parent re-analysis", () => {
 
   const continuation: Event[] = [
     lease("T400", 20, 3, "analysis", "analyst", "a-401"),
-    started("T400", 21, 3, "analyst", "a-401"),
     transition("T400", 22, "analysis", "active", "decomposition", "ready", "decision_decompose", 3, "analyst", "a-401"),
     lease("T400", 23, 4, "decomposition", "decomposer", "d-401"),
-    started("T400", 24, 4, "decomposer", "d-401"),
     transition("T400", 25, "decomposition", "active", "review", "waiting", "children_created", 4, "decomposer", "d-401"),
 
     lease("T402", 26, 1, "execution", "coder", "e-402"),
-    started("T402", 27, 1, "coder", "e-402"),
     exited("T402", 28, 1, "coder", "e-402", 2),
     complete("T402", 29),
   ];
@@ -608,7 +577,6 @@ test("Scenario D: checkpoint triggers parent re-analysis", () => {
   }
 
   state = mustReduce(state, lease("T400", 31, 5, "review", "reviewer", "r-400"));
-  state = mustReduce(state, started("T400", 32, 5, "reviewer", "r-400"));
   state = mustReduce(state, reviewVerdict("T400", 33, 5, "reviewer", "r-400", "approve"));
   state = mustReduce(state, reviewPolicy("T400", 34, "approved"));
   state = mustReduce(state, complete("T400", 35));
@@ -621,19 +589,15 @@ test("Scenario E: execution -> too_complex -> re-analysis -> decompose", () => {
   const events: Event[] = [
     createTask("T500", 1, { costBudget: 30 }),
     lease("T500", 2, 1, "analysis", "analyst", "a-500"),
-    started("T500", 3, 1, "analyst", "a-500"),
     transition("T500", 4, "analysis", "active", "execution", "ready", "decision_execute", 1, "analyst", "a-500"),
 
     lease("T500", 5, 2, "execution", "coder", "e-500"),
-    started("T500", 6, 2, "coder", "e-500"),
     transition("T500", 7, "execution", "active", "analysis", "ready", "too_complex", 2, "coder", "e-500"),
 
     lease("T500", 8, 3, "analysis", "analyst", "a-501"),
-    started("T500", 9, 3, "analyst", "a-501"),
     transition("T500", 10, "analysis", "active", "decomposition", "ready", "decision_decompose", 3, "analyst", "a-501"),
 
     lease("T500", 11, 4, "decomposition", "decomposer", "d-500"),
-    started("T500", 12, 4, "decomposer", "d-500"),
     {
       type: "DecompositionCreated",
       taskId: "T500",
@@ -663,7 +627,6 @@ test("Scenario E: execution -> too_complex -> re-analysis -> decompose", () => {
     transition("T500", 14, "decomposition", "active", "review", "waiting", "children_created", 4, "decomposer", "d-500"),
 
     lease("T501", 15, 1, "execution", "coder", "e-501"),
-    started("T501", 16, 1, "coder", "e-501"),
     exited("T501", 17, 1, "coder", "e-501", 1),
     complete("T501", 18),
 
@@ -707,11 +670,9 @@ test("Scenario F: task exhaustion from budget exhaustion", () => {
       },
     }),
     lease("T600", 2, 1, "analysis", "analyst", "a-600"),
-    started("T600", 3, 1, "analyst", "a-600"),
     transition("T600", 4, "analysis", "active", "execution", "ready", "decision_execute", 1, "analyst", "a-600"),
 
     lease("T600", 5, 2, "execution", "coder", "e-601"),
-    started("T600", 6, 2, "coder", "e-601"),
     {
       type: "RetryScheduled",
       taskId: "T600",
@@ -731,7 +692,6 @@ test("Scenario F: task exhaustion from budget exhaustion", () => {
     },
 
     lease("T600", 9, 3, "execution", "coder", "e-602"),
-    started("T600", 10, 3, "coder", "e-602"),
     {
       type: "RetryScheduled",
       taskId: "T600",
@@ -777,14 +737,12 @@ test("Scenario G: session policy enforcement", () => {
   // T700: continued execution allowed after prior execution attempt.
   state = mustReduce(state, createTask("T700", 1));
   state = mustReduce(state, lease("T700", 2, 1, "analysis", "analyst", "a-700", "fresh"));
-  state = mustReduce(state, started("T700", 3, 1, "analyst", "a-700"));
   state = mustReduce(
     state,
     transition("T700", 4, "analysis", "active", "execution", "ready", "decision_execute", 1, "analyst", "a-700"),
   );
 
   state = mustReduce(state, lease("T700", 5, 2, "execution", "coder", "e-700", "fresh"));
-  state = mustReduce(state, started("T700", 6, 2, "coder", "e-700"));
   state = mustReduce(state, {
     type: "RetryScheduled",
     taskId: "T700",
@@ -815,7 +773,6 @@ test("Scenario G: session policy enforcement", () => {
   // T702: first execution lease cannot be continued.
   state = mustReduce(state, createTask("T702", 30));
   state = mustReduce(state, lease("T702", 31, 1, "analysis", "analyst", "a-702", "fresh"));
-  state = mustReduce(state, started("T702", 32, 1, "analyst", "a-702"));
   state = mustReduce(
     state,
     transition("T702", 33, "analysis", "active", "execution", "ready", "decision_execute", 1, "analyst", "a-702"),
@@ -863,7 +820,6 @@ test("Scenario I: fence token enforcement", () => {
   let state = createInitialState();
   state = mustReduce(state, createTask("T900", 1, { initialPhase: "execution", skipAnalysis: true }));
   state = mustReduce(state, lease("T900", 2, 1, "execution", "coder", "e-900"));
-  state = mustReduce(state, started("T900", 3, 1, "coder", "e-900"));
   state = mustReduce(state, {
     type: "RetryScheduled",
     taskId: "T900",
@@ -882,7 +838,6 @@ test("Scenario I: fence token enforcement", () => {
     source: { type: "core", id: "clock" },
   });
   state = mustReduce(state, lease("T900", 6, 2, "execution", "coder", "e-901"));
-  state = mustReduce(state, started("T900", 7, 2, "coder", "e-901"));
 
   mustReject(state, exited("T900", 8, 1, "coder", "e-900", 1), "stale_fence_token");
   state = mustReduce(state, exited("T900", 9, 2, "coder", "e-901", 1));
@@ -893,11 +848,9 @@ test("Scenario J: wait/consultation flow", () => {
   const events: Event[] = [
     createTask("T1000", 1),
     lease("T1000", 2, 1, "analysis", "analyst", "a-1000"),
-    started("T1000", 3, 1, "analyst", "a-1000"),
     transition("T1000", 4, "analysis", "active", "execution", "ready", "decision_execute", 1, "analyst", "a-1000"),
 
     lease("T1000", 5, 2, "execution", "coder", "e-1000"),
-    started("T1000", 6, 2, "coder", "e-1000"),
     {
       type: "WaitRequested",
       taskId: "T1000",
@@ -950,7 +903,6 @@ test("Scenario K: WaitResolved redirect_to_analysis", () => {
   const events: Event[] = [
     createTask("T1100", 1, { initialPhase: "execution", skipAnalysis: true }),
     lease("T1100", 2, 1, "execution", "coder", "e-1100"),
-    started("T1100", 3, 1, "coder", "e-1100"),
     {
       type: "WaitRequested",
       taskId: "T1100",
@@ -997,10 +949,8 @@ test("Scenario L: proactive cost exhaustion pauses task as exhausted", () => {
   const events: Event[] = [
     createTask("T1200", 1, { costBudget: 1 }),
     lease("T1200", 2, 1, "analysis", "analyst", "a-1200"),
-    started("T1200", 3, 1, "analyst", "a-1200"),
     transition("T1200", 4, "analysis", "active", "execution", "ready", "decision_execute", 1, "analyst", "a-1200"),
     lease("T1200", 5, 2, "execution", "coder", "e-1200"),
-    started("T1200", 6, 2, "coder", "e-1200"),
     exited("T1200", 7, 2, "coder", "e-1200", 1),
     transition("T1200", 8, "execution", "active", "analysis", "ready", "too_complex", 2, "coder", "e-1200"),
   ];
@@ -1025,10 +975,8 @@ test("Scenario M: ChildCostRecovered auto-emission and single-shot recovery", ()
   const prefix: Event[] = [
     createTask("T1200", 1, { costBudget: 100 }),
     lease("T1200", 2, 1, "analysis", "analyst", "a-1200"),
-    started("T1200", 3, 1, "analyst", "a-1200"),
     transition("T1200", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-1200"),
     lease("T1200", 5, 2, "decomposition", "decomposer", "d-1200"),
-    started("T1200", 6, 2, "decomposer", "d-1200"),
     {
       type: "DecompositionCreated",
       taskId: "T1200",
@@ -1066,7 +1014,6 @@ test("Scenario M: ChildCostRecovered auto-emission and single-shot recovery", ()
     transition("T1200", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-1200"),
 
     lease("T1201", 9, 1, "execution", "coder", "e-1201"),
-    started("T1201", 10, 1, "coder", "e-1201"),
     exited("T1201", 11, 1, "coder", "e-1201", 10),
     complete("T1201", 12),
   ];
@@ -1087,7 +1034,6 @@ test("Scenario M: ChildCostRecovered auto-emission and single-shot recovery", ()
   }
 
   state = mustReduce(state, lease("T1202", 14, 1, "execution", "coder", "e-1202"));
-  state = mustReduce(state, started("T1202", 15, 1, "coder", "e-1202"));
   state = mustReduce(state, exited("T1202", 16, 1, "coder", "e-1202", 5));
   state = mustReduce(state, complete("T1202", 17));
 
@@ -1124,7 +1070,6 @@ test("Scenario N: WaitResolved redirect_wait supports consultant handoff", () =>
   const events: Event[] = [
     createTask("T1300", 1, { initialPhase: "execution", skipAnalysis: true }),
     lease("T1300", 2, 1, "execution", "coder", "e-1300"),
-    started("T1300", 3, 1, "coder", "e-1300"),
     {
       type: "WaitRequested",
       taskId: "T1300",
@@ -1207,10 +1152,8 @@ test("Scenario O: all children failed routes parent back to analysis", () => {
   const prefix: Event[] = [
     createTask("T1400", 1, { costBudget: 100 }),
     lease("T1400", 2, 1, "analysis", "analyst", "a-1400"),
-    started("T1400", 3, 1, "analyst", "a-1400"),
     transition("T1400", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-1400"),
     lease("T1400", 5, 2, "decomposition", "decomposer", "d-1400"),
-    started("T1400", 6, 2, "decomposer", "d-1400"),
     {
       type: "DecompositionCreated",
       taskId: "T1400",
@@ -1300,10 +1243,8 @@ test("Scenario P: checkpoint trigger does not double-charge analysis attempts", 
   const prefix: Event[] = [
     createTask("T1500", 1, { attemptBudgets: budgets, costBudget: 80 }),
     lease("T1500", 2, 1, "analysis", "analyst", "a-1500"),
-    started("T1500", 3, 1, "analyst", "a-1500"),
     transition("T1500", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-1500"),
     lease("T1500", 5, 2, "decomposition", "decomposer", "d-1500"),
-    started("T1500", 6, 2, "decomposer", "d-1500"),
     {
       type: "DecompositionCreated",
       taskId: "T1500",
@@ -1357,33 +1298,8 @@ test("Scenario P: checkpoint trigger does not double-charge analysis attempts", 
   assert.equal(state.tasks.T1500?.attempts.analysis.used, 2);
 });
 
-test("Scenario Q: AgentExited followup timeout schedules retry", () => {
-  let state = createInitialState();
-  state = mustReduce(state, createTask("T1600", 1, { initialPhase: "execution", skipAnalysis: true }));
-  state = mustReduce(state, lease("T1600", 2, 1, "execution", "coder", "e-1600"));
-  state = mustReduce(state, started("T1600", 3, 1, "coder", "e-1600"));
-  state = mustReduce(state, exited("T1600", 4, 1, "coder", "e-1600", 1));
-
-  const clock = new CoreClock();
-  const beforeTimeout = clock.collectDueEvents(state, 34_000);
-  assert.equal(
-    beforeTimeout.some((event) => event.type === "RetryScheduled" && event.taskId === "T1600"),
-    false,
-  );
-
-  const afterTimeout = clock.collectDueEvents(state, 65_500);
-  const timeoutRetry = afterTimeout.find(
-    (event) =>
-      event.type === "RetryScheduled" &&
-      event.taskId === "T1600" &&
-      event.reason === "agent_exit_followup_timeout",
-  );
-  assert.ok(timeoutRetry);
-
-  state = mustReduce(state, timeoutRetry);
-  assert.equal(state.tasks.T1600?.condition, "retryWait");
-  assert.equal(state.tasks.T1600?.lastAgentExitAt, null);
-});
+// Scenario Q removed: agent_exit_followup_timeout was removed from CoreClock
+// as part of the LeaseGranted+AgentStarted merge.
 
 test("Scenario R: retryWait budget exhaustion pauses before BackoffExpired", () => {
   let state = createInitialState();
@@ -1402,7 +1318,6 @@ test("Scenario R: retryWait budget exhaustion pauses before BackoffExpired", () 
   );
 
   state = mustReduce(state, lease("T1700", 2, 1, "execution", "coder", "e-1700"));
-  state = mustReduce(state, started("T1700", 3, 1, "coder", "e-1700"));
   state = mustReduce(state, {
     type: "RetryScheduled",
     taskId: "T1700",
@@ -1422,7 +1337,6 @@ test("Scenario R: retryWait budget exhaustion pauses before BackoffExpired", () 
   });
 
   state = mustReduce(state, lease("T1700", 6, 2, "execution", "coder", "e-1701"));
-  state = mustReduce(state, started("T1700", 7, 2, "coder", "e-1701"));
   state = mustReduce(state, {
     type: "RetryScheduled",
     taskId: "T1700",
@@ -1461,6 +1375,13 @@ test("Scenario S: LeaseExpired auto-emission transitions leased task to retryWai
     sessionId: "a-1800",
     sessionType: "fresh",
     contextBudget: 512,
+    agentContext: {
+      sessionId: "a-1800",
+      agentId: "analyst",
+      memoryRef: null,
+      contextTokens: 400,
+      modelId: "gpt-5",
+    },
   });
 
   const clock = new CoreClock();
@@ -1490,7 +1411,6 @@ test("Scenario T: WaitResolved(block) blocks task and propagates summary to pare
   );
 
   state = mustReduce(state, lease("T1901", 3, 1, "execution", "coder", "e-1901"));
-  state = mustReduce(state, started("T1901", 4, 1, "coder", "e-1901"));
   state = mustReduce(state, {
     type: "WaitRequested",
     taskId: "T1901",
@@ -1591,14 +1511,12 @@ test("Scenario V: DecompositionCreated rejects cost over-allocation", () => {
   let state = createInitialState();
   state = mustReduce(state, createTask("T2100", 1, { costBudget: 50 }));
   state = mustReduce(state, lease("T2100", 2, 1, "analysis", "analyst", "a-2100"));
-  state = mustReduce(state, started("T2100", 3, 1, "analyst", "a-2100"));
   state = mustReduce(state, exited("T2100", 4, 1, "analyst", "a-2100", 10));
   state = mustReduce(
     state,
     transition("T2100", 5, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-2100"),
   );
   state = mustReduce(state, lease("T2100", 6, 2, "decomposition", "decomposer", "d-2100"));
-  state = mustReduce(state, started("T2100", 7, 2, "decomposer", "d-2100"));
 
   mustReject(state, {
     type: "DecompositionCreated",
@@ -1640,10 +1558,8 @@ test("Scenario W: canceled child full recovery keeps invariants valid", () => {
   const prefix: Event[] = [
     createTask("T2200", 1, { costBudget: 100 }),
     lease("T2200", 2, 1, "analysis", "analyst", "a-2200"),
-    started("T2200", 3, 1, "analyst", "a-2200"),
     transition("T2200", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-2200"),
     lease("T2200", 5, 2, "decomposition", "decomposer", "d-2200"),
-    started("T2200", 6, 2, "decomposer", "d-2200"),
     {
       type: "DecompositionCreated",
       taskId: "T2200",
@@ -1715,10 +1631,8 @@ test("Scenario X: duplicate ChildCostRecovered is rejected", () => {
   const prefix: Event[] = [
     createTask("T2300", 1, { costBudget: 100 }),
     lease("T2300", 2, 1, "analysis", "analyst", "a-2300"),
-    started("T2300", 3, 1, "analyst", "a-2300"),
     transition("T2300", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-2300"),
     lease("T2300", 5, 2, "decomposition", "decomposer", "d-2300"),
-    started("T2300", 6, 2, "decomposer", "d-2300"),
     {
       type: "DecompositionCreated",
       taskId: "T2300",
@@ -1746,7 +1660,6 @@ test("Scenario X: duplicate ChildCostRecovered is rejected", () => {
       },
     },
     lease("T2301", 8, 1, "execution", "coder", "e-2301"),
-    started("T2301", 9, 1, "coder", "e-2301"),
     exited("T2301", 10, 1, "coder", "e-2301", 10),
     complete("T2301", 11),
   ];
@@ -1778,7 +1691,6 @@ test("Scenario Y: WaitRequested clears stale lastAgentExitAt", () => {
   let state = createInitialState();
   state = mustReduce(state, createTask("T2400", 1, { initialPhase: "execution", skipAnalysis: true }));
   state = mustReduce(state, lease("T2400", 2, 1, "execution", "coder", "e-2400"));
-  state = mustReduce(state, started("T2400", 3, 1, "coder", "e-2400"));
   state = mustReduce(state, exited("T2400", 4, 1, "coder", "e-2400", 1));
   assert.equal(state.tasks.T2400?.lastAgentExitAt, 4);
 
@@ -1825,7 +1737,6 @@ test("Scenario Z: WaitResolved(resume) keeps lastAgentExitAt cleared", () => {
   let state = createInitialState();
   state = mustReduce(state, createTask("T2500", 1, { initialPhase: "execution", skipAnalysis: true }));
   state = mustReduce(state, lease("T2500", 2, 1, "execution", "coder", "e-2500"));
-  state = mustReduce(state, started("T2500", 3, 1, "coder", "e-2500"));
   state = mustReduce(state, exited("T2500", 4, 1, "coder", "e-2500", 1));
 
   state = mustReduce(state, {
@@ -1871,10 +1782,8 @@ test("Scenario AA: re-decomposition v2 cancels old children and supersedes appro
   const events: Event[] = [
     createTask("T2600", 1, { costBudget: 100 }),
     lease("T2600", 2, 1, "analysis", "analyst", "a-2600"),
-    started("T2600", 3, 1, "analyst", "a-2600"),
     transition("T2600", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-2600"),
     lease("T2600", 5, 2, "decomposition", "decomposer", "d-2600"),
-    started("T2600", 6, 2, "decomposer", "d-2600"),
     {
       type: "DecompositionCreated",
       taskId: "T2600",
@@ -1910,7 +1819,6 @@ test("Scenario AA: re-decomposition v2 cancels old children and supersedes appro
       },
     },
     lease("T2601", 8, 1, "execution", "coder", "e-2601"),
-    started("T2601", 9, 1, "coder", "e-2601"),
     {
       type: "DecompositionCreated",
       taskId: "T2600",
@@ -1970,10 +1878,8 @@ test("Scenario AB: mixed child terminals (done + failed) still produce children_
   const prefix: Event[] = [
     createTask("T2700", 1, { costBudget: 100 }),
     lease("T2700", 2, 1, "analysis", "analyst", "a-2700"),
-    started("T2700", 3, 1, "analyst", "a-2700"),
     transition("T2700", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-2700"),
     lease("T2700", 5, 2, "decomposition", "decomposer", "d-2700"),
-    started("T2700", 6, 2, "decomposer", "d-2700"),
     {
       type: "DecompositionCreated",
       taskId: "T2700",
@@ -2047,10 +1953,8 @@ test("Scenario AC: all children canceled emits children_all_failed", () => {
   const prefix: Event[] = [
     createTask("T2800", 1, { costBudget: 100 }),
     lease("T2800", 2, 1, "analysis", "analyst", "a-2800"),
-    started("T2800", 3, 1, "analyst", "a-2800"),
     transition("T2800", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-2800"),
     lease("T2800", 5, 2, "decomposition", "decomposer", "d-2800"),
-    started("T2800", 6, 2, "decomposer", "d-2800"),
     {
       type: "DecompositionCreated",
       taskId: "T2800",
@@ -2129,10 +2033,8 @@ test("Scenario AD: no ChildCostRecovered emitted when parent is terminal", () =>
   const prefix: Event[] = [
     createTask("T2900", 1, { costBudget: 100 }),
     lease("T2900", 2, 1, "analysis", "analyst", "a-2900"),
-    started("T2900", 3, 1, "analyst", "a-2900"),
     transition("T2900", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-2900"),
     lease("T2900", 5, 2, "decomposition", "decomposer", "d-2900"),
-    started("T2900", 6, 2, "decomposer", "d-2900"),
     {
       type: "DecompositionCreated",
       taskId: "T2900",
@@ -2185,7 +2087,6 @@ test("Scenario AE: redirect_wait intermediate state is explicit and sequential",
   let state = createInitialState();
   state = mustReduce(state, createTask("T3000", 1, { initialPhase: "execution", skipAnalysis: true }));
   state = mustReduce(state, lease("T3000", 2, 1, "execution", "coder", "e-3000"));
-  state = mustReduce(state, started("T3000", 3, 1, "coder", "e-3000"));
 
   state = mustReduce(state, {
     type: "WaitRequested",
@@ -2281,7 +2182,6 @@ test("Scenario AF: CheckpointCreated and StateReverted preserve search state", (
   let state = createInitialState();
   state = mustReduce(state, createTask("T3100", 1, { initialPhase: "execution", skipAnalysis: true, reviewConfig: reviewConfigRequired() }));
   state = mustReduce(state, lease("T3100", 2, 1, "execution", "coder", "e-3100"));
-  state = mustReduce(state, started("T3100", 3, 1, "coder", "e-3100"));
   state = mustReduce(state, {
     type: "CheckpointCreated",
     taskId: "T3100",
@@ -2309,7 +2209,6 @@ test("Scenario AF: CheckpointCreated and StateReverted preserve search state", (
   state = mustReduce(state, exited("T3100", 7, 1, "coder", "e-3100", 4));
   state = mustReduce(state, transition("T3100", 8, "execution", "active", "review", "ready", "work_complete", 1, "coder", "e-3100"));
   state = mustReduce(state, lease("T3100", 9, 2, "review", "reviewer", "r-3100"));
-  state = mustReduce(state, started("T3100", 10, 2, "reviewer", "r-3100"));
   state = mustReduce(state, reviewVerdict("T3100", 11, 2, "reviewer", "r-3100", "changes_requested"));
   state = mustReduce(state, reviewPolicy("T3100", 12, "changes_requested"));
   state = mustReduce(state, transition("T3100", 13, "review", "active", "execution", "ready", "changes_requested", 2, "reviewer", "r-3100"));
@@ -2393,10 +2292,8 @@ test("Scenario AH: review.waiting with all terminal children passes invariants b
   const events: Event[] = [
     createTask("T3300", 1, { costBudget: 80 }),
     lease("T3300", 2, 1, "analysis", "analyst", "a-3300"),
-    started("T3300", 3, 1, "analyst", "a-3300"),
     transition("T3300", 4, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-3300"),
     lease("T3300", 5, 2, "decomposition", "decomposer", "d-3300"),
-    started("T3300", 6, 2, "decomposer", "d-3300"),
     {
       type: "DecompositionCreated",
       taskId: "T3300",
@@ -2463,7 +2360,6 @@ test("Clock emits TaskExhausted (not TaskFailed) for attempt budget exhaustion",
       skipAnalysis: true,
     }),
     lease("TEX100", 2, 1, "execution", "coder", "e-tex100"),
-    started("TEX100", 3, 1, "coder", "e-tex100"),
     {
       type: "RetryScheduled",
       taskId: "TEX100",
@@ -2511,7 +2407,6 @@ test("Clock emits TaskExhausted for cost exhaustion", () => {
       skipAnalysis: true,
     }),
     lease("TEX101", 2, 1, "execution", "coder", "e-tex101"),
-    started("TEX101", 3, 1, "coder", "e-tex101"),
     exited("TEX101", 4, 1, "coder", "e-tex101", 2),
     {
       type: "RetryScheduled",
@@ -2621,13 +2516,11 @@ test("Full lifecycle: exhaust → budget increase → dispatch → complete", ()
 
   // Dispatch: lease → start → work complete → complete
   state = mustReduce(state, lease("TEX103", 4, 1, "execution", "coder", "e-tex103-2"));
-  state = mustReduce(state, started("TEX103", 5, 1, "coder", "e-tex103-2"));
   state = mustReduce(state, exited("TEX103", 6, 1, "coder", "e-tex103-2", 1));
   state = mustReduce(state, transition(
     "TEX103", 7, "execution", "active", "review", "ready", "work_complete", 1, "coder", "e-tex103-2",
   ));
   state = mustReduce(state, lease("TEX103", 8, 2, "review", "reviewer", "r-tex103"));
-  state = mustReduce(state, started("TEX103", 9, 2, "reviewer", "r-tex103"));
   state = mustReduce(state, reviewVerdict("TEX103", 10, 2, "reviewer", "r-tex103", "approve"));
   state = mustReduce(state, reviewPolicy("TEX103", 11, "approved"));
   state = mustReduce(state, complete("TEX103", 12));

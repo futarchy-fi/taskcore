@@ -6,7 +6,6 @@ import type { Core } from "../core/index.js";
 import type {
   AgentContext,
   AgentExited,
-  AgentStarted,
   LeaseGranted,
   PhaseTransition,
   RetryScheduled,
@@ -700,7 +699,14 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     const fenceToken = task.currentFenceToken + 1;
     const runId = crypto.randomUUID();
 
-    // 1. LeaseGranted
+    const agentContext: AgentContext = {
+      sessionId,
+      agentId,
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "claude-sonnet-4-6",
+    };
+
     const lease: LeaseGranted = {
       type: "LeaseGranted",
       taskId: task.id,
@@ -712,32 +718,11 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       sessionId,
       sessionType: "fresh",
       contextBudget: task.contextBudget || config.defaultContextBudget,
+      agentContext,
     };
     const leaseResult = core.submit(lease);
     if (!leaseResult.ok) {
       console.error(`[dispatcher] LeaseGranted failed for T${task.id}: ${leaseResult.error.message}`);
-      return;
-    }
-
-    // 2. AgentStarted
-    const agentContext: AgentContext = {
-      sessionId,
-      agentId,
-      memoryRef: null,
-      contextTokens: null,
-      modelId: "claude-sonnet-4-6",
-    };
-
-    const started: AgentStarted = {
-      type: "AgentStarted",
-      taskId: task.id,
-      ts: now + 1,
-      fenceToken,
-      agentContext,
-    };
-    const startResult = core.submit(started);
-    if (!startResult.ok) {
-      console.error(`[dispatcher] AgentStarted failed for T${task.id}: ${startResult.error.message}`);
       return;
     }
 

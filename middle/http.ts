@@ -5,7 +5,6 @@ import * as path from "node:path";
 import type { Core } from "../core/index.js";
 import type {
   AgentContext,
-  AgentStarted,
   AttemptBudgetMaxInput,
   BudgetIncreased,
   DecompositionChildSpec,
@@ -523,6 +522,13 @@ function handleClaimTask(
     }
 
     const now = Date.now();
+    const agentContext: AgentContext = {
+      sessionId,
+      agentId,
+      memoryRef: null,
+      contextTokens: null,
+      modelId,
+    };
     const lg: LeaseGranted = {
       type: "LeaseGranted",
       taskId,
@@ -534,31 +540,15 @@ function handleClaimTask(
       sessionId,
       sessionType: "fresh",
       contextBudget,
-    };
-    let err = submitOrError(core, lg);
-    if (err) return err;
-
-    const agentContext: AgentContext = {
-      sessionId,
-      agentId,
-      memoryRef: null,
-      contextTokens: null,
-      modelId,
-    };
-    const started: AgentStarted = {
-      type: "AgentStarted",
-      taskId,
-      ts: now + 1,
-      fenceToken,
       agentContext,
     };
-    err = submitOrError(core, started);
+    let err = submitOrError(core, lg);
     if (err) return err;
 
     const metadataUpdated: MetadataUpdated = {
       type: "MetadataUpdated",
       taskId,
-      ts: now + 2,
+      ts: now + 1,
       patch: {
         claimedAt: nowIso(),
         claimedBy: agentId,
@@ -1985,16 +1975,9 @@ function handleDecomposeCommit(
         sessionId: ctx.sessionId,
         sessionType: "fresh",
         contextBudget: config.defaultContextBudget,
-      };
-      err = submitOrError(core, lg);
-      if (err) { pendingDecompositions.delete(taskId); return err; }
-
-      const agentStart: AgentStarted = {
-        type: "AgentStarted", taskId, ts: now + 2,
-        fenceToken: newFence,
         agentContext: ctx,
       };
-      err = submitOrError(core, agentStart);
+      err = submitOrError(core, lg);
       if (err) { pendingDecompositions.delete(taskId); return err; }
 
       task = core.getTask(taskId)!;
@@ -2225,17 +2208,9 @@ function handleDecompose(
         sessionId: ctx.sessionId,
         sessionType: "fresh",
         contextBudget: config.defaultContextBudget,
-      };
-      err = submitOrError(core, lg);
-      if (err) return err;
-
-      // 3. AgentStarted
-      const agentStart: AgentStarted = {
-        type: "AgentStarted", taskId, ts: now + 2,
-        fenceToken: newFence,
         agentContext: ctx,
       };
-      err = submitOrError(core, agentStart);
+      err = submitOrError(core, lg);
       if (err) return err;
 
       // Re-fetch task after state changes
@@ -2412,7 +2387,7 @@ function collectAttentionTasks(core: Core): {
     .filter(
       (t) =>
         !t.terminal &&
-        (t.condition === "leased" || t.condition === "active") &&
+        t.condition === "active" &&
         t.leaseExpiresAt !== null &&
         t.leaseExpiresAt <= now,
     )

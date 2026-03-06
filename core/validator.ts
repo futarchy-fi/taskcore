@@ -498,8 +498,8 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "LeaseExpired": {
-      if (task.condition !== "leased" && task.condition !== "active") {
-        return mkError(event, "invalid_condition", "LeaseExpired requires leased or active condition.");
+      if (task.condition !== "active") {
+        return mkError(event, "invalid_condition", "LeaseExpired requires active condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "LeaseExpired fence token mismatch.");
@@ -508,8 +508,8 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "LeaseReleased": {
-      if (task.condition !== "leased" && task.condition !== "active") {
-        return mkError(event, "invalid_condition", "LeaseReleased requires leased or active condition.");
+      if (task.condition !== "active") {
+        return mkError(event, "invalid_condition", "LeaseReleased requires active condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "LeaseReleased fence token mismatch.");
@@ -524,8 +524,8 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "LeaseExtended": {
-      if (task.condition !== "leased" && task.condition !== "active") {
-        return mkError(event, "invalid_condition", "LeaseExtended requires leased or active condition.");
+      if (task.condition !== "active") {
+        return mkError(event, "invalid_condition", "LeaseExtended requires active condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "LeaseExtended fence token mismatch.");
@@ -537,15 +537,7 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "AgentStarted": {
-      if (task.condition !== "leased") {
-        return mkError(event, "invalid_condition", "AgentStarted requires leased condition.");
-      }
-      if (event.fenceToken !== task.currentFenceToken) {
-        return mkError(event, "stale_fence_token", "AgentStarted fence token mismatch.");
-      }
-      if (task.leasedTo !== null && task.leasedTo !== event.agentContext.agentId) {
-        return mkError(event, "agent_mismatch", "AgentStarted agentContext.agentId must match leased agent.");
-      }
+      // Legacy no-op: always accept for backward compatibility with old event journals.
       return null;
     }
 
@@ -563,8 +555,8 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "CostReported": {
-      if (task.condition !== "active" && task.condition !== "leased") {
-        return mkError(event, "invalid_condition", "CostReported requires leased or active condition.");
+      if (task.condition !== "active") {
+        return mkError(event, "invalid_condition", "CostReported requires active condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "CostReported fence token mismatch.");
@@ -616,8 +608,8 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "RetryScheduled": {
-      if (task.condition !== "active" && task.condition !== "leased") {
-        return mkError(event, "invalid_condition", "RetryScheduled requires active or leased condition.");
+      if (task.condition !== "active") {
+        return mkError(event, "invalid_condition", "RetryScheduled requires active condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "RetryScheduled fence token mismatch.");

@@ -91,15 +91,6 @@ function assertTaskShape(task: Task, allTasks: Record<TaskId, Task>, violations:
     });
   }
 
-  if (task.condition === "leased" && (task.leasedTo === null || task.leaseExpiresAt === null)) {
-    push(
-      violations,
-      "leased_missing_fields",
-      "Leased tasks require leasedTo and leaseExpiresAt.",
-      task.id,
-    );
-  }
-
   if (task.condition === "retryWait" && task.retryAfter === null) {
     push(violations, "retry_wait_missing_retry_after", "retryWait requires retryAfter.", task.id);
   }

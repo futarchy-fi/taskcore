@@ -55,6 +55,13 @@ function makeLeaseEvent(taskId: string, ts: number, fenceToken: number): Event {
     sessionId: "sess-1",
     sessionType: "fresh",
     contextBudget: 1024,
+    agentContext: {
+      sessionId: "sess-1",
+      agentId: "test-agent",
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "test",
+    },
   } as Event;
 }
 

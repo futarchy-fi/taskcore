@@ -129,23 +129,16 @@ test("property: retry loop is bounded by execution attempt budget", () => {
         sessionId: `s-${seed}-${i}`,
         sessionType: "fresh",
         contextBudget: 500,
-      });
-
-      now += 1;
-      state = mustReduce(state, {
-        type: "AgentStarted",
-        taskId,
-        ts: now,
-        fenceToken: fence,
         agentContext: {
           sessionId: `s-${seed}-${i}`,
           agentId: "coder",
           memoryRef: null,
-          contextTokens: 300,
-          modelId: "gpt-5",
+          contextTokens: null,
+          modelId: "test",
         },
       });
 
+      now += 1;
       now += 1;
       state = mustReduce(state, {
         type: "RetryScheduled",
@@ -186,6 +179,13 @@ test("property: retry loop is bounded by execution attempt budget", () => {
         sessionId: `s-${seed}-overflow`,
         sessionType: "fresh",
         contextBudget: 500,
+        agentContext: {
+          sessionId: `s-${seed}-overflow`,
+          agentId: "coder",
+          memoryRef: null,
+          contextTokens: null,
+          modelId: "test",
+        },
       },
       "attempt_budget_exhausted",
     );
@@ -212,18 +212,12 @@ test("property A: cost conservation", () => {
       sessionId: `pc-a-${seed}`,
       sessionType: "fresh",
       contextBudget: 500,
-    });
-    state = mustReduce(state, {
-      type: "AgentStarted",
-      taskId: rootId,
-      ts: 3,
-      fenceToken: 1,
       agentContext: {
         sessionId: `pc-a-${seed}`,
         agentId: "analyst",
         memoryRef: null,
-        contextTokens: 250,
-        modelId: "gpt-5",
+        contextTokens: null,
+        modelId: "test",
       },
     });
     state = mustReduce(state, {
@@ -255,21 +249,14 @@ test("property A: cost conservation", () => {
       sessionId: `pc-d-${seed}`,
       sessionType: "fresh",
       contextBudget: 500,
-    });
-    state = mustReduce(state, {
-      type: "AgentStarted",
-      taskId: rootId,
-      ts: 6,
-      fenceToken: 2,
       agentContext: {
         sessionId: `pc-d-${seed}`,
         agentId: "decomposer",
         memoryRef: null,
-        contextTokens: 250,
-        modelId: "gpt-5",
+        contextTokens: null,
+        modelId: "test",
       },
     });
-
     const allocations: number[] = [];
     let remaining = rootBudget;
     for (let i = 0; i < childCount; i += 1) {
@@ -344,19 +331,12 @@ test("property A: cost conservation", () => {
         sessionId: `${childId}-s`,
         sessionType: "fresh",
         contextBudget: 500,
-      });
-      ts += 1;
-      state = mustReduce(state, {
-        type: "AgentStarted",
-        taskId: childId,
-        ts,
-        fenceToken: 1,
         agentContext: {
           sessionId: `${childId}-s`,
           agentId: "coder",
           memoryRef: null,
-          contextTokens: 250,
-          modelId: "gpt-5",
+          contextTokens: null,
+          modelId: "test",
         },
       });
       ts += 1;
@@ -486,6 +466,13 @@ test("property B: terminal absorption", () => {
             sessionId: `${taskId}-s-${i}`,
             sessionType: "fresh",
             contextBudget: 500,
+            agentContext: {
+              sessionId: `${taskId}-s-${i}`,
+              agentId: "coder",
+              memoryRef: null,
+              contextTokens: null,
+              modelId: "test",
+            },
           },
           "terminal_absorption",
         );
@@ -531,23 +518,6 @@ test("property B: terminal absorption", () => {
           "terminal_absorption",
         );
       } else {
-        expectReject(
-          state,
-          {
-            type: "AgentStarted",
-            taskId,
-            ts,
-            fenceToken: 1,
-            agentContext: {
-              sessionId: `${taskId}-s-${i}`,
-              agentId: "coder",
-              memoryRef: null,
-              contextTokens: 200,
-              modelId: "gpt-5",
-            },
-          },
-          "terminal_absorption",
-        );
       }
     }
   }
@@ -575,25 +545,17 @@ test("property C: fence token monotonicity", () => {
         sessionId: `${taskId}-s-${token}`,
         sessionType: "fresh",
         contextBudget: 500,
-      });
-      ts += 1;
-
-      assert.equal(state.tasks[taskId]?.currentFenceToken, token);
-
-      state = mustReduce(state, {
-        type: "AgentStarted",
-        taskId,
-        ts,
-        fenceToken: token,
         agentContext: {
           sessionId: `${taskId}-s-${token}`,
           agentId: "coder",
           memoryRef: null,
-          contextTokens: 250,
-          modelId: "gpt-5",
+          contextTokens: null,
+          modelId: "test",
         },
       });
       ts += 1;
+
+      assert.equal(state.tasks[taskId]?.currentFenceToken, token);
 
       if (token > 1) {
         expectReject(
@@ -709,27 +671,19 @@ test("property D: attempt budget bounds", () => {
           sessionId: `${taskId}-run-s-${i}`,
           sessionType: "fresh",
           contextBudget: 300,
+          agentContext: {
+            sessionId: `${taskId}-run-s-${i}`,
+            agentId: "worker",
+            memoryRef: null,
+            contextTokens: null,
+            modelId: "test",
+          },
         });
         ts += 1;
 
         const current = state.tasks[`${taskId}-run`];
         assert.ok(current);
         assert.ok(current.attempts[phase].used <= current.attempts[phase].max);
-
-        state = mustReduce(state, {
-          type: "AgentStarted",
-          taskId: `${taskId}-run`,
-          ts,
-          fenceToken: i,
-          agentContext: {
-            sessionId: `${taskId}-run-s-${i}`,
-            agentId: "worker",
-            memoryRef: null,
-            contextTokens: 200,
-            modelId: "gpt-5",
-          },
-        });
-        ts += 1;
 
         state = mustReduce(state, {
           type: "RetryScheduled",
@@ -770,6 +724,13 @@ test("property D: attempt budget bounds", () => {
           sessionId: `${taskId}-run-overflow`,
           sessionType: "fresh",
           contextBudget: 300,
+          agentContext: {
+            sessionId: `${taskId}-run-overflow`,
+            agentId: "worker",
+            memoryRef: null,
+            contextTokens: null,
+            modelId: "test",
+          },
         },
         "attempt_budget_exhausted",
       );

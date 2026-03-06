@@ -7,14 +7,11 @@ import {
   type Event,
   type LeaseExpired,
   type PhaseTransition,
-  type RetryScheduled,
   type SystemState,
   type Task,
   type TaskExhausted,
 } from "./types.js";
 
-const AGENT_EXIT_FOLLOWUP_TIMEOUT = 60_000;
-const AGENT_EXIT_RETRY_BACKOFF = 1_000;
 
 function backoffDue(task: Task, now: number): boolean {
   return task.condition === "retryWait" && task.retryAfter !== null && task.retryAfter <= now;
@@ -107,27 +104,6 @@ export class CoreClock {
 
       if (
         task.condition === "active" &&
-        task.leasedTo !== null &&
-        task.leaseExpiresAt === null &&
-        task.lastAgentExitAt !== null &&
-        now - task.lastAgentExitAt > AGENT_EXIT_FOLLOWUP_TIMEOUT
-      ) {
-        const retryScheduled: RetryScheduled = {
-          type: "RetryScheduled",
-          taskId: task.id,
-          ts: now,
-          fenceToken: task.currentFenceToken,
-          reason: "agent_exit_followup_timeout",
-          retryAfter: now + AGENT_EXIT_RETRY_BACKOFF,
-          phase: task.phase,
-          attemptNumber: Math.max(1, task.attempts[task.phase].used),
-        };
-        due.push(retryScheduled);
-        continue;
-      }
-
-      if (
-        (task.condition === "leased" || task.condition === "active") &&
         task.leaseExpiresAt !== null &&
         task.leaseExpiresAt <= now
       ) {

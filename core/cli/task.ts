@@ -543,13 +543,26 @@ function printTaskOverview(task: Record<string, unknown>, includeDeps: boolean, 
   if (childRows.length === 0) {
     process.stdout.write("  (none)\n");
   } else {
+    let doneCount = 0;
+    const problemCounts: Record<string, number> = {};
     for (const child of childRows) {
       const cid = getString(child, "id");
       const ctitle = getString(child, "title", "(untitled)");
       const cphase = getString(child, "phase", "terminal");
       const ccondition = getString(child, "condition", getString(child, "terminal", "unknown"));
       process.stdout.write(`  T${cid} ${ctitle} [${cphase}.${ccondition}]\n`);
+
+      const ct = getString(child, "terminal", "");
+      if (ct === "done") { doneCount++; }
+      else if (ct) { problemCounts[ct] = (problemCounts[ct] ?? 0) + 1; }
+      else if (ccondition) { problemCounts[ccondition] = (problemCounts[ccondition] ?? 0) + 1; }
     }
+
+    const parts = [`${doneCount}/${childRows.length} done`];
+    for (const [key, count] of Object.entries(problemCounts).sort((a, b) => b[1] - a[1])) {
+      parts.push(`${count} ${key}`);
+    }
+    process.stdout.write(`\n  Summary: ${parts.join(", ")}\n`);
   }
 }
 
@@ -567,8 +580,9 @@ async function cmdList(argv: string[], jsonMode: boolean): Promise<void> {
   const priorityFilter = getFlagString(flags, "priority");
   const parentFilter = getFlagString(flags, "parent");
   const mine = getFlagBool(flags, "mine");
+  const DEFAULT_LIMIT = 100;
   const limitRaw = getFlagString(flags, "limit");
-  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : null;
+  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : DEFAULT_LIMIT;
 
   const myAgent = process.env["TASKCORE_AGENT_ID"]?.trim();
 
@@ -601,7 +615,82 @@ async function cmdList(argv: string[], jsonMode: boolean): Promise<void> {
     return;
   }
 
-  const rows: string[][] = [["ID", "Priority", "Phase", "Condition", "Assignee", "Title"]];
+  const wide = getFlagBool(flags, "wide");
+  const extraFields = getFlagList(flags, "fields");
+
+  // Build parent→children index for the waiting field
+  const childrenByParent = new Map<string, Record<string, unknown>[]>();
+  for (const task of tasks) {
+    const pid = asString(task["parentId"]);
+    if (pid) {
+      let list = childrenByParent.get(pid);
+      if (!list) { list = []; childrenByParent.set(pid, list); }
+      list.push(task);
+    }
+  }
+
+  function waitingSummary(task: Record<string, unknown>): string {
+    const condition = getString(task, "condition", getString(task, "terminal", ""));
+    if (condition !== "waiting") return "-";
+    const id = getString(task, "id");
+    const children = childrenByParent.get(id);
+    if (!children || children.length === 0) return "waiting (no children)";
+    let done = 0;
+    const problems: Record<string, number> = {};
+    for (const child of children) {
+      const ct = getString(child, "terminal", "");
+      if (ct === "done") { done++; continue; }
+      if (ct) { problems[ct] = (problems[ct] ?? 0) + 1; continue; }
+      const cc = getString(child, "condition", "");
+      if (cc) problems[cc] = (problems[cc] ?? 0) + 1;
+    }
+    const parts = [`${done}/${children.length} done`];
+    for (const [key, count] of Object.entries(problems).sort((a, b) => b[1] - a[1])) {
+      parts.push(`${count} ${key}`);
+    }
+    return parts.join(", ");
+  }
+
+  type Column = { header: string; extract: (task: Record<string, unknown>, meta: Record<string, unknown>) => string };
+  const availableExtras: Record<string, Column> = {
+    reviewer:  { header: "Reviewer",  extract: (_t, m) => getString(m, "reviewer", "-") },
+    consulted: { header: "Consulted", extract: (_t, m) => getString(m, "consulted", "-") },
+    informed:  { header: "Informed",  extract: (_t, m) => {
+      const v = m["informed"];
+      if (Array.isArray(v)) return v.join(",") || "-";
+      return getString(m, "informed", "-");
+    }},
+    parent:    { header: "Parent",    extract: (t, _m) => { const p = asString(t["parentId"]); return p ? `T${p}` : "-"; } },
+    cost:      { header: "Cost",      extract: (t, _m) => {
+      const c = asRecord(t["cost"]);
+      if (!c) return "-";
+      const consumed = asNumber(c["consumed"]);
+      const allocated = asNumber(c["allocated"]);
+      return consumed !== null && allocated !== null ? `${formatMoney(consumed)}/${formatMoney(allocated)}` : "-";
+    }},
+    updated:   { header: "Updated",   extract: (t, _m) => {
+      const ts = asNumber(t["updatedAt"]);
+      if (ts === null) return "-";
+      return new Date(ts).toISOString().slice(0, 10);
+    }},
+    waiting:   { header: "Waiting On", extract: (t, _m) => waitingSummary(t) },
+  };
+
+  const extras: Column[] = [];
+  if (wide) {
+    extras.push(availableExtras["reviewer"]!, availableExtras["consulted"]!, availableExtras["parent"]!);
+  }
+  for (const name of extraFields) {
+    const col = availableExtras[name];
+    if (!col) {
+      const valid = Object.keys(availableExtras).join(", ");
+      throw new CliError(`Unknown field '${name}'. Available: ${valid}`, 1);
+    }
+    if (!extras.includes(col)) extras.push(col);
+  }
+
+  const headerRow = ["ID", "Priority", "Phase", "Condition", "Assignee", ...extras.map((c) => c.header), "Title"];
+  const rows: string[][] = [headerRow];
   for (const task of shown) {
     const metadata = asRecord(task["metadata"]) ?? {};
     rows.push([
@@ -610,12 +699,17 @@ async function cmdList(argv: string[], jsonMode: boolean): Promise<void> {
       getString(task, "phase", "terminal"),
       getString(task, "condition", getString(task, "terminal", "unknown")),
       getString(metadata, "assignee", "-"),
+      ...extras.map((c) => c.extract(task, metadata)),
       getString(task, "title", "(untitled)"),
     ]);
   }
 
   printTable(rows);
-  process.stdout.write(`\nShowing ${shown.length} of ${filtered.length} tasks\n`);
+  if (shown.length < filtered.length) {
+    process.stdout.write(`\nShowing top ${shown.length} of ${filtered.length} tasks (capped at ${limit}). Use --limit to change.\n`);
+  } else {
+    process.stdout.write(`\nShowing ${shown.length} tasks\n`);
+  }
   process.stdout.write("Hint: run `task show <id>` for full details.\n");
 }
 
@@ -1604,6 +1698,256 @@ async function cmdIncident(argv: string[], jsonMode: boolean): Promise<void> {
   process.stdout.write(`Incident recorded: ${incidentId}\n`);
 }
 
+const subcommandHelp: Record<string, string> = {
+  list: [
+    "task list [filters]",
+    "",
+    "List non-terminal tasks, sorted by priority then recency.",
+    "Default limit: 100. Use --limit to change.",
+    "",
+    "Filters:",
+    "  --phase <phase>        Filter by phase (analysis, execution, review, ...)",
+    "  --condition <cond>     Filter by condition (ready, active, exhausted, ...)",
+    "  --terminal <term>      Show terminal tasks (done, failed, cancelled)",
+    "  --assignee <agent>     Filter by assignee",
+    "  --priority <level>     Filter by priority (critical, high, medium, low, backlog)",
+    "  --parent <id>          Filter by parent task",
+    "  --mine                 Show only tasks assigned to TASKCORE_AGENT_ID",
+    "  --limit <N>            Max tasks to show (default: 100)",
+    "",
+    "Display:",
+    "  --wide                 Show extra columns (reviewer, consulted, parent)",
+    "  --fields <f1,f2,...>   Add specific columns. Available fields:",
+    "                           reviewer, consulted, informed, parent, cost, updated, waiting",
+  ].join("\n"),
+
+  show: [
+    "task show <id> [options]",
+    "",
+    "Show full details for a task.",
+    "",
+    "Options:",
+    "  --events     Include event history",
+    "  --children   Include child tasks",
+    "  --deps       Include dependency info",
+  ].join("\n"),
+
+  events: [
+    "task events <id> [--last N]",
+    "",
+    "Show event history for a task.",
+    "",
+    "Options:",
+    "  --last <N>   Show only the last N events",
+  ].join("\n"),
+
+  attention: [
+    "task attention [--format telegram]",
+    "",
+    "Show tasks needing attention (blocked, failed, stalled, exhausted).",
+    "",
+    "Options:",
+    "  --format telegram   Output as Telegram-formatted text",
+  ].join("\n"),
+
+  create: [
+    "task create <title> --description <desc> [options]",
+    "",
+    "Create a new task. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Options:",
+    "  --description <text>   Task description (required)",
+    "  --assignee <agent>     Assign to a specific agent",
+    "  --reviewer <agent>     Set reviewer",
+    "  --consulted <agent>    Set consulted agent",
+    "  --priority <level>     Priority (critical, high, medium, low, backlog)",
+    "  --informed <ids>       Comma-separated list of agents to notify",
+    "  --depends-on <ids>     Comma-separated task IDs this depends on",
+    "  --repo <repo>          Repository for this task",
+    "  --base-branch <branch> Base branch for code worktree",
+  ].join("\n"),
+
+  claim: [
+    "task claim <id>",
+    "",
+    "Claim a task and receive workspace info. Requires TASKCORE_AGENT_ID.",
+    "Writes a .task context file to the worktree root.",
+  ].join("\n"),
+
+  release: [
+    "task release [--reason <reason>] [--worked]",
+    "",
+    "Release the current task's lease. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Options:",
+    "  --reason <text>   Why the lease is being released",
+    "  --worked          Indicate that useful work was performed",
+  ].join("\n"),
+
+  extend: [
+    "task extend [--duration 15m|30m|1h]",
+    "",
+    "Extend the lease on the current task. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Options:",
+    "  --duration <dur>   Lease extension (default: 15m). Formats: 10m, 30m, 1h",
+  ].join("\n"),
+
+  submit: [
+    "task submit <evidence>",
+    "",
+    "Submit the current task for review. Requires TASKCORE_AGENT_ID.",
+    "Evidence describes what was done.",
+  ].join("\n"),
+
+  complete: [
+    "task complete <evidence>",
+    "",
+    "Mark the current task as done. Requires TASKCORE_AGENT_ID.",
+    "Evidence describes what was accomplished.",
+  ].join("\n"),
+
+  block: [
+    "task block <reason>",
+    "",
+    "Mark the current task as blocked. Requires TASKCORE_AGENT_ID.",
+    "Reason explains what is preventing progress.",
+  ].join("\n"),
+
+  cost: [
+    "task cost <amount>",
+    "",
+    "Report cost consumed on the current task. Requires TASKCORE_AGENT_ID.",
+    "Amount is a non-negative number (dollars).",
+  ].join("\n"),
+
+  update: [
+    "task update <message>",
+    "",
+    "Record a progress update (journal entry + metadata). Requires TASKCORE_AGENT_ID.",
+  ].join("\n"),
+
+  analyze: [
+    "task analyze",
+    "",
+    "Show analysis context for the current task.",
+    "Displays description, previous failures, and decision options.",
+  ].join("\n"),
+
+  decide: [
+    "task decide <execute|decompose>",
+    "",
+    "Record an analysis decision. Requires TASKCORE_AGENT_ID.",
+    "",
+    "  execute     Task will be executed directly",
+    "  decompose   Task will be split into subtasks",
+  ].join("\n"),
+
+  decompose: [
+    "task decompose <subcommand> ...",
+    "",
+    "Manage task decomposition. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Subcommands:",
+    "  start                                Begin a decomposition session",
+    "  add <title> --desc <text> --cost <N>  Add a child task",
+    "    --assignee <agent>                  Assign child to agent",
+    "    --reviewer <agent>                  Set child reviewer",
+    "    --depends-on <indices>              Comma-separated 0-based sibling indices",
+    "    --skip-analysis                     Skip analysis phase for child",
+    "  commit <strategy>                     Commit the decomposition",
+    "  cancel                                Cancel pending decomposition",
+  ].join("\n"),
+
+  review: [
+    "task review <subcommand> ...",
+    "",
+    "Review workflow for the current task. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Subcommands:",
+    "  read                    Show review context",
+    "  note <text>             Add a review note",
+    "  approve [summary]       Approve and mark done",
+    "  reject [reason]         Reject the submission",
+    "  request-changes [text]  Send back for rework",
+  ].join("\n"),
+
+  journal: [
+    "task journal <subcommand> ...",
+    "",
+    "Read/write journal entries. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Subcommands:",
+    "  read                      Read the task journal",
+    "  write <entry>             Append a journal entry",
+    "  write-file <name> <text>  Write a named file to the journal",
+  ].join("\n"),
+
+  worktree: [
+    "task worktree",
+    "",
+    "Show journal and code worktree paths from the .task context file.",
+  ].join("\n"),
+
+  revive: [
+    "task revive <id> [--reason <reason>]",
+    "",
+    "Revive a failed or blocked task. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Options:",
+    "  --reason <text>   Why the task is being revived",
+  ].join("\n"),
+
+  cancel: [
+    "task cancel <id> [--reason <reason>]",
+    "",
+    "Cancel a task. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Options:",
+    "  --reason <text>   Why the task is being cancelled",
+  ].join("\n"),
+
+  budget: [
+    "task budget <id> [--cost N] [--attempts phase:max,...]",
+    "",
+    "Increase budget for a task. Requires TASKCORE_AGENT_ID.",
+    "Provide at least one of --cost or --attempts.",
+    "",
+    "Options:",
+    "  --cost <N>                  Add dollars to cost budget",
+    "  --attempts <phase:max,...>  Increase attempt limits (e.g. execution:4,review:2)",
+  ].join("\n"),
+
+  metadata: [
+    "task metadata <id> <key> <value>",
+    "",
+    "Set a metadata field on a task. Requires TASKCORE_AGENT_ID.",
+    "Value is auto-parsed: null, true, false, numbers, comma-separated lists.",
+  ].join("\n"),
+
+  reparent: [
+    "task reparent <id> --parent <parent-id>",
+    "",
+    "Move a task under a different parent. Requires TASKCORE_AGENT_ID.",
+  ].join("\n"),
+
+  incident: [
+    "task incident <summary> --severity <sev> --category <cat> [options]",
+    "",
+    "Record an incident. Requires TASKCORE_AGENT_ID.",
+    "",
+    "Options:",
+    "  --severity <level>   Incident severity (required)",
+    "  --category <cat>     Incident category (required)",
+    "  --detail <text>      Additional detail",
+    "  --tags <t1,t2,...>   Comma-separated tags",
+  ].join("\n"),
+};
+
+function wantsHelp(argv: string[]): boolean {
+  return argv.includes("--help") || argv.includes("-h");
+}
+
 function extractJsonFlag(argv: string[]): { jsonMode: boolean; args: string[] } {
   let jsonMode = false;
   const args: string[] = [];
@@ -1626,6 +1970,12 @@ async function run(argv: string[]): Promise<void> {
 
   if (!command || command === "help" || command === "--help" || command === "-h") {
     printHelp();
+    return;
+  }
+
+  const help = subcommandHelp[command];
+  if (help && wantsHelp(rest)) {
+    process.stdout.write(help + "\n");
     return;
   }
 
