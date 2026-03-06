@@ -7,11 +7,11 @@ export type Timestamp = number;
 export type Duration = number;
 
 export type Phase = "analysis" | "decomposition" | "execution" | "review";
-export type Condition = "ready" | "leased" | "active" | "waiting" | "retryWait" | "exhausted";
+export type Condition = "ready" | "active" | "waiting" | "retryWait" | "exhausted";
 export type Terminal = "done" | "failed" | "blocked" | "canceled";
 
 export const PHASES: readonly Phase[] = ["analysis", "decomposition", "execution", "review"];
-export const CONDITIONS: readonly Condition[] = ["ready", "leased", "active", "waiting", "retryWait", "exhausted"];
+export const CONDITIONS: readonly Condition[] = ["ready", "active", "waiting", "retryWait", "exhausted"];
 export const TERMINALS: readonly Terminal[] = ["done", "failed", "blocked", "canceled"];
 
 export interface AttemptBudget {
@@ -216,6 +216,7 @@ export interface LeaseGranted extends BaseEvent {
   sessionId: SessionId;
   sessionType: "fresh" | "continued";
   contextBudget: number;
+  agentContext: AgentContext;
 }
 
 export interface LeaseExpired extends BaseEvent {
@@ -241,6 +242,7 @@ export interface LeaseExtended extends BaseEvent {
   source: EventSource;
 }
 
+/** @deprecated Legacy event — now a no-op. LeaseGranted includes agentContext directly. */
 export interface AgentStarted extends BaseEvent {
   type: "AgentStarted";
   fenceToken: number;

@@ -217,12 +217,6 @@ function autoTransitionToExecution(
       sessionId: "migration",
       sessionType: "fresh",
       contextBudget: 100,
-    },
-    {
-      type: "AgentStarted",
-      taskId,
-      ts: baseTs + 11,
-      fenceToken,
       agentContext: syntheticCtx,
     },
     {
@@ -274,12 +268,6 @@ function leaseAndStart(
       sessionId: "migration",
       sessionType: "fresh",
       contextBudget: 100,
-    },
-    {
-      type: "AgentStarted",
-      taskId,
-      ts: baseTs + 21,
-      fenceToken,
       agentContext: ctx,
     },
   ];
@@ -337,12 +325,6 @@ function approveAndComplete(
       sessionId: "migration",
       sessionType: "fresh",
       contextBudget: 100,
-    },
-    {
-      type: "AgentStarted",
-      taskId,
-      ts: baseTs + 41,
-      fenceToken,
       agentContext: { ...syntheticCtx, agentId: "migrate:reviewer" },
     },
     {

@@ -3,7 +3,6 @@ import type { Core } from "../core/index.js";
 import type {
   AgentContext,
   AgentExited,
-  AgentStarted,
   LeaseGranted,
   PhaseTransition,
   Task,
@@ -44,7 +43,6 @@ export function autoAnalysis(core: Core, task: Task, config: Config): boolean {
     modelId: "daemon",
   };
 
-  // 1. LeaseGranted
   const lease: LeaseGranted = {
     type: "LeaseGranted",
     taskId: task.id,
@@ -52,10 +50,11 @@ export function autoAnalysis(core: Core, task: Task, config: Config): boolean {
     fenceToken,
     agentId: "daemon:auto-analysis",
     phase: "analysis",
-    leaseTimeout: 60_000, // 1 minute (virtual, will complete instantly)
+    leaseTimeout: 60_000,
     sessionId,
     sessionType: "fresh",
     contextBudget: task.contextBudget || config.defaultContextBudget,
+    agentContext: daemonCtx,
   };
   const leaseResult = core.submit(lease);
   if (!leaseResult.ok) {
@@ -63,25 +62,11 @@ export function autoAnalysis(core: Core, task: Task, config: Config): boolean {
     return false;
   }
 
-  // 2. AgentStarted
-  const started: AgentStarted = {
-    type: "AgentStarted",
-    taskId: task.id,
-    ts: now + 1,
-    fenceToken,
-    agentContext: daemonCtx,
-  };
-  const startResult = core.submit(started);
-  if (!startResult.ok) {
-    console.error(`[analysis] AgentStarted failed for T${task.id}: ${startResult.error.message}`);
-    return false;
-  }
-
-  // 3. PhaseTransition: analysis.active → execution.ready
+  // PhaseTransition: analysis.active → execution.ready
   const transition: PhaseTransition = {
     type: "PhaseTransition",
     taskId: task.id,
-    ts: now + 2,
+    ts: now + 1,
     from: { phase: "analysis", condition: "active" },
     to: { phase: "execution", condition: "ready" },
     reasonCode: "decision_execute",
@@ -95,11 +80,11 @@ export function autoAnalysis(core: Core, task: Task, config: Config): boolean {
     return false;
   }
 
-  // 4. AgentExited (virtual agent)
+  // AgentExited (virtual agent)
   const exited: AgentExited = {
     type: "AgentExited",
     taskId: task.id,
-    ts: now + 3,
+    ts: now + 2,
     fenceToken,
     exitCode: 0,
     reportedCost: 0,

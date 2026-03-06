@@ -76,7 +76,7 @@ function reconcileOrphanedTasks(core: OrchestrationCore): void {
 
   for (const task of Object.values(state.tasks)) {
     if (task.terminal !== null) continue;
-    if (task.condition !== "active" && task.condition !== "leased") continue;
+    if (task.condition !== "active") continue;
     if (task.phase === null) continue;
 
     const event: RetryScheduled = {

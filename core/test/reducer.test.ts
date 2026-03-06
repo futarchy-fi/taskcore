@@ -28,7 +28,7 @@ function stateRef(): StateRef {
   };
 }
 
-test("reducer applies create -> lease -> start -> phase transition", () => {
+test("reducer applies create -> lease -> phase transition", () => {
   let state = createInitialState();
 
   const events: Event[] = [
@@ -66,12 +66,6 @@ test("reducer applies create -> lease -> start -> phase transition", () => {
       sessionId: "s-1",
       sessionType: "fresh",
       contextBudget: 1024,
-    },
-    {
-      type: "AgentStarted",
-      taskId: "T1",
-      ts: 3,
-      fenceToken: 1,
       agentContext: {
         sessionId: "s-1",
         agentId: "analyst",
@@ -110,7 +104,7 @@ test("reducer applies create -> lease -> start -> phase transition", () => {
   assert.equal(task.phase, "execution");
   assert.equal(task.condition, "ready");
   assert.equal(task.attempts.analysis.used, 1);
-  assert.equal(state.sequence, 4);
+  assert.equal(state.sequence, 3);
 });
 
 test("child terminal failure summary is accumulated on parent", () => {
@@ -468,14 +462,11 @@ test("BudgetIncreased insufficient keeps task exhausted", () => {
       costBudget: 5, dependencies: [], reviewConfig: null, skipAnalysis: true, metadata: {},
       source: { type: "middle", id: "test" },
     },
-    // Lease → start → retry to use up the attempt
+    // Lease → retry to use up the attempt
     {
       type: "LeaseGranted", taskId: "EX4", ts: 2,
       fenceToken: 1, agentId: "coder", phase: "execution",
       leaseTimeout: 60_000, sessionId: "s-ex4", sessionType: "fresh", contextBudget: 512,
-    },
-    {
-      type: "AgentStarted", taskId: "EX4", ts: 3, fenceToken: 1,
       agentContext: { sessionId: "s-ex4", agentId: "coder", memoryRef: null, contextTokens: 400, modelId: "gpt-5" },
     },
     {

@@ -260,10 +260,10 @@ function applyLeaseGranted(state: SystemState, event: Extract<Event, { type: "Le
   t.leasedTo = event.agentId;
   t.leaseExpiresAt = event.ts + event.leaseTimeout;
   t.phase = event.phase;
-  t.condition = "leased";
+  t.condition = "active";
   t.retryAfter = null;
   t.waitState = null;
-  t.currentSessionId = event.sessionId;
+  t.currentSessionId = event.agentContext.sessionId;
   t.contextBudget = event.contextBudget;
   t.attempts[event.phase].used += 1;
   t.updatedAt = event.ts;
@@ -299,13 +299,10 @@ function applyLeaseExtended(state: SystemState, event: Extract<Event, { type: "L
   state.tasks[t.id] = t;
 }
 
-function applyAgentStarted(state: SystemState, event: Extract<Event, { type: "AgentStarted" }>, task: Task): void {
-  const t = deepCloneTask(task);
-  t.condition = "active";
-  t.currentSessionId = event.agentContext.sessionId;
-  t.leaseExpiresAt = null;
-  t.updatedAt = event.ts;
-  state.tasks[t.id] = t;
+// Legacy no-op: AgentStarted is now absorbed into LeaseGranted.
+// Kept for backward compatibility with existing event journals.
+function applyAgentStarted(_state: SystemState, _event: Extract<Event, { type: "AgentStarted" }>, _task: Task): void {
+  // no-op
 }
 
 function applyCostReported(state: SystemState, event: Extract<Event, { type: "CostReported" }>, task: Task): void {

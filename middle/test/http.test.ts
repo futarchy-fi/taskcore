@@ -178,6 +178,13 @@ describe("HTTP API", () => {
       sessionId: "session-1",
       sessionType: "fresh",
       contextBudget: 100,
+      agentContext: {
+        sessionId: "session-1",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
     });
     assert.equal(leaseRes.status, 200);
 
@@ -349,16 +356,9 @@ describe("HTTP API", () => {
     assert.equal(task.phase, "execution");
     assert.equal(task.condition, "ready");
 
-    // Simulate dispatch: LeaseGranted + AgentStarted
+    // Simulate dispatch: LeaseGranted (now includes agentContext)
     const fenceToken = 1;
     const sessionId = "test-session";
-    const agentCtx = {
-      sessionId,
-      agentId: "coder",
-      memoryRef: null,
-      contextTokens: null,
-      modelId: "test",
-    };
 
     let evRes = await request("POST", "/tasks/1/events", {
       type: "LeaseGranted",
@@ -371,15 +371,13 @@ describe("HTTP API", () => {
       sessionId,
       sessionType: "fresh",
       contextBudget: 100,
-    });
-    assert.equal(evRes.status, 200);
-
-    evRes = await request("POST", "/tasks/1/events", {
-      type: "AgentStarted",
-      taskId: "1",
-      ts: Date.now(),
-      fenceToken,
-      agentContext: agentCtx,
+      agentContext: {
+        sessionId,
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
     });
     assert.equal(evRes.status, 200);
 
@@ -404,13 +402,6 @@ describe("HTTP API", () => {
 
     // Simulate reviewer dispatch
     const reviewFence = 2;
-    const reviewCtx = {
-      sessionId: "review-session",
-      agentId: "hermes",
-      memoryRef: null,
-      contextTokens: null,
-      modelId: "test",
-    };
 
     await request("POST", "/tasks/1/events", {
       type: "LeaseGranted",
@@ -423,14 +414,13 @@ describe("HTTP API", () => {
       sessionId: "review-session",
       sessionType: "fresh",
       contextBudget: 100,
-    });
-
-    await request("POST", "/tasks/1/events", {
-      type: "AgentStarted",
-      taskId: "1",
-      ts: Date.now(),
-      fenceToken: reviewFence,
-      agentContext: reviewCtx,
+      agentContext: {
+        sessionId: "review-session",
+        agentId: "hermes",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
     });
 
     // Reviewer approves: done
@@ -492,12 +482,6 @@ describe("HTTP API", () => {
       sessionId: "s-direct",
       sessionType: "fresh",
       contextBudget: 100,
-    });
-    await request("POST", "/tasks/1/events", {
-      type: "AgentStarted",
-      taskId: "1",
-      ts: Date.now(),
-      fenceToken: 1,
       agentContext: {
         sessionId: "s-direct",
         agentId: "coder",

@@ -49,6 +49,13 @@ test("validator rejects non-monotonic fence token", () => {
     sessionId: "sess-1",
     sessionType: "fresh",
     contextBudget: 512,
+    agentContext: {
+      sessionId: "sess-1",
+      agentId: "analyst",
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "test",
+    },
   };
 
   const error = validateEvent(state, invalidLease);
@@ -316,6 +323,13 @@ test("TaskExhausted requires ready or retryWait condition", () => {
     sessionId: "s-1",
     sessionType: "fresh",
     contextBudget: 512,
+    agentContext: {
+      sessionId: "s-1",
+      agentId: "coder",
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "test",
+    },
   };
   const r = reduce(state, leaseEvent);
   assert.equal(r.ok, true);
