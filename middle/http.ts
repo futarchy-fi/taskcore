@@ -33,7 +33,7 @@ import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
 import type { Config } from "./config.js";
 import { buildPrompt } from "./prompt.js";
 import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent, taskBranch } from "./journal.js";
-import { loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
+import { agentRole, loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
 import { createWorktree, getWorktreePath } from "./worktree.js";
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,7 @@ interface ClaimBody {
   contextBudget?: number;
   modelId?: string;
   source?: string;
+  force?: boolean;
 }
 
 interface TaskCreateBody {
@@ -521,6 +522,23 @@ function handleClaimTask(
       return { status: 400, body: { error: "invalid_context_budget", message: "contextBudget must be a positive integer." } };
     }
 
+    // Role enforcement: reject mismatched agents unless --force
+    const force = b.force === true;
+    if (!force) {
+      const claimRole = agentRole(agentId);
+      if (task.phase === "review") {
+        const reviewer = task.metadata["reviewer"] as string | undefined;
+        if (reviewer && agentRole(reviewer) !== claimRole) {
+          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} reviewer is "${reviewer}", not "${agentId}". Use --force to override.` } };
+        }
+      } else {
+        const assignee = task.metadata["assignee"] as string | undefined;
+        if (assignee && agentRole(assignee) !== claimRole) {
+          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} assignee is "${assignee}", not "${agentId}". Use --force to override.` } };
+        }
+      }
+    }
+
     const now = Date.now();
     const agentContext: AgentContext = {
       sessionId,
@@ -545,6 +563,11 @@ function handleClaimTask(
     let err = submitOrError(core, lg);
     if (err) return err;
 
+    // Auto-set reviewer metadata when claiming in review phase
+    const reviewerPatch = task.phase === "review" && !task.metadata["reviewer"]
+      ? { reviewer: agentId }
+      : {};
+
     const metadataUpdated: MetadataUpdated = {
       type: "MetadataUpdated",
       taskId,
@@ -555,6 +578,7 @@ function handleClaimTask(
         claimSessionId: sessionId,
         claimSessionKey: null,
         claimSource,
+        ...reviewerPatch,
       },
       reason: "agent claimed task via MCP",
       source: { type: "agent", id: agentId },

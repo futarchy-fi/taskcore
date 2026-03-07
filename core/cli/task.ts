@@ -871,12 +871,14 @@ async function cmdCreate(argv: string[], jsonMode: boolean): Promise<void> {
 
 async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
   const agentId = requireAgentId();
-  const { positionals } = parseFlags(argv);
+  const { positionals, flags } = parseFlags(argv);
   const taskId = normalizeTaskId(ensureText(positionals[0], "task id"));
+  const force = getFlagBool(flags, "force");
 
   const response = await apiRequest("POST", `/tasks/${taskId}/claim`, {
     agentId,
     source: "task-cli",
+    force,
   });
 
   const task = asRecord(response["task"]);
