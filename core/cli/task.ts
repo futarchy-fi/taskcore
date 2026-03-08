@@ -6,6 +6,7 @@ import * as path from "node:path";
 
 const PORT = Number.parseInt(process.env["ORCHESTRATOR_PORT"] ?? "18800", 10);
 const BASE_URL = `http://127.0.0.1:${Number.isFinite(PORT) ? PORT : 18800}`;
+const ACTIVE_DIR = path.join(os.homedir(), ".taskcore", "active");
 
 interface ApiResponse<T = unknown> {
   status: number;
@@ -258,6 +259,63 @@ function clearTaskContextFile(): void {
   }
 }
 
+// --- Active task file: ~/.taskcore/active/{agent-id}.json ---
+
+function activeTaskPath(agentId: string): string {
+  return path.join(ACTIVE_DIR, `${agentId}.json`);
+}
+
+function writeActiveTask(agentId: string, context: TaskContext): void {
+  fs.mkdirSync(ACTIVE_DIR, { recursive: true });
+  const content = JSON.stringify(context, null, 2) + "\n";
+  fs.writeFileSync(activeTaskPath(agentId), content, "utf-8");
+}
+
+function readActiveTask(agentId: string): TaskContext | null {
+  const filePath = activeTaskPath(agentId);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8")) as unknown;
+    const obj = asRecord(parsed);
+    if (!obj) return null;
+
+    const taskId = asString(obj["taskId"]);
+    const phase = asString(obj["phase"]);
+    const fenceToken = asNumber(obj["fenceToken"]);
+    const sessionId = asString(obj["sessionId"]);
+    const journalPath = asString(obj["journalPath"]);
+    const codeWorktree = asString(obj["codeWorktree"]);
+    const claimedAt = asNumber(obj["claimedAt"]);
+
+    if (!taskId || fenceToken === null || !sessionId || !journalPath || claimedAt === null) {
+      return null;
+    }
+
+    return {
+      taskId,
+      phase,
+      fenceToken,
+      sessionId,
+      journalPath,
+      codeWorktree,
+      claimedAt,
+      reviewNotes: asArray<string>(obj["reviewNotes"]),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function clearActiveTask(agentId: string): void {
+  const filePath = activeTaskPath(agentId);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch {
+    // ignore — file may already be gone
+  }
+}
+
 function requireAgentId(): string {
   const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
   if (!agentId) {
@@ -275,9 +333,18 @@ function agentRole(agentId: string): string {
 function currentTaskId(explicit?: string): string {
   if (explicit) return normalizeTaskId(explicit);
 
+  // 1. .task file in cwd tree (worktree-native)
   const { context } = readTaskContext();
   if (context?.taskId) return normalizeTaskId(context.taskId);
 
+  // 2. Active task file (~/.taskcore/active/{agent-id}.json)
+  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  if (agentId) {
+    const active = readActiveTask(agentId);
+    if (active?.taskId) return normalizeTaskId(active.taskId);
+  }
+
+  // 3. TASK_ID env var (lossy fallback — ID only)
   const envTaskId = process.env["TASK_ID"]?.trim();
   if (envTaskId) return normalizeTaskId(envTaskId);
 
@@ -911,6 +978,9 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
     writeTaskContext(context, roots);
   }
 
+  // Write global active task file
+  writeActiveTask(agentId, context);
+
   if (jsonMode) {
     process.stdout.write(JSON.stringify(response, null, 2) + "\n");
     return;
@@ -1021,6 +1091,7 @@ async function cmdRelease(argv: string[], jsonMode: boolean): Promise<void> {
   };
 
   const response = await apiRequest("POST", `/tasks/${taskId}/events`, payload);
+  clearActiveTask(agentId);
   clearTaskContextFile();
 
   if (jsonMode) {
@@ -1062,7 +1133,7 @@ async function cmdExtend(argv: string[], jsonMode: boolean): Promise<void> {
 }
 
 async function cmdSubmit(argv: string[], jsonMode: boolean): Promise<void> {
-  requireAgentId();
+  const agentId = requireAgentId();
   const evidence = ensureText(argv.join(" "), "evidence");
   const taskId = currentTaskId();
 
@@ -1070,6 +1141,9 @@ async function cmdSubmit(argv: string[], jsonMode: boolean): Promise<void> {
     status: "review",
     evidence,
   });
+
+  clearActiveTask(agentId);
+  clearTaskContextFile();
 
   if (jsonMode) {
     process.stdout.write(JSON.stringify(response, null, 2) + "\n");
@@ -1081,7 +1155,7 @@ async function cmdSubmit(argv: string[], jsonMode: boolean): Promise<void> {
 }
 
 async function cmdComplete(argv: string[], jsonMode: boolean): Promise<void> {
-  requireAgentId();
+  const agentId = requireAgentId();
   const evidence = ensureText(argv.join(" "), "evidence");
   const taskId = currentTaskId();
 
@@ -1089,6 +1163,9 @@ async function cmdComplete(argv: string[], jsonMode: boolean): Promise<void> {
     status: "done",
     evidence,
   });
+
+  clearActiveTask(agentId);
+  clearTaskContextFile();
 
   if (jsonMode) {
     process.stdout.write(JSON.stringify(response, null, 2) + "\n");
@@ -1099,7 +1176,7 @@ async function cmdComplete(argv: string[], jsonMode: boolean): Promise<void> {
 }
 
 async function cmdBlock(argv: string[], jsonMode: boolean): Promise<void> {
-  requireAgentId();
+  const agentId = requireAgentId();
   const reason = ensureText(argv.join(" "), "reason");
   const taskId = currentTaskId();
 
@@ -1107,6 +1184,9 @@ async function cmdBlock(argv: string[], jsonMode: boolean): Promise<void> {
     status: "blocked",
     blocker: reason,
   });
+
+  clearActiveTask(agentId);
+  clearTaskContextFile();
 
   if (jsonMode) {
     process.stdout.write(JSON.stringify(response, null, 2) + "\n");
