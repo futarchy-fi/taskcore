@@ -88,7 +88,7 @@ function asArray<T = unknown>(value: unknown): T[] {
 function formatMoney(value: unknown): string {
   const n = asNumber(value);
   if (n === null) return "n/a";
-  return `$${n.toFixed(2)}`;
+  return n.toFixed(2);
 }
 
 function formatIso(ts: unknown): string {
