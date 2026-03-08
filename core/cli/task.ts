@@ -328,8 +328,14 @@ function clearActiveTask(agentId: string): void {
   }
 }
 
+function resolveAgentId(): string | undefined {
+  return process.env["TASKCORE_AGENT_ID"]?.trim()
+    || process.env["CLAW_NAME"]?.trim()
+    || undefined;
+}
+
 function requireAgentId(): string {
-  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const agentId = resolveAgentId();
   if (!agentId) {
     throw new CliError("TASKCORE_AGENT_ID is required for this command.", 3);
   }
@@ -350,7 +356,7 @@ function currentTaskId(explicit?: string): string {
   if (context?.taskId) return normalizeTaskId(context.taskId);
 
   // 2. Active task file (~/.taskcore/active/{agent-id}.json)
-  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const agentId = resolveAgentId();
   if (agentId) {
     const active = readActiveTask(agentId);
     if (active?.taskId) return normalizeTaskId(active.taskId);
@@ -530,7 +536,7 @@ function phaseGuidance(phase: string, condition: string): string[] {
 }
 
 async function cmdHome(jsonMode: boolean): Promise<void> {
-  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const agentId = resolveAgentId();
 
   // --- Try to find active task ---
   let activeContext: TaskContext | null = null;
@@ -940,7 +946,7 @@ async function cmdList(argv: string[], jsonMode: boolean): Promise<void> {
   const limitRaw = getFlagString(flags, "limit");
   const limit = limitRaw ? Number.parseInt(limitRaw, 10) : DEFAULT_LIMIT;
 
-  const myAgent = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const myAgent = resolveAgentId();
 
   const filtered = tasks
     .filter((task) => {
