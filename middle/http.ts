@@ -199,6 +199,85 @@ function daemonAgentContext(): AgentContext {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Status broadcast — sends to Status Updates (Bots) group on transitions
+// ---------------------------------------------------------------------------
+
+const STATUS_GROUP_CHAT_ID = process.env["STATUS_GROUP_CHAT_ID"] || "";
+
+const EVENT_EMOJI: Record<string, string> = {
+  TaskCreated: "📝",
+  LeaseGranted: "🤖",
+  LeaseReleased: "🔓",
+  PhaseTransition: "➡️",
+  DecompositionCreated: "🔀",
+  ReviewVerdictSubmitted: "📋",
+  ReviewPolicyMet: "✅",
+  TaskCompleted: "✅",
+  TaskFailed: "❌",
+  TaskExhausted: "💤",
+  TaskBlocked: "🚫",
+  TaskCanceled: "🗑️",
+  TaskRevived: "🔄",
+  BudgetIncreased: "💰",
+};
+
+// Events that are too noisy or internal to broadcast
+const SILENT_EVENTS = new Set([
+  "LeaseExpired", "LeaseExtended", "AgentStarted", "AgentExited",
+  "CostReported", "WaitRequested", "WaitResolved", "DependencySatisfied",
+  "RetryScheduled", "BackoffExpired", "ChildCostRecovered",
+  "CheckpointTriggered", "CheckpointCreated", "StateReverted",
+  "MetadataUpdated", "TaskReparented",
+]);
+
+function broadcastTransition(core: Core, event: Event): void {
+  if (!STATUS_GROUP_CHAT_ID || !TELEGRAM_BOT_TOKEN) return;
+  if (SILENT_EVENTS.has(event.type)) return;
+
+  const emoji = EVENT_EMOJI[event.type] || "📌";
+  const task = core.getTask(event.taskId);
+  const title = task ? task.title.slice(0, 60) : `T${event.taskId}`;
+
+  let detail = "";
+  switch (event.type) {
+    case "LeaseGranted":
+      detail = ` by ${(event as LeaseGranted).agentId}`;
+      break;
+    case "LeaseReleased":
+      detail = ` (${(event as LeaseReleased).reason})`;
+      break;
+    case "PhaseTransition": {
+      const pt = event as PhaseTransition;
+      detail = ` → ${pt.to.phase}.${pt.to.condition}`;
+      break;
+    }
+    case "TaskBlocked":
+      detail = `: ${(event as TaskBlocked).reason?.slice(0, 80) || ""}`;
+      break;
+    case "TaskFailed":
+      detail = `: ${(event as TaskFailed).reason?.slice(0, 80) || ""}`;
+      break;
+    case "DecompositionCreated": {
+      const dc = event as DecompositionCreated;
+      detail = ` → ${dc.children.length} children`;
+      break;
+    }
+  }
+
+  const msg = `${emoji} <b>${event.type}</b> T${event.taskId}: ${escapeHtml(title)}${escapeHtml(detail)}`;
+
+  fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: STATUS_GROUP_CHAT_ID, text: msg, parse_mode: "HTML" }),
+  }).catch(() => {});
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function submitOrError(core: Core, event: Event): RouteResult | null {
   const result = core.submit(event);
   if (!result.ok) {
@@ -207,6 +286,7 @@ function submitOrError(core: Core, event: Event): RouteResult | null {
       body: { error: result.error.code, message: result.error.message },
     };
   }
+  broadcastTransition(core, event);
   return null;
 }
 

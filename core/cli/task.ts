@@ -286,7 +286,7 @@ function readActiveTask(agentId: string): TaskContext | null {
     const codeWorktree = asString(obj["codeWorktree"]);
     const claimedAt = asNumber(obj["claimedAt"]);
 
-    if (!taskId || fenceToken === null || !sessionId || !journalPath || claimedAt === null) {
+    if (!taskId || fenceToken === null || !sessionId || claimedAt === null) {
       return null;
     }
 
@@ -295,7 +295,7 @@ function readActiveTask(agentId: string): TaskContext | null {
       phase,
       fenceToken,
       sessionId,
-      journalPath,
+      journalPath: journalPath ?? "",
       codeWorktree,
       claimedAt,
       reviewNotes: asArray<string>(obj["reviewNotes"]),
