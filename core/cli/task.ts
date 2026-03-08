@@ -1734,6 +1734,47 @@ async function cmdDecompose(argv: string[], jsonMode: boolean): Promise<void> {
       process.stdout.write(`\nBudget remaining: ${formatMoney(response["budgetRemaining"])}\n`);
       process.stdout.write("\nNext:\n");
       process.stdout.write("  task decompose add \"Next title\" --desc \"...\" --cost N\n");
+      process.stdout.write("  task decompose checkpoint 0,2     — mark checkpoints (optional)\n");
+      process.stdout.write("  task decompose commit \"Strategy description\"\n");
+      return;
+    }
+
+    case "checkpoint": {
+      const raw = args.join(",").split(",").map((s) => s.trim()).filter(Boolean);
+      if (raw.length === 0 || (raw.length === 1 && raw[0] === "none")) {
+        const response = await apiRequest("POST", `/tasks/${taskId}/decompose/checkpoint`, { indices: [] });
+        if (jsonMode) { process.stdout.write(JSON.stringify(response, null, 2) + "\n"); return; }
+        process.stdout.write("Checkpoints cleared.\n");
+        return;
+      }
+
+      let indices: number[];
+      if (raw.length === 1 && raw[0] === "all") {
+        // Will be resolved server-side; fetch children count first
+        const response = await apiRequest("POST", `/tasks/${taskId}/decompose/checkpoint`, { indices: [] });
+        const children = asArray<unknown>(response["children"]);
+        indices = children.map((_, i) => i);
+      } else {
+        indices = raw.map((s) => {
+          const n = Number.parseInt(s, 10);
+          if (!Number.isInteger(n) || n < 0) throw new CliError(`Invalid child index: '${s}'`, 1);
+          return n;
+        });
+      }
+
+      const response = await apiRequest("POST", `/tasks/${taskId}/decompose/checkpoint`, { indices });
+      if (jsonMode) { process.stdout.write(JSON.stringify(response, null, 2) + "\n"); return; }
+
+      const children = asArray<unknown>(response["children"])
+        .map((c) => asRecord(c))
+        .filter((c): c is Record<string, unknown> => c !== null);
+      process.stdout.write("--- Checkpoint selection ---\n");
+      for (const child of children) {
+        const marker = child["isCheckpoint"] ? " ★" : "";
+        process.stdout.write(`  #${String(child["index"])}: ${getString(child, "title", "(untitled)")}${marker}\n`);
+      }
+      process.stdout.write(`\n★ = checkpoint (wakes parent for re-analysis on completion)\n`);
+      process.stdout.write("\nNext:\n");
       process.stdout.write("  task decompose commit \"Strategy description\"\n");
       return;
     }
@@ -1770,7 +1811,7 @@ async function cmdDecompose(argv: string[], jsonMode: boolean): Promise<void> {
     }
 
     default:
-      throw new CliError("Usage: task decompose <start|add|commit|cancel> ...", 1);
+      throw new CliError("Usage: task decompose <start|add|checkpoint|commit|cancel> ...", 1);
   }
 }
 
