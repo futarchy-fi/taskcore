@@ -151,7 +151,7 @@ export class CoreClock {
       }
 
       let emittedCheckpoint = false;
-      if (task.phase === "review" && task.condition === "waiting" && task.checkpoints.length > 0) {
+      if ((task.phase === "review" || task.phase === "analysis") && task.condition === "waiting" && task.checkpoints.length > 0) {
         const alreadyTriggered = new Set(task.triggeredCheckpoints);
         for (const childId of task.checkpoints) {
           if (alreadyTriggered.has(childId)) {
@@ -175,42 +175,26 @@ export class CoreClock {
       }
 
       const completion = childrenCompleteReady(state, task);
-      if (!emittedCheckpoint && task.phase === "review" && task.condition === "waiting" && completion.allTerminal) {
-        const childrenTransition: PhaseTransition = completion.anyDone
-          ? {
-              type: "PhaseTransition",
-              taskId: task.id,
-              ts: now,
-              from: { phase: "review", condition: "waiting" },
-              to: { phase: "review", condition: "ready" },
-              reasonCode: "children_complete",
-              reason: "All children reached terminal state",
-              fenceToken: task.currentFenceToken,
-              agentContext: {
-                sessionId: "core",
-                agentId: "core",
-                memoryRef: null,
-                contextTokens: null,
-                modelId: "core",
-              },
-            }
-          : {
-              type: "PhaseTransition",
-              taskId: task.id,
-              ts: now,
-              from: { phase: "review", condition: "waiting" },
-              to: { phase: "analysis", condition: "ready" },
-              reasonCode: "children_all_failed",
-              reason: "All children reached terminal state with no successful child",
-              fenceToken: task.currentFenceToken,
-              agentContext: {
-                sessionId: "core",
-                agentId: "core",
-                memoryRef: null,
-                contextTokens: null,
-                modelId: "core",
-              },
-            };
+      if (!emittedCheckpoint && task.phase === "analysis" && task.condition === "waiting" && completion.allTerminal) {
+        const childrenTransition: PhaseTransition = {
+          type: "PhaseTransition",
+          taskId: task.id,
+          ts: now,
+          from: { phase: "analysis", condition: "waiting" },
+          to: { phase: "analysis", condition: "ready" },
+          reasonCode: completion.anyDone ? "children_complete" : "children_all_failed",
+          reason: completion.anyDone
+            ? "All children reached terminal state"
+            : "All children reached terminal state with no successful child",
+          fenceToken: task.currentFenceToken,
+          agentContext: {
+            sessionId: "core",
+            agentId: "core",
+            memoryRef: null,
+            contextTokens: null,
+            modelId: "core",
+          },
+        };
         due.push(childrenTransition);
       }
     }

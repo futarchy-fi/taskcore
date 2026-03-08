@@ -35,9 +35,10 @@ const PHASE_TRANSITION_TABLE = new Set<string>([
   transitionKey("review", "active", "analysis", "ready", "wrong_approach"),
   transitionKey("review", "active", "analysis", "ready", "needs_redecomp"),
   transitionKey("review", "active", "decomposition", "ready", "add_children"),
-  transitionKey("decomposition", "active", "review", "waiting", "children_created"),
-  transitionKey("review", "waiting", "review", "ready", "children_complete"),
-  transitionKey("review", "waiting", "analysis", "ready", "children_all_failed"),
+  transitionKey("analysis", "active", "review", "ready", "work_complete"),
+  transitionKey("decomposition", "active", "analysis", "waiting", "children_created"),
+  transitionKey("analysis", "waiting", "analysis", "ready", "children_complete"),
+  transitionKey("analysis", "waiting", "analysis", "ready", "children_all_failed"),
 ]);
 
 function transitionKey(

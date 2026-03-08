@@ -299,7 +299,7 @@ test("property A: cost conservation", () => {
       taskId: rootId,
       ts: 8,
       from: { phase: "decomposition", condition: "active" },
-      to: { phase: "review", condition: "waiting" },
+      to: { phase: "analysis", condition: "waiting" },
       reasonCode: "children_created",
       reason: "children created",
       fenceToken: 2,
