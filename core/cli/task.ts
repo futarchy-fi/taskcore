@@ -61,6 +61,18 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return null;
 }
 
+/** Check if an ApiError looks like a lease-expiry state mismatch and print a helpful message. Returns true if handled. */
+function handleLeaseExpiryError(err: unknown, taskId: string, action: string): boolean {
+  if (!(err instanceof ApiError)) return false;
+  const body = asRecord(err.body);
+  if (err.status !== 409 || body?.["error"] !== "invalid_state") return false;
+  const msg = typeof body["message"] === "string" ? body["message"] : "";
+  process.stderr.write(`\nCannot ${action}: ${msg}\n`);
+  process.stderr.write(`This usually means your lease expired and the task reverted.\n`);
+  process.stderr.write(`Run: task claim ${taskId}\n\n`);
+  return true;
+}
+
 function asString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
@@ -567,7 +579,15 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
       return;
     }
 
+    // Detect lease expiry: active file exists but task is no longer active for us
+    const leaseExpired = !terminal && condition !== "active" && activeContext.fenceToken > 0;
+
     process.stdout.write(`\n  Active Task: T${taskId} — ${title}\n`);
+    if (leaseExpired) {
+      process.stdout.write(`\n  ⚠️  LEASE EXPIRED — task reverted to ${phase}.${condition}\n`);
+      process.stdout.write(`  Your work may still be in the worktree. To reclaim:\n`);
+      process.stdout.write(`    task claim ${taskId}\n\n`);
+    }
     process.stdout.write(`  Phase:       ${phase}.${terminal || condition}\n`);
     process.stdout.write(`  Claimed:     ${elapsed} ago (fence ${activeContext.fenceToken})\n`);
     if (activeContext.codeWorktree) {
@@ -1400,10 +1420,16 @@ async function cmdSubmit(argv: string[], jsonMode: boolean): Promise<void> {
   const evidence = ensureText(argv.join(" "), "evidence");
   const taskId = currentTaskId();
 
-  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
-    status: "review",
-    evidence,
-  });
+  let response: Record<string, unknown>;
+  try {
+    response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+      status: "review",
+      evidence,
+    });
+  } catch (err) {
+    if (handleLeaseExpiryError(err, taskId, "submit")) process.exit(1);
+    throw err;
+  }
 
   clearActiveTask(agentId);
   clearTaskContextFile();
@@ -1422,10 +1448,16 @@ async function cmdComplete(argv: string[], jsonMode: boolean): Promise<void> {
   const evidence = ensureText(argv.join(" "), "evidence");
   const taskId = currentTaskId();
 
-  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
-    status: "done",
-    evidence,
-  });
+  let response: Record<string, unknown>;
+  try {
+    response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+      status: "done",
+      evidence,
+    });
+  } catch (err) {
+    if (handleLeaseExpiryError(err, taskId, "complete")) process.exit(1);
+    throw err;
+  }
 
   clearActiveTask(agentId);
   clearTaskContextFile();
@@ -1443,10 +1475,16 @@ async function cmdBlock(argv: string[], jsonMode: boolean): Promise<void> {
   const reason = ensureText(argv.join(" "), "reason");
   const taskId = currentTaskId();
 
-  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
-    status: "blocked",
-    blocker: reason,
-  });
+  let response: Record<string, unknown>;
+  try {
+    response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+      status: "blocked",
+      blocker: reason,
+    });
+  } catch (err) {
+    if (handleLeaseExpiryError(err, taskId, "block")) process.exit(1);
+    throw err;
+  }
 
   clearActiveTask(agentId);
   clearTaskContextFile();
