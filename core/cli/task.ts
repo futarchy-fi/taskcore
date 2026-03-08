@@ -61,6 +61,18 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return null;
 }
 
+/** Check if an ApiError looks like a lease-expiry state mismatch and print a helpful message. Returns true if handled. */
+function handleLeaseExpiryError(err: unknown, taskId: string, action: string): boolean {
+  if (!(err instanceof ApiError)) return false;
+  const body = asRecord(err.body);
+  if (err.status !== 409 || body?.["error"] !== "invalid_state") return false;
+  const msg = typeof body["message"] === "string" ? body["message"] : "";
+  process.stderr.write(`\nCannot ${action}: ${msg}\n`);
+  process.stderr.write(`This usually means your lease expired and the task reverted.\n`);
+  process.stderr.write(`Run: task claim ${taskId}\n\n`);
+  return true;
+}
+
 function asString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
@@ -316,8 +328,14 @@ function clearActiveTask(agentId: string): void {
   }
 }
 
+function resolveAgentId(): string | undefined {
+  return process.env["TASKCORE_AGENT_ID"]?.trim()
+    || process.env["CLAW_NAME"]?.trim()
+    || undefined;
+}
+
 function requireAgentId(): string {
-  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const agentId = resolveAgentId();
   if (!agentId) {
     throw new CliError("TASKCORE_AGENT_ID is required for this command.", 3);
   }
@@ -338,7 +356,7 @@ function currentTaskId(explicit?: string): string {
   if (context?.taskId) return normalizeTaskId(context.taskId);
 
   // 2. Active task file (~/.taskcore/active/{agent-id}.json)
-  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const agentId = resolveAgentId();
   if (agentId) {
     const active = readActiveTask(agentId);
     if (active?.taskId) return normalizeTaskId(active.taskId);
@@ -518,7 +536,7 @@ function phaseGuidance(phase: string, condition: string): string[] {
 }
 
 async function cmdHome(jsonMode: boolean): Promise<void> {
-  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const agentId = resolveAgentId();
 
   // --- Try to find active task ---
   let activeContext: TaskContext | null = null;
@@ -567,7 +585,15 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
       return;
     }
 
+    // Detect lease expiry: active file exists but task is no longer active for us
+    const leaseExpired = !terminal && condition !== "active" && activeContext.fenceToken > 0;
+
     process.stdout.write(`\n  Active Task: T${taskId} — ${title}\n`);
+    if (leaseExpired) {
+      process.stdout.write(`\n  ⚠️  LEASE EXPIRED — task reverted to ${phase}.${condition}\n`);
+      process.stdout.write(`  Your work may still be in the worktree. To reclaim:\n`);
+      process.stdout.write(`    task claim ${taskId}\n\n`);
+    }
     process.stdout.write(`  Phase:       ${phase}.${terminal || condition}\n`);
     process.stdout.write(`  Claimed:     ${elapsed} ago (fence ${activeContext.fenceToken})\n`);
     if (activeContext.codeWorktree) {
@@ -920,7 +946,7 @@ async function cmdList(argv: string[], jsonMode: boolean): Promise<void> {
   const limitRaw = getFlagString(flags, "limit");
   const limit = limitRaw ? Number.parseInt(limitRaw, 10) : DEFAULT_LIMIT;
 
-  const myAgent = process.env["TASKCORE_AGENT_ID"]?.trim();
+  const myAgent = resolveAgentId();
 
   const filtered = tasks
     .filter((task) => {
@@ -1400,10 +1426,16 @@ async function cmdSubmit(argv: string[], jsonMode: boolean): Promise<void> {
   const evidence = ensureText(argv.join(" "), "evidence");
   const taskId = currentTaskId();
 
-  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
-    status: "review",
-    evidence,
-  });
+  let response: Record<string, unknown>;
+  try {
+    response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+      status: "review",
+      evidence,
+    });
+  } catch (err) {
+    if (handleLeaseExpiryError(err, taskId, "submit")) process.exit(1);
+    throw err;
+  }
 
   clearActiveTask(agentId);
   clearTaskContextFile();
@@ -1422,10 +1454,16 @@ async function cmdComplete(argv: string[], jsonMode: boolean): Promise<void> {
   const evidence = ensureText(argv.join(" "), "evidence");
   const taskId = currentTaskId();
 
-  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
-    status: "done",
-    evidence,
-  });
+  let response: Record<string, unknown>;
+  try {
+    response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+      status: "done",
+      evidence,
+    });
+  } catch (err) {
+    if (handleLeaseExpiryError(err, taskId, "complete")) process.exit(1);
+    throw err;
+  }
 
   clearActiveTask(agentId);
   clearTaskContextFile();
@@ -1443,10 +1481,16 @@ async function cmdBlock(argv: string[], jsonMode: boolean): Promise<void> {
   const reason = ensureText(argv.join(" "), "reason");
   const taskId = currentTaskId();
 
-  const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
-    status: "blocked",
-    blocker: reason,
-  });
+  let response: Record<string, unknown>;
+  try {
+    response = await apiRequest("POST", `/tasks/${taskId}/status`, {
+      status: "blocked",
+      blocker: reason,
+    });
+  } catch (err) {
+    if (handleLeaseExpiryError(err, taskId, "block")) process.exit(1);
+    throw err;
+  }
 
   clearActiveTask(agentId);
   clearTaskContextFile();
