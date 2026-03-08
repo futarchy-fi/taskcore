@@ -13,6 +13,7 @@ import type {
   Event,
   FailureSummary,
   LeaseGranted,
+  LeaseReleased,
   MetadataUpdated,
   ReviewPolicyMet,
   ReviewVerdictSubmitted,
@@ -448,6 +449,7 @@ function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[]
     { method: "POST", pattern: "/tasks", handler: handleCreateTask(core, config, registry) },
     { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
     { method: "POST", pattern: "/tasks/:id/claim", handler: handleClaimTask(core, config) },
+    { method: "POST", pattern: "/tasks/:id/release", handler: handleReleaseTask(core) },
     { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core) },
     { method: "POST", pattern: "/tasks/:id/reparent", handler: handleReparent(core) },
     { method: "POST", pattern: "/tasks/:id/revive", handler: handleRevive(core) },
@@ -630,6 +632,68 @@ function handleClaimTask(
         reviewContext: updated.phase === "review" ? buildPrompt(core, updated.id, "review", config) : null,
         warnings: workspace.warnings,
         guidance: "Start a fresh context (/new) unless this task is tightly coupled to your previous context.",
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/release — gracefully release a lease
+function handleReleaseTask(
+  core: Core,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as { fenceToken?: number; reason?: string; workPerformed?: boolean };
+
+    const task = core.getTask(taskId);
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+    if (task.terminal) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+    if (task.condition !== "active") {
+      return {
+        status: 409,
+        body: { error: "not_active", message: `Task ${taskId} must be active to release, got ${task.phase}.${task.condition}` },
+      };
+    }
+    if (!task.phase) {
+      return { status: 409, body: { error: "no_phase", message: `Task ${taskId} has no phase` } };
+    }
+
+    const fenceToken = typeof b.fenceToken === "number" ? b.fenceToken : task.currentFenceToken;
+    const reason = typeof b.reason === "string" && b.reason.trim().length > 0
+      ? b.reason.trim()
+      : "Agent released task";
+    const workPerformed = b.workPerformed === true;
+
+    const event: LeaseReleased = {
+      type: "LeaseReleased",
+      taskId,
+      ts: Date.now(),
+      fenceToken,
+      reason,
+      phase: task.phase,
+      workPerformed,
+      source: { type: "agent", id: task.leasedTo ?? "unknown" },
+    };
+
+    const err = submitOrError(core, event);
+    if (err) return err;
+
+    const updated = core.getTask(taskId);
+    return {
+      status: 200,
+      body: {
+        released: true,
+        taskId,
+        phase: updated?.phase,
+        condition: updated?.condition,
+        workPerformed,
+        message: workPerformed
+          ? `Task ${taskId} released (attempt consumed — work was performed)`
+          : `Task ${taskId} released (no attempt consumed)`,
       },
     };
   };
