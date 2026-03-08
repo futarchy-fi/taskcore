@@ -2048,20 +2048,40 @@ function parseMetadataValue(raw: string): unknown {
 async function cmdMetadata(argv: string[], jsonMode: boolean): Promise<void> {
   requireAgentId();
   const taskId = normalizeTaskId(ensureText(argv[0], "task id"));
-  const key = ensureText(argv[1], "metadata key");
-  const value = ensureText(argv.slice(2).join(" "), "metadata value");
+  const rest = argv.slice(1);
 
-  const patch: Record<string, unknown> = {
-    [key]: parseMetadataValue(value),
-    reason: "metadata updated via task CLI",
-  };
+  if (rest.length === 0) {
+    throw new CliError("Usage: task metadata <id> key=value [key2=value2 ...]\n       task metadata <id> <key> <value>", 1);
+  }
+
+  const patch: Record<string, unknown> = {};
+
+  // Check if using key=value format (any arg contains '=')
+  const hasKvp = rest.some((arg) => arg.includes("="));
+  if (hasKvp) {
+    for (const arg of rest) {
+      const eqIdx = arg.indexOf("=");
+      if (eqIdx < 1) throw new CliError(`Invalid key=value pair: '${arg}'. Format: key=value`, 1);
+      const key = arg.slice(0, eqIdx);
+      const value = arg.slice(eqIdx + 1);
+      patch[key] = parseMetadataValue(value);
+    }
+  } else {
+    // Legacy 3-arg form: task metadata <id> <key> <value>
+    const key = ensureText(rest[0], "metadata key");
+    const value = ensureText(rest.slice(1).join(" "), "metadata value");
+    patch[key] = parseMetadataValue(value);
+  }
+
+  patch["reason"] = "metadata updated via task CLI";
 
   const response = await apiRequest("PATCH", `/tasks/${taskId}/metadata`, patch);
   if (jsonMode) {
     process.stdout.write(JSON.stringify(response, null, 2) + "\n");
     return;
   }
-  process.stdout.write(`Updated metadata for T${taskId}.\n`);
+  const keys = Object.keys(patch).filter((k) => k !== "reason");
+  process.stdout.write(`Updated metadata for T${taskId}: ${keys.join(", ")}\n`);
 }
 
 async function cmdReparent(argv: string[], jsonMode: boolean): Promise<void> {
