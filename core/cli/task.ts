@@ -1282,8 +1282,15 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
   }
   process.stdout.write(`Fence: ${fenceToken}\n`);
 
+  const desc = getString(task, "description", "(none)");
+  const descLines = desc.split("\n");
   process.stdout.write("\n## Description\n");
-  process.stdout.write(getString(task, "description", "(none)") + "\n");
+  if (descLines.length > 5) {
+    process.stdout.write(descLines.slice(0, 5).join("\n") + "\n");
+    process.stdout.write(`  ... (${descLines.length - 5} more lines — \`task show ${taskId}\` for full)\n`);
+  } else {
+    process.stdout.write(desc + "\n");
+  }
 
   process.stdout.write("\n## Your Workspace\n");
   if (journalPath) process.stdout.write(`  Journal: ${journalPath}\n`);
@@ -1321,34 +1328,34 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
 
   const parentJournal = asString(response["parentJournal"]);
   if (parentJournal) {
+    const pLines = parentJournal.split("\n").filter((l) => l.trim().length > 0);
     process.stdout.write("\n## Parent Context\n");
-    process.stdout.write(parentJournal + "\n");
+    process.stdout.write("  " + pLines.slice(0, 2).join("\n  ") + "\n");
+    if (pLines.length > 2) {
+      process.stdout.write(`  ... (${pLines.length - 2} more lines in journal)\n`);
+    }
   }
 
   const siblingFailures = asArray<unknown>(response["siblingFailures"])
     .map((entry) => asRecord(entry))
     .filter((entry): entry is Record<string, unknown> => entry !== null);
   if (siblingFailures.length > 0) {
-    process.stdout.write("\n## Sibling Failures\n");
+    process.stdout.write(`\n## Sibling Failures (${siblingFailures.length})\n`);
     for (const sibling of siblingFailures.slice(0, 5)) {
-      process.stdout.write(`  T${getString(sibling, "taskId", "?")}: ${getString(sibling, "summary", "") || getString(sibling, "content", "")}`.trim() + "\n");
+      const raw = getString(sibling, "summary", "") || getString(sibling, "content", "");
+      const oneLine = raw.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !l.startsWith("#") && !l.startsWith("_Recorded")).join(" — ").slice(0, 120);
+      process.stdout.write(`  T${getString(sibling, "taskId", "?")}: ${oneLine}\n`);
+    }
+    if (siblingFailures.length > 5) {
+      process.stdout.write(`  ... and ${siblingFailures.length - 5} more\n`);
     }
   }
 
-  const workspaceConventions = asString(response["workspaceConventions"]);
-  if (workspaceConventions) {
-    process.stdout.write("\n## Workspace Conventions\n");
-    process.stdout.write(workspaceConventions + "\n");
-  }
-
-  process.stdout.write("\n## What To Do Next\n");
-  process.stdout.write("  1. Read the code in the worktree\n");
-  process.stdout.write("  2. Write observations to your journal:\n");
-  process.stdout.write("       task journal write \"Starting analysis...\"\n");
-  process.stdout.write("  3. When done:\n");
-  process.stdout.write("       task submit \"Description of what you did\"\n");
-  process.stdout.write("  4. If blocked:\n");
-  process.stdout.write("       task block \"What is preventing progress\"\n");
+  process.stdout.write("\n## Next Steps\n");
+  process.stdout.write("  task submit \"what you did\"   — when done\n");
+  process.stdout.write("  task block \"what's wrong\"    — if stuck\n");
+  process.stdout.write("  task show                    — full task details\n");
+  process.stdout.write("  task extend                  — extend lease\n");
 }
 
 function sourceFor(agentId: string): Record<string, string> {
