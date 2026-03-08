@@ -144,6 +144,7 @@ interface PendingDecomposition {
   startedAt: number;
   approach: string;
   children: PendingChild[];
+  checkpointIndices: number[];
 }
 
 const pendingDecompositions = new Map<string, PendingDecomposition>();
@@ -573,6 +574,7 @@ function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[]
     { method: "POST", pattern: "/tasks/:id/budget", handler: handleBudgetIncrease(core) },
     { method: "POST", pattern: "/tasks/:id/decompose/start", handler: handleDecomposeStart(core) },
     { method: "POST", pattern: "/tasks/:id/decompose/add-child", handler: handleDecomposeAddChild(core) },
+    { method: "POST", pattern: "/tasks/:id/decompose/checkpoint", handler: handleDecomposeCheckpoint() },
     { method: "POST", pattern: "/tasks/:id/decompose/commit", handler: handleDecomposeCommit(core, config) },
     { method: "POST", pattern: "/tasks/:id/decompose/cancel", handler: handleDecomposeCancel(core) },
     { method: "POST", pattern: "/tasks/:id/decompose", handler: handleDecompose(core, config) },
@@ -1992,6 +1994,7 @@ function handleDecomposeStart(
       startedAt: Date.now(),
       approach: "",
       children: [],
+      checkpointIndices: [],
     });
 
     return {
@@ -2107,6 +2110,47 @@ function handleDecomposeAddChild(
         guidance: `Child ${childIndex} added ("${b.title.trim()}"). Add another child or commit the decomposition:\n` +
           `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/add-child -H 'Content-Type: application/json' -d '{...}'\n` +
           `  curl -s -X POST http://127.0.0.1:18800/tasks/${taskId}/decompose/commit -H 'Content-Type: application/json' -d '{"approach": "your strategy"}'`,
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/decompose/checkpoint — set checkpoint children
+function handleDecomposeCheckpoint(): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const pending = pendingDecompositions.get(taskId);
+    if (!pending) {
+      return {
+        status: 409,
+        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call POST /tasks/${taskId}/decompose/start first.` },
+      };
+    }
+
+    const b = body as { indices?: number[] };
+    const indices = b.indices ?? [];
+    for (const idx of indices) {
+      if (!Number.isInteger(idx) || idx < 0 || idx >= pending.children.length) {
+        return {
+          status: 400,
+          body: { error: "invalid_index", message: `Child index ${idx} is out of range (0-${pending.children.length - 1})` },
+        };
+      }
+    }
+
+    pending.checkpointIndices = indices;
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        checkpointIndices: indices,
+        children: pending.children.map((c, i) => ({
+          index: i,
+          title: c.title,
+          isCheckpoint: indices.includes(i),
+        })),
       },
     };
   };
@@ -2259,6 +2303,11 @@ function handleDecomposeCommit(
       });
     }
 
+    // Map checkpoint indices to child task IDs
+    const checkpointTaskIds: string[] = (pending.checkpointIndices ?? [])
+      .map((idx) => childIdMap[idx])
+      .filter((id): id is string => id !== undefined);
+
     // Submit DecompositionCreated
     const decomp: DecompositionCreated = {
       type: "DecompositionCreated",
@@ -2266,7 +2315,7 @@ function handleDecomposeCommit(
       fenceToken,
       version,
       children: childSpecs,
-      checkpoints: [],
+      checkpoints: checkpointTaskIds,
       completionRule: "and",
       agentContext: ctx,
     };
