@@ -1589,12 +1589,26 @@ async function cmdAnalyze(jsonMode: boolean): Promise<void> {
 
 async function cmdDecide(argv: string[], jsonMode: boolean): Promise<void> {
   requireAgentId();
-  const decision = argv[0]?.trim();
+  const { positionals, flags } = parseFlags(argv);
+  const decision = positionals[0]?.trim();
   if (decision !== "execute" && decision !== "decompose") {
-    throw new CliError("Usage: task decide <execute|decompose>", 1);
+    throw new CliError("Usage: task decide <execute|decompose> [--force]", 1);
   }
 
+  const force = getFlagBool(flags, "force");
   const taskId = currentTaskId();
+
+  if (!force) {
+    const journal = await apiRequest("GET", `/tasks/${taskId}/journal`);
+    const content = typeof journal["content"] === "string" ? journal["content"].trim() : "";
+    if (content.length === 0) {
+      throw new CliError(
+        "Cannot proceed: no analysis found. Submit your analysis first:\n  task journal \"your analysis here\"\n\nUse --force to bypass this check.",
+        1,
+      );
+    }
+  }
+
   const status = decision === "execute" ? "execute" : "decompose";
   const response = await apiRequest("POST", `/tasks/${taskId}/status`, { status });
 
