@@ -456,6 +456,269 @@ function getNumber(obj: Record<string, unknown>, key: string, fallback = 0): num
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours < 24) return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return remainingHours > 0 ? `${days}d ${remainingHours}h` : `${days}d`;
+}
+
+function phaseGuidance(phase: string, condition: string): string[] {
+  const state = `${phase}.${condition}`;
+  switch (state) {
+    case "analysis.ready":
+      return ["Claim and analyze the task:", "  task claim <id>"];
+    case "analysis.active":
+      return [
+        "You're analyzing this task. Next steps:",
+        "  task decide execute       # ready to implement",
+        "  task decide decompose     # break into subtasks",
+        "  task block <reason>       # can't proceed",
+      ];
+    case "execution.ready":
+      return ["Claim and start working:", "  task claim <id>"];
+    case "execution.active":
+      return [
+        "You're executing this task. Next steps:",
+        "  task submit <evidence>    # done, send for review",
+        "  task complete <evidence>  # done, no review needed",
+        "  task block <reason>       # stuck",
+        "  task update <message>     # log progress",
+        "  task cost <amount>        # report cost",
+      ];
+    case "review.ready":
+      return ["Claim to start reviewing:", "  task claim <id>"];
+    case "review.active":
+      return [
+        "You're reviewing this task. Next steps:",
+        "  task review read          # read review materials",
+        "  task review approve       # approve",
+        "  task review reject        # reject",
+        "  task review request-changes <notes>  # request changes",
+      ];
+    case "decomposition.ready":
+      return ["Claim to decompose:", "  task claim <id>"];
+    case "decomposition.active":
+      return [
+        "You're decomposing this task. Next steps:",
+        "  task decompose start      # begin decomposition",
+        "  task decompose add <...>  # add a child task",
+        "  task decompose commit     # finalize children",
+        "  task decompose cancel     # cancel decomposition",
+      ];
+    default:
+      return [`State: ${state}`];
+  }
+}
+
+async function cmdHome(jsonMode: boolean): Promise<void> {
+  const agentId = process.env["TASKCORE_AGENT_ID"]?.trim();
+
+  // --- Try to find active task ---
+  let activeContext: TaskContext | null = null;
+
+  // 1. .task file in cwd
+  const { context: cwdContext } = readTaskContext();
+  if (cwdContext) activeContext = cwdContext;
+
+  // 2. Active task file
+  if (!activeContext && agentId) {
+    activeContext = readActiveTask(agentId);
+  }
+
+  if (activeContext) {
+    // Fetch live state from daemon
+    let task: Record<string, unknown> | null = null;
+    try {
+      task = await getTask(activeContext.taskId);
+    } catch {
+      // daemon unreachable or task gone — show what we have from the file
+    }
+
+    const taskId = activeContext.taskId;
+    const title = task ? getString(task, "title", "(untitled)") : "(unknown)";
+    const phase = task ? getString(task, "phase", activeContext.phase ?? "unknown") : (activeContext.phase ?? "unknown");
+    const condition = task ? getString(task, "condition", getString(task, "terminal", "unknown")) : "active";
+    const terminal = task ? getString(task, "terminal", "") : "";
+    const elapsed = formatDuration(Date.now() - activeContext.claimedAt);
+
+    if (jsonMode) {
+      const result: Record<string, unknown> = {
+        mode: "active",
+        taskId,
+        title,
+        phase,
+        condition,
+        terminal: terminal || undefined,
+        fenceToken: activeContext.fenceToken,
+        sessionId: activeContext.sessionId,
+        elapsed,
+        journalPath: activeContext.journalPath,
+        codeWorktree: activeContext.codeWorktree,
+      };
+      if (task) result["task"] = task;
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      return;
+    }
+
+    process.stdout.write(`\n  Active Task: T${taskId} — ${title}\n`);
+    process.stdout.write(`  Phase:       ${phase}.${terminal || condition}\n`);
+    process.stdout.write(`  Claimed:     ${elapsed} ago (fence ${activeContext.fenceToken})\n`);
+    if (activeContext.codeWorktree) {
+      process.stdout.write(`  Worktree:    ${activeContext.codeWorktree}\n`);
+    }
+    if (activeContext.journalPath) {
+      process.stdout.write(`  Journal:     ${activeContext.journalPath}\n`);
+    }
+    if (agentId) {
+      process.stdout.write(`  Agent:       ${agentId}\n`);
+    }
+
+    // Show review notes if any
+    if (activeContext.reviewNotes && activeContext.reviewNotes.length > 0) {
+      process.stdout.write(`\n  Review Notes:\n`);
+      for (const note of activeContext.reviewNotes) {
+        process.stdout.write(`    - ${note}\n`);
+      }
+    }
+
+    // Show description snippet if available
+    if (task) {
+      const desc = getString(task, "description", "");
+      if (desc) {
+        const lines = desc.split("\n").slice(0, 3);
+        process.stdout.write(`\n  Description:\n`);
+        for (const line of lines) {
+          process.stdout.write(`    ${line}\n`);
+        }
+        if (desc.split("\n").length > 3) {
+          process.stdout.write(`    ...\n`);
+        }
+      }
+
+      // Show cost if available
+      const costObj = asRecord(task["cost"]);
+      if (costObj) {
+        const allocated = asNumber(costObj["allocated"]);
+        const consumed = asNumber(costObj["consumed"]);
+        if (allocated !== null) {
+          const remaining = (allocated ?? 0) - (consumed ?? 0);
+          process.stdout.write(`\n  Budget: ${formatMoney(consumed)} / ${formatMoney(allocated)} (${formatMoney(remaining)} remaining)\n`);
+        }
+      }
+    }
+
+    // Phase-specific guidance
+    if (!terminal) {
+      const guidance = phaseGuidance(phase, condition);
+      process.stdout.write("\n");
+      for (const line of guidance) {
+        process.stdout.write(`  ${line}\n`);
+      }
+    } else {
+      process.stdout.write(`\n  Task is terminal (${terminal}). No active work.\n`);
+      process.stdout.write(`  Run: task release   # to clear active context\n`);
+    }
+
+    process.stdout.write("\n");
+    return;
+  }
+
+  // --- No active task: show available work ---
+  const role = agentId ? agentRole(agentId) : null;
+
+  let tasks: Record<string, unknown>[] = [];
+  try {
+    const body = await apiRequest("GET", "/tasks?full=true");
+    tasks = asArray<unknown>(body["tasks"])
+      .map((t) => toTaskListEntry(t))
+      .filter((t): t is Record<string, unknown> => t !== null);
+  } catch (err) {
+    if (jsonMode) {
+      process.stdout.write(JSON.stringify({ mode: "idle", error: String(err) }, null, 2) + "\n");
+    } else {
+      process.stdout.write(`\n  No active task.${agentId ? ` (agent: ${agentId})` : ""}\n`);
+      process.stdout.write(`  Cannot reach daemon: ${String(err)}\n\n`);
+    }
+    return;
+  }
+
+  // Filter to claimable tasks (*.ready, not terminal)
+  const claimable = tasks
+    .filter((t) => {
+      const terminal = getString(t, "terminal", "");
+      if (terminal) return false;
+      const condition = getString(t, "condition", "");
+      return condition === "ready";
+    })
+    .filter((t) => {
+      // If agent has a role, prefer tasks assigned to that role (but show all)
+      return true;
+    })
+    .sort((a, b) => {
+      const metaA = asRecord(a["metadata"]) ?? {};
+      const metaB = asRecord(b["metadata"]) ?? {};
+      // Tasks assigned to my role come first
+      if (role) {
+        const aMatch = getString(metaA, "assignee") === role ? 0 : 1;
+        const bMatch = getString(metaB, "assignee") === role ? 0 : 1;
+        if (aMatch !== bMatch) return aMatch - bMatch;
+      }
+      // Then by priority
+      const pa = priorityRank(getString(metaA, "priority", "medium"));
+      const pb = priorityRank(getString(metaB, "priority", "medium"));
+      if (pa !== pb) return pa - pb;
+      return getNumber(b, "updatedAt") - getNumber(a, "updatedAt");
+    });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({
+      mode: "idle",
+      agentId: agentId || null,
+      role: role || null,
+      available: claimable.length,
+      tasks: claimable.slice(0, 10),
+    }, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`\n  No active task.${agentId ? ` (agent: ${agentId})` : ""}\n`);
+
+  if (claimable.length === 0) {
+    process.stdout.write("  No tasks available to claim.\n\n");
+    return;
+  }
+
+  // Show up to 10 claimable tasks
+  const shown = claimable.slice(0, 10);
+  process.stdout.write(`\n  Available tasks (${claimable.length} total):\n\n`);
+
+  const rows: string[][] = [];
+  for (const t of shown) {
+    const id = getString(t, "id");
+    const title = getString(t, "title", "(untitled)");
+    const phase = getString(t, "phase", "?");
+    const meta = asRecord(t["metadata"]) ?? {};
+    const priority = getString(meta, "priority", "medium");
+    const assignee = getString(meta, "assignee", "");
+    const roleTag = role && assignee === role ? " *" : "";
+    rows.push([`  T${id}`, `[${priority}]`, `${phase}`, `${title}${roleTag}`]);
+  }
+  printTable(rows);
+
+  if (claimable.length > 10) {
+    process.stdout.write(`  ... and ${claimable.length - 10} more\n`);
+  }
+
+  process.stdout.write(`\n  Claim a task:  task claim <id>\n\n`);
+}
+
 function printHelp(): void {
   const text = [
     "task CLI",
@@ -2058,7 +2321,12 @@ async function run(argv: string[]): Promise<void> {
   const command = args[0];
   const rest = args.slice(1);
 
-  if (!command || command === "help" || command === "--help" || command === "-h") {
+  if (!command) {
+    await cmdHome(jsonMode);
+    return;
+  }
+
+  if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
     return;
   }
