@@ -1223,6 +1223,9 @@ async function cmdCreate(argv: string[], jsonMode: boolean): Promise<void> {
   if (assignee) process.stdout.write(`Dispatcher will auto-assign to ${assignee}.\n`);
   if (dependsOn.length > 0) process.stdout.write(`Waiting on ${dependsOn.map((id) => `T${id}`).join(", ")} before starting.\n`);
   process.stdout.write(`Hint: task show ${taskId}\n`);
+  if (dependsOn.length === 0) {
+    process.stdout.write(`Depends on other tasks? Run: task metadata ${taskId} depends-on <task-ids>\n`);
+  }
 }
 
 async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
