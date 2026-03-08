@@ -235,37 +235,74 @@ function broadcastTransition(core: Core, event: Event): void {
   if (!STATUS_GROUP_CHAT_ID || !TELEGRAM_BOT_TOKEN) return;
   if (SILENT_EVENTS.has(event.type)) return;
 
-  const emoji = EVENT_EMOJI[event.type] || "📌";
   const task = core.getTask(event.taskId);
   const title = task ? task.title.slice(0, 60) : `T${event.taskId}`;
+  const tid = `T${event.taskId}`;
 
-  let detail = "";
+  let msg = "";
   switch (event.type) {
-    case "LeaseGranted":
-      detail = ` by ${(event as LeaseGranted).agentId}`;
+    case "TaskCreated":
+      msg = `📝 ${tid} created (${escapeHtml(title)})`;
       break;
-    case "LeaseReleased":
-      detail = ` (${(event as LeaseReleased).reason})`;
+    case "LeaseGranted": {
+      const lg = event as LeaseGranted;
+      const phase = task?.phase ?? lg.phase;
+      const verb = phase === "review" ? "will review" : phase === "analysis" ? "will analyze" : "claimed";
+      msg = `🤖 <b>${escapeHtml(lg.agentId)}</b> ${verb} ${tid} (${escapeHtml(title)})`;
       break;
+    }
+    case "LeaseReleased": {
+      const lr = event as LeaseReleased;
+      msg = `🔓 ${tid} released: ${escapeHtml(lr.reason)} (${escapeHtml(title)})`;
+      break;
+    }
     case "PhaseTransition": {
       const pt = event as PhaseTransition;
-      detail = ` → ${pt.to.phase}.${pt.to.condition}`;
+      msg = `➡️ ${tid} → ${pt.to.phase}.${pt.to.condition} (${escapeHtml(title)})`;
       break;
     }
-    case "TaskBlocked":
-      detail = `: ${(event as TaskBlocked).reason?.slice(0, 80) || ""}`;
-      break;
-    case "TaskFailed":
-      detail = `: ${(event as TaskFailed).reason?.slice(0, 80) || ""}`;
-      break;
     case "DecompositionCreated": {
       const dc = event as DecompositionCreated;
-      detail = ` → ${dc.children.length} children`;
+      msg = `🔀 ${tid} decomposed into ${dc.children.length} children (${escapeHtml(title)})`;
       break;
     }
+    case "ReviewVerdictSubmitted": {
+      const rv = event as ReviewVerdictSubmitted;
+      msg = `📋 ${tid} review: ${rv.verdict} by ${escapeHtml(rv.reviewer)} (${escapeHtml(title)})`;
+      break;
+    }
+    case "ReviewPolicyMet":
+      msg = `✅ ${tid} review passed (${escapeHtml(title)})`;
+      break;
+    case "TaskCompleted":
+      msg = `✅ ${tid} completed (${escapeHtml(title)})`;
+      break;
+    case "TaskFailed": {
+      const tf = event as TaskFailed;
+      msg = `❌ ${tid} failed: ${escapeHtml(tf.reason.slice(0, 80))} (${escapeHtml(title)})`;
+      break;
+    }
+    case "TaskExhausted":
+      msg = `💤 ${tid} exhausted budget (${escapeHtml(title)})`;
+      break;
+    case "TaskBlocked": {
+      const tb = event as TaskBlocked;
+      msg = `🚫 ${tid} blocked: ${escapeHtml(tb.reason.slice(0, 80))} (${escapeHtml(title)})`;
+      break;
+    }
+    case "TaskCanceled":
+      msg = `🗑️ ${tid} canceled (${escapeHtml(title)})`;
+      break;
+    case "TaskRevived":
+      msg = `🔄 ${tid} revived (${escapeHtml(title)})`;
+      break;
+    case "BudgetIncreased":
+      msg = `💰 ${tid} budget increased (${escapeHtml(title)})`;
+      break;
+    default:
+      msg = `📌 ${tid} ${event.type} (${escapeHtml(title)})`;
+      break;
   }
-
-  const msg = `${emoji} <b>${event.type}</b> T${event.taskId}: ${escapeHtml(title)}${escapeHtml(detail)}`;
 
   fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
