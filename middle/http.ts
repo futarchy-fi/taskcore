@@ -199,6 +199,122 @@ function daemonAgentContext(): AgentContext {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Status broadcast — sends to Status Updates (Bots) group on transitions
+// ---------------------------------------------------------------------------
+
+const STATUS_GROUP_CHAT_ID = process.env["STATUS_GROUP_CHAT_ID"] || "";
+
+const EVENT_EMOJI: Record<string, string> = {
+  TaskCreated: "📝",
+  LeaseGranted: "🤖",
+  LeaseReleased: "🔓",
+  PhaseTransition: "➡️",
+  DecompositionCreated: "🔀",
+  ReviewVerdictSubmitted: "📋",
+  ReviewPolicyMet: "✅",
+  TaskCompleted: "✅",
+  TaskFailed: "❌",
+  TaskExhausted: "💤",
+  TaskBlocked: "🚫",
+  TaskCanceled: "🗑️",
+  TaskRevived: "🔄",
+  BudgetIncreased: "💰",
+};
+
+// Events that are too noisy or internal to broadcast
+const SILENT_EVENTS = new Set([
+  "LeaseExpired", "LeaseExtended", "AgentStarted", "AgentExited",
+  "CostReported", "WaitRequested", "WaitResolved", "DependencySatisfied",
+  "RetryScheduled", "BackoffExpired", "ChildCostRecovered",
+  "CheckpointTriggered", "CheckpointCreated", "StateReverted",
+  "MetadataUpdated", "TaskReparented",
+]);
+
+function broadcastTransition(core: Core, event: Event): void {
+  if (!STATUS_GROUP_CHAT_ID || !TELEGRAM_BOT_TOKEN) return;
+  if (SILENT_EVENTS.has(event.type)) return;
+
+  const task = core.getTask(event.taskId);
+  const title = task ? task.title.slice(0, 60) : `T${event.taskId}`;
+  const tid = `T${event.taskId}`;
+
+  let msg = "";
+  switch (event.type) {
+    case "TaskCreated":
+      msg = `📝 ${tid} created (${escapeHtml(title)})`;
+      break;
+    case "LeaseGranted": {
+      const lg = event as LeaseGranted;
+      const phase = task?.phase ?? lg.phase;
+      const verb = phase === "review" ? "will review" : phase === "analysis" ? "will analyze" : "claimed";
+      msg = `🤖 <b>${escapeHtml(lg.agentId)}</b> ${verb} ${tid} (${escapeHtml(title)})`;
+      break;
+    }
+    case "LeaseReleased": {
+      const lr = event as LeaseReleased;
+      msg = `🔓 ${tid} released: ${escapeHtml(lr.reason)} (${escapeHtml(title)})`;
+      break;
+    }
+    case "PhaseTransition": {
+      const pt = event as PhaseTransition;
+      msg = `➡️ ${tid} → ${pt.to.phase}.${pt.to.condition} (${escapeHtml(title)})`;
+      break;
+    }
+    case "DecompositionCreated": {
+      const dc = event as DecompositionCreated;
+      msg = `🔀 ${tid} decomposed into ${dc.children.length} children (${escapeHtml(title)})`;
+      break;
+    }
+    case "ReviewVerdictSubmitted": {
+      const rv = event as ReviewVerdictSubmitted;
+      msg = `📋 ${tid} review: ${rv.verdict} by ${escapeHtml(rv.reviewer)} (${escapeHtml(title)})`;
+      break;
+    }
+    case "ReviewPolicyMet":
+      msg = `✅ ${tid} review passed (${escapeHtml(title)})`;
+      break;
+    case "TaskCompleted":
+      msg = `✅ ${tid} completed (${escapeHtml(title)})`;
+      break;
+    case "TaskFailed": {
+      const tf = event as TaskFailed;
+      msg = `❌ ${tid} failed: ${escapeHtml(tf.reason.slice(0, 80))} (${escapeHtml(title)})`;
+      break;
+    }
+    case "TaskExhausted":
+      msg = `💤 ${tid} exhausted budget (${escapeHtml(title)})`;
+      break;
+    case "TaskBlocked": {
+      const tb = event as TaskBlocked;
+      msg = `🚫 ${tid} blocked: ${escapeHtml(tb.reason.slice(0, 80))} (${escapeHtml(title)})`;
+      break;
+    }
+    case "TaskCanceled":
+      msg = `🗑️ ${tid} canceled (${escapeHtml(title)})`;
+      break;
+    case "TaskRevived":
+      msg = `🔄 ${tid} revived (${escapeHtml(title)})`;
+      break;
+    case "BudgetIncreased":
+      msg = `💰 ${tid} budget increased (${escapeHtml(title)})`;
+      break;
+    default:
+      msg = `📌 ${tid} ${event.type} (${escapeHtml(title)})`;
+      break;
+  }
+
+  fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: STATUS_GROUP_CHAT_ID, text: msg, parse_mode: "HTML" }),
+  }).catch(() => {});
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function submitOrError(core: Core, event: Event): RouteResult | null {
   const result = core.submit(event);
   if (!result.ok) {
@@ -207,6 +323,7 @@ function submitOrError(core: Core, event: Event): RouteResult | null {
       body: { error: result.error.code, message: result.error.message },
     };
   }
+  broadcastTransition(core, event);
   return null;
 }
 
