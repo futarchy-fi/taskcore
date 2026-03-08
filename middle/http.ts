@@ -2093,12 +2093,12 @@ function handleDecomposeCommit(
     let err = submitOrError(core, decomp);
     if (err) { pendingDecompositions.delete(taskId); return err; }
 
-    // Transition parent to review.waiting
+    // Transition parent to analysis.waiting (blocked on children)
     const waitTransition: PhaseTransition = {
       type: "PhaseTransition",
       taskId, ts: now + 4,
       from: { phase: "decomposition", condition: "active" },
-      to: { phase: "review", condition: "waiting" },
+      to: { phase: "analysis", condition: "waiting" },
       reasonCode: "children_created",
       reason: `Decomposed into ${pending.children.length} subtasks`,
       fenceToken,
@@ -2118,7 +2118,7 @@ function handleDecomposeCommit(
         taskId,
         children: childSpecs.map(c => ({ id: c.taskId, title: c.title, costAllocation: c.costAllocation })),
         decompositionVersion: version,
-        transition: "→ review.waiting",
+        transition: "→ analysis.waiting",
       },
     };
   };
@@ -2328,12 +2328,12 @@ function handleDecompose(
     let err = submitOrError(core, decomp);
     if (err) return err;
 
-    // Transition parent to review.waiting (waits for children to complete)
+    // Transition parent to analysis.waiting (blocked on children)
     const waitTransition: PhaseTransition = {
       type: "PhaseTransition",
       taskId, ts: now + 4,
       from: { phase: "decomposition", condition: "active" },
-      to: { phase: "review", condition: "waiting" },
+      to: { phase: "analysis", condition: "waiting" },
       reasonCode: "children_created",
       reason: `Decomposed into ${b.children.length} subtasks`,
       fenceToken,
@@ -2350,7 +2350,7 @@ function handleDecompose(
         taskId,
         children: childSpecs.map(c => ({ id: c.taskId, title: c.title, costAllocation: c.costAllocation })),
         decompositionVersion: version,
-        transition: "→ review.waiting",
+        transition: "→ analysis.waiting",
       },
     };
   };

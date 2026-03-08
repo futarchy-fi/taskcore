@@ -334,7 +334,7 @@ test("Scenario B: decomposition -> children complete -> integration review -> do
         modelId: "gpt-5",
       },
     },
-    transition("T200", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-200"),
+    transition("T200", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-200"),
 
     lease("T201", 9, 1, "execution", "coder", "e-201"),
     exited("T201", 11, 1, "coder", "e-201", 2),
@@ -381,10 +381,12 @@ test("Scenario B: decomposition -> children complete -> integration review -> do
   );
 
   const suffix: Event[] = [
-    lease("T200", 32, 3, "review", "reviewer", "r-200"),
-    reviewVerdict("T200", 34, 3, "reviewer", "r-200", "approve"),
-    reviewPolicy("T200", 35, "approved"),
-    complete("T200", 36),
+    lease("T200", 32, 3, "analysis", "analyst", "a-200"),
+    transition("T200", 33, "analysis", "active", "review", "ready", "work_complete", 3, "analyst", "a-200"),
+    lease("T200", 34, 4, "review", "reviewer", "r-200"),
+    reviewVerdict("T200", 36, 4, "reviewer", "r-200", "approve"),
+    reviewPolicy("T200", 37, "approved"),
+    complete("T200", 38),
   ];
 
   for (const event of suffix) {
@@ -440,7 +442,7 @@ test("Scenario C: cost conservation across tree", () => {
         modelId: "gpt-5",
       },
     },
-    transition("T300", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-300"),
+    transition("T300", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-300"),
 
     lease("T301", 9, 1, "execution", "coder", "e-301"),
     exited("T301", 11, 1, "coder", "e-301", 3),
@@ -524,7 +526,7 @@ test("Scenario D: checkpoint triggers parent re-analysis", () => {
         modelId: "gpt-5",
       },
     },
-    transition("T400", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-400"),
+    transition("T400", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-400"),
 
     lease("T401", 9, 1, "execution", "coder", "e-401"),
     exited("T401", 11, 1, "coder", "e-401", 2),
@@ -552,7 +554,7 @@ test("Scenario D: checkpoint triggers parent re-analysis", () => {
     lease("T400", 20, 3, "analysis", "analyst", "a-401"),
     transition("T400", 22, "analysis", "active", "decomposition", "ready", "decision_decompose", 3, "analyst", "a-401"),
     lease("T400", 23, 4, "decomposition", "decomposer", "d-401"),
-    transition("T400", 25, "decomposition", "active", "review", "waiting", "children_created", 4, "decomposer", "d-401"),
+    transition("T400", 25, "decomposition", "active", "analysis", "waiting", "children_created", 4, "decomposer", "d-401"),
 
     lease("T402", 26, 1, "execution", "coder", "e-402"),
     exited("T402", 28, 1, "coder", "e-402", 2),
@@ -576,10 +578,12 @@ test("Scenario D: checkpoint triggers parent re-analysis", () => {
     state = mustReduce(state, event);
   }
 
-  state = mustReduce(state, lease("T400", 31, 5, "review", "reviewer", "r-400"));
-  state = mustReduce(state, reviewVerdict("T400", 33, 5, "reviewer", "r-400", "approve"));
-  state = mustReduce(state, reviewPolicy("T400", 34, "approved"));
-  state = mustReduce(state, complete("T400", 35));
+  state = mustReduce(state, lease("T400", 31, 5, "analysis", "analyst", "a-402"));
+  state = mustReduce(state, transition("T400", 32, "analysis", "active", "review", "ready", "work_complete", 5, "analyst", "a-402"));
+  state = mustReduce(state, lease("T400", 33, 6, "review", "reviewer", "r-400"));
+  state = mustReduce(state, reviewVerdict("T400", 35, 6, "reviewer", "r-400", "approve"));
+  state = mustReduce(state, reviewPolicy("T400", 36, "approved"));
+  state = mustReduce(state, complete("T400", 37));
 
   assert.equal(state.tasks.T400?.terminal, "done");
   assert.ok((state.tasks.T400?.attempts.analysis.used ?? 0) >= 2);
@@ -624,7 +628,7 @@ test("Scenario E: execution -> too_complex -> re-analysis -> decompose", () => {
         modelId: "gpt-5",
       },
     },
-    transition("T500", 14, "decomposition", "active", "review", "waiting", "children_created", 4, "decomposer", "d-500"),
+    transition("T500", 14, "decomposition", "active", "analysis", "waiting", "children_created", 4, "decomposer", "d-500"),
 
     lease("T501", 15, 1, "execution", "coder", "e-501"),
     exited("T501", 17, 1, "coder", "e-501", 1),
@@ -634,8 +638,8 @@ test("Scenario E: execution -> too_complex -> re-analysis -> decompose", () => {
       type: "PhaseTransition",
       taskId: "T500",
       ts: 19,
-      from: { phase: "review", condition: "waiting" },
-      to: { phase: "review", condition: "ready" },
+      from: { phase: "analysis", condition: "waiting" },
+      to: { phase: "analysis", condition: "ready" },
       reasonCode: "children_complete",
       reason: "All children reached terminal state",
       fenceToken: 4,
@@ -647,7 +651,9 @@ test("Scenario E: execution -> too_complex -> re-analysis -> decompose", () => {
         modelId: "core",
       },
     },
-    complete("T500", 20),
+    lease("T500", 20, 5, "analysis", "analyst", "a-502"),
+    transition("T500", 21, "analysis", "active", "review", "ready", "work_complete", 5, "analyst", "a-502"),
+    complete("T500", 22),
   ];
 
   const state = mustReplay(events);
@@ -1011,7 +1017,7 @@ test("Scenario M: ChildCostRecovered auto-emission and single-shot recovery", ()
         modelId: "gpt-5",
       },
     },
-    transition("T1200", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-1200"),
+    transition("T1200", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-1200"),
 
     lease("T1201", 9, 1, "execution", "coder", "e-1201"),
     exited("T1201", 11, 1, "coder", "e-1201", 10),
@@ -1188,7 +1194,7 @@ test("Scenario O: all children failed routes parent back to analysis", () => {
         modelId: "gpt-5",
       },
     },
-    transition("T1400", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-1400"),
+    transition("T1400", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-1400"),
     {
       type: "TaskFailed",
       taskId: "T1401",
@@ -1279,7 +1285,7 @@ test("Scenario P: checkpoint trigger does not double-charge analysis attempts", 
         modelId: "gpt-5",
       },
     },
-    transition("T1500", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-1500"),
+    transition("T1500", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-1500"),
     complete("T1501", 9),
   ];
 
@@ -1914,7 +1920,7 @@ test("Scenario AB: mixed child terminals (done + failed) still produce children_
         modelId: "gpt-5",
       },
     },
-    transition("T2700", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-2700"),
+    transition("T2700", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-2700"),
     complete("T2701", 9),
     {
       type: "TaskFailed",
@@ -1945,7 +1951,7 @@ test("Scenario AB: mixed child terminals (done + failed) still produce children_
     state = mustReduce(state, event);
   }
 
-  assert.equal(state.tasks.T2700?.phase, "review");
+  assert.equal(state.tasks.T2700?.phase, "analysis");
   assert.equal(state.tasks.T2700?.condition, "ready");
 });
 
@@ -1989,7 +1995,7 @@ test("Scenario AC: all children canceled emits children_all_failed", () => {
         modelId: "gpt-5",
       },
     },
-    transition("T2800", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-2800"),
+    transition("T2800", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-2800"),
     {
       type: "TaskCanceled",
       taskId: "T2801",
@@ -2288,7 +2294,7 @@ test("Scenario AG: submit invariant error is returned and invalid event is not p
   }
 });
 
-test("Scenario AH: review.waiting with all terminal children passes invariants before tick", () => {
+test("Scenario AH: analysis.waiting with all terminal children passes invariants before tick", () => {
   const events: Event[] = [
     createTask("T3300", 1, { costBudget: 80 }),
     lease("T3300", 2, 1, "analysis", "analyst", "a-3300"),
@@ -2328,13 +2334,13 @@ test("Scenario AH: review.waiting with all terminal children passes invariants b
         modelId: "gpt-5",
       },
     },
-    transition("T3300", 8, "decomposition", "active", "review", "waiting", "children_created", 2, "decomposer", "d-3300"),
+    transition("T3300", 8, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-3300"),
     complete("T3301", 9),
     complete("T3302", 10),
   ];
 
   const state = mustReplay(events);
-  assert.equal(state.tasks.T3300?.phase, "review");
+  assert.equal(state.tasks.T3300?.phase, "analysis");
   assert.equal(state.tasks.T3300?.condition, "waiting");
   assert.equal(state.tasks.T3301?.terminal, "done");
   assert.equal(state.tasks.T3302?.terminal, "done");
