@@ -92,7 +92,6 @@ async function setup(): Promise<void> {
     journalRepoPath,
     worktreeBaseDir,
     runtimeFile: "",
-    lifecycleFile: "",
   };
 
   server = createHttpServer(core, config);

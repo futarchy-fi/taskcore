@@ -51,9 +51,8 @@ The verified state machine. 45 tests across unit, integration, scenario, and pro
 
 The bridge between the pure core and the real world.
 
-- **daemon.ts** — Entry point: lock file, core init, tick loop (2s), dispatch loop (10s), graceful shutdown
+- **daemon.ts** — Entry point: lock file, core init, tick loop (2s), graceful shutdown
 - **http.ts** — HTTP API on `127.0.0.1:18800` with status-update translation
-- **dispatcher.ts** — Priority-sorted dispatch, agent spawn, exit handling with exponential backoff
 - **analysis.ts** — Auto-analysis: tasks with an assignee skip straight to execution
 - **prompt.ts** — Prompt builder for work and review modes
 - **mcp-bridge.ts** — MCP stdio server (JSON-RPC 2.0) for agents that use MCP tools
@@ -161,11 +160,8 @@ curl http://127.0.0.1:18800/tasks/1
 | `ORCHESTRATOR_DB` | `$WORKSPACE/data/taskcore.db` | SQLite database path |
 | `AGENT_REGISTRY` | `$WORKSPACE/agents/registry.json` | Agent registry path |
 | `WORKSPACE_DIR` | `~/.openclaw/workspace` | Workspace root |
-| `MAX_CONCURRENT` | 1 | Max concurrent agent dispatches |
 | `TICK_INTERVAL_MS` | 2000 | Core tick interval (auto-events) |
-| `DISPATCH_INTERVAL_MS` | 10000 | Dispatch loop interval |
 | `LEASE_TIMEOUT_MS` | 600000 | Default agent lease timeout |
-| `AGENT_TIMEOUT_MS` | 600000 | Max agent runtime before SIGKILL |
 
 ### Migration from tasks.json
 
