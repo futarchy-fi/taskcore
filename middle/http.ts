@@ -33,7 +33,7 @@ import type {
 import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
 import type { Config } from "./config.js";
 import { buildPrompt } from "./prompt.js";
-import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent, taskBranch } from "./journal.js";
+import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent, mergeTaskBranch, taskBranch } from "./journal.js";
 import { agentRole, loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
 import { createWorktree, getWorktreePath } from "./worktree.js";
 
@@ -374,8 +374,12 @@ function ensureTaskWorkspaces(config: Config, task: Task): {
   if (targetRepo) {
     try {
       const cPath = getWorktreePath(config.worktreeBaseDir, task.id, "code");
-      const baseBranch = (task.metadata["base_branch"] as string | undefined) ?? "main";
       const codeBranch = `task/T${task.id}`;
+      // Child tasks inherit parent's code branch; root tasks fork from base_branch/main
+      const parentCodeBranch = task.parentId ? `task/T${task.parentId}` : null;
+      const baseBranch = parentCodeBranch
+        ?? (task.metadata["base_branch"] as string | undefined)
+        ?? "main";
       if (!fs.existsSync(cPath)) {
         createWorktree(targetRepo, cPath, codeBranch, baseBranch);
       }
@@ -568,7 +572,7 @@ function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[]
     { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
     { method: "POST", pattern: "/tasks/:id/claim", handler: handleClaimTask(core, config) },
     { method: "POST", pattern: "/tasks/:id/release", handler: handleReleaseTask(core) },
-    { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core) },
+    { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core, config) },
     { method: "POST", pattern: "/tasks/:id/reparent", handler: handleReparent(core) },
     { method: "POST", pattern: "/tasks/:id/revive", handler: handleRevive(core) },
     { method: "POST", pattern: "/tasks/:id/budget", handler: handleBudgetIncrease(core) },
@@ -1246,6 +1250,7 @@ function handleSubmitEvent(
 // POST /tasks/:id/status — agent-friendly status update
 function handleStatusUpdate(
   core: Core,
+  config: Config,
 ): RouteDef["handler"] {
   return async (_req, params, body) => {
     const taskId = params["id"]!;
@@ -1268,7 +1273,7 @@ function handleStatusUpdate(
         return applyReviewTransition(core, task, fenceToken, ctx, now, b.evidence);
 
       case "done":
-        return applyDoneTransition(core, task, fenceToken, ctx, now, b.evidence, b.stateRef);
+        return applyDoneTransition(core, config, task, fenceToken, ctx, now, b.evidence, b.stateRef);
 
       case "reject":
         return applyRejectTransition(core, task, fenceToken, ctx, now, b.evidence);
@@ -1574,8 +1579,20 @@ function notifyInformed(task: Task, event: string, detail?: string): void {
   }
 }
 
+function mergeCodeBranch(config: Config, task: Task): void {
+  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
+  if (!targetRepo) return;
+  const parentId = task.parentId ?? (task.metadata["parentId"] as string | undefined) ?? null;
+  try {
+    mergeTaskBranch(targetRepo, task.id, parentId);
+  } catch (err) {
+    console.warn(`[http] T${task.id} code branch merge failed (non-fatal):`, err);
+  }
+}
+
 function applyDoneTransition(
   core: Core,
+  config: Config,
   task: Task,
   fenceToken: number,
   ctx: AgentContext,
@@ -1594,6 +1611,7 @@ function applyDoneTransition(
     if (err) return err;
 
     notifyInformed(task, "✅ Done");
+    mergeCodeBranch(config, task);
 
     return {
       status: 200,
@@ -1651,6 +1669,7 @@ function applyDoneTransition(
   if (err) return err;
 
   notifyInformed(task, "✅ Done");
+  mergeCodeBranch(config, task);
 
   return {
     status: 200,

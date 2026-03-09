@@ -553,10 +553,21 @@ function applyAutoDetectedStatus(
 
     // Merge journal branch on completion
     try {
-      const parentId = (task.metadata["parentId"] as string) ?? null;
+      const parentId = task.parentId ?? (task.metadata["parentId"] as string) ?? null;
       mergeTaskBranch(config.journalRepoPath, task.id, parentId);
     } catch (err) {
       console.warn(`[dispatcher] T${task.id} journal merge failed (non-fatal):`, err);
+    }
+
+    // Merge code branch on completion (child → parent, or task → main)
+    const codeRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
+    if (codeRepo) {
+      try {
+        const parentId = task.parentId ?? (task.metadata["parentId"] as string) ?? null;
+        mergeTaskBranch(codeRepo, task.id, parentId);
+      } catch (err) {
+        console.warn(`[dispatcher] T${task.id} code branch merge failed (non-fatal):`, err);
+      }
     }
 
     pushDigest(config, { emoji: "✅", taskId: task.id, title: task.title.slice(0, 60), detail: "" });
@@ -758,7 +769,11 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
       const targetRepo = task.metadata["repo"] as string | undefined;
       if (targetRepo) {
         const cPath = getWorktreePath(config.worktreeBaseDir, task.id, "code");
-        const baseBranch = (task.metadata["base_branch"] as string) ?? "main";
+        // Child tasks inherit parent's code branch; root tasks fork from base_branch/main
+        const parentCodeBranch = task.parentId ? `task/T${task.parentId}` : null;
+        const baseBranch = parentCodeBranch
+          ?? (task.metadata["base_branch"] as string)
+          ?? "main";
         const codeBranch = `task/T${task.id}`;
         try {
           createWorktree(targetRepo, cPath, codeBranch, baseBranch);

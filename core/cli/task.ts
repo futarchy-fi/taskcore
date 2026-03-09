@@ -585,6 +585,15 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
       return;
     }
 
+    // If the task is in a state where it can't be reclaimed (waiting for children,
+    // or already terminal), clear the stale active file and fall through to show
+    // available work instead of showing a dead-end "Active Task" display.
+    if (condition === "waiting" && agentId) {
+      clearActiveTask(agentId);
+      clearTaskContextFile();
+      // Fall through to "no active task" / available work below
+    } else {
+
     // Detect lease expiry: active file exists but task is no longer active for us
     const leaseExpired = !terminal && condition !== "active" && activeContext.fenceToken > 0;
 
@@ -656,6 +665,7 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     if (agentId) clearActiveTask(agentId);
     clearTaskContextFile();
     // Fall through to show available work below
+    } // end else (non-waiting active task display)
   }
 
   // --- No active task: show available work ---
@@ -1995,6 +2005,9 @@ async function cmdDecompose(argv: string[], jsonMode: boolean): Promise<void> {
       for (const child of children) {
         process.stdout.write(`  T${getString(child, "id", "?")}: ${getString(child, "title", "(untitled)")}  ${formatMoney(child["costAllocation"])}\n`);
       }
+      // Parent task moves to waiting — clear active file so agent picks up new work
+      const decompAgentId = process.env["TASKCORE_AGENT_ID"];
+      if (decompAgentId) clearActiveTask(decompAgentId);
       return;
     }
 
