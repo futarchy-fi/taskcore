@@ -432,6 +432,14 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     return validateTaskReparented(state, event, task);
   }
 
+  // CompletionVerificationRecorded — only on non-terminal tasks
+  if (event.type === "CompletionVerificationRecorded") {
+    if (task.terminal !== null) {
+      return mkError(event, "terminal_task", "CompletionVerificationRecorded not allowed on terminal tasks.");
+    }
+    return null;
+  }
+
   // MetadataUpdated bypasses terminal check — metadata is informational
   if (event.type === "MetadataUpdated") {
     return validateMetadataUpdated(event);

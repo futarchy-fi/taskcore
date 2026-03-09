@@ -7,6 +7,7 @@ import type {
   AgentContext,
   AttemptBudgetMaxInput,
   BudgetIncreased,
+  CompletionVerificationRecorded,
   DecompositionChildSpec,
   DecompositionCreated,
   Dependency,
@@ -36,6 +37,7 @@ import { buildPrompt } from "./prompt.js";
 import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent, mergeTaskBranch, taskBranch } from "./journal.js";
 import { agentRole, loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
 import { createWorktree, getWorktreePath } from "./worktree.js";
+import { verifyArtifacts } from "./finalize.js";
 
 // ---------------------------------------------------------------------------
 // Auto-incident emitter
@@ -1688,10 +1690,32 @@ function applyDoneTransition(
   stateRef?: StateRef,
 ): RouteResult {
   if (task.phase === "execution" && task.condition === "active" && task.reviewConfig === null) {
+    // Verify artifacts before allowing completion
+    const verification = verifyArtifacts(task, config);
+    const verificationEvent: CompletionVerificationRecorded = {
+      type: "CompletionVerificationRecorded",
+      taskId: task.id,
+      ts,
+      verification,
+    };
+    submitOrError(core, verificationEvent);
+
+    if (!verification.passed) {
+      console.warn(`[http] T${task.id} completion verification failed: ${verification.reason}`);
+      return {
+        status: 422,
+        body: {
+          error: "verification_failed",
+          message: verification.reason,
+          verification,
+        },
+      };
+    }
+
     const completed: TaskCompleted = {
       type: "TaskCompleted",
       taskId: task.id,
-      ts,
+      ts: ts + 1,
       stateRef: stateRef ?? defaultStateRef(),
       source: { type: "agent", id: ctx.agentId },
     };
@@ -1703,7 +1727,7 @@ function applyDoneTransition(
 
     return {
       status: 200,
-      body: { ok: true, taskId: task.id, transition: "execution.active → done" },
+      body: { ok: true, taskId: task.id, transition: "execution.active → done", verification },
     };
   }
 
@@ -1713,6 +1737,28 @@ function applyDoneTransition(
       body: {
         error: "invalid_state",
         message: `Task must be in review.active for done (or execution.active without reviewer), got ${task.phase}.${task.condition}`,
+      },
+    };
+  }
+
+  // Verify artifacts before allowing completion (review path)
+  const verification = verifyArtifacts(task, config);
+  const verificationEvent: CompletionVerificationRecorded = {
+    type: "CompletionVerificationRecorded",
+    taskId: task.id,
+    ts,
+    verification,
+  };
+  submitOrError(core, verificationEvent);
+
+  if (!verification.passed) {
+    console.warn(`[http] T${task.id} completion verification failed: ${verification.reason}`);
+    return {
+      status: 422,
+      body: {
+        error: "verification_failed",
+        message: verification.reason,
+        verification,
       },
     };
   }

@@ -1,0 +1,10 @@
+{
+  "taskId": "1282",
+  "phase": "execution",
+  "fenceToken": 3,
+  "sessionId": "c893aa20-a7b7-4112-9cc3-68c12a747bf1",
+  "journalPath": "/tmp/taskcore-worktrees/journal-T1282/tasks/T1282/",
+  "codeWorktree": "/tmp/taskcore-worktrees/code-T1282",
+  "claimedAt": 1773098423616,
+  "reviewNotes": []
+}

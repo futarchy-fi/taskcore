@@ -127,6 +127,7 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
       contextIsolation: event.reviewConfig?.isolationRules ?? [],
       contextBudget: 0,
       waitState: null,
+      lastCompletionVerification: null,
       createdAt: event.ts,
       updatedAt: event.ts,
       metadata: event.metadata,
@@ -175,6 +176,7 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
     contextIsolation: event.reviewConfig?.isolationRules ?? [],
     contextBudget: 0,
     waitState: null,
+    lastCompletionVerification: null,
     createdAt: event.ts,
     updatedAt: event.ts,
     metadata: structuredClone(event.metadata),
@@ -231,6 +233,7 @@ function createChildTaskFromDecomposition(parent: Task, event: Extract<Event, { 
     contextIsolation: child.reviewConfig?.isolationRules ?? [],
     contextBudget: 0,
     waitState: null,
+    lastCompletionVerification: null,
     createdAt: event.ts,
     updatedAt: event.ts,
     metadata: structuredClone(child.metadata ?? {}),
@@ -744,6 +747,17 @@ function applyMetadataUpdated(state: SystemState, event: Extract<Event, { type: 
   state.tasks[t.id] = t;
 }
 
+function applyCompletionVerificationRecorded(
+  state: SystemState,
+  event: Extract<Event, { type: "CompletionVerificationRecorded" }>,
+  task: Task,
+): void {
+  const t = deepCloneTask(task);
+  t.lastCompletionVerification = structuredClone(event.verification);
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
 function applyTaskReparented(state: SystemState, event: Extract<Event, { type: "TaskReparented" }>, task: Task): void {
   const t = deepCloneTask(task);
 
@@ -890,6 +904,9 @@ function applyUnchecked(state: SystemState, event: Event): void {
       break;
     case "MetadataUpdated":
       applyMetadataUpdated(state, event, task);
+      break;
+    case "CompletionVerificationRecorded":
+      applyCompletionVerificationRecorded(state, event, task);
       break;
     default: {
       const neverEvent: never = event;
