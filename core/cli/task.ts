@@ -690,10 +690,16 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     .sort((a, b) => {
       const metaA = asRecord(a["metadata"]) ?? {};
       const metaB = asRecord(b["metadata"]) ?? {};
-      // Tasks assigned to my role come first
+      // Tasks assigned to my role come first (check both assignee and reviewer for review-phase tasks)
       if (role) {
-        const aMatch = getString(metaA, "assignee") === role ? 0 : 1;
-        const bMatch = getString(metaB, "assignee") === role ? 0 : 1;
+        const aAssignee = getString(metaA, "assignee");
+        const aReviewer = getString(metaA, "reviewer");
+        const aPhase = getString(a, "phase");
+        const aMatch = (aAssignee === role || (aPhase === "review" && aReviewer === role)) ? 0 : 1;
+        const bAssignee = getString(metaB, "assignee");
+        const bReviewer = getString(metaB, "reviewer");
+        const bPhase = getString(b, "phase");
+        const bMatch = (bAssignee === role || (bPhase === "review" && bReviewer === role)) ? 0 : 1;
         if (aMatch !== bMatch) return aMatch - bMatch;
       }
       // Then by priority
@@ -718,6 +724,8 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
 
   if (claimable.length === 0) {
     process.stdout.write("  No tasks available to claim.\n\n");
+    process.stdout.write("  Working on something? Start tracking:\n");
+    process.stdout.write("    task do \"what you're working on\"\n\n");
     return;
   }
 
@@ -733,7 +741,9 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     const meta = asRecord(t["metadata"]) ?? {};
     const priority = getString(meta, "priority", "medium");
     const assignee = getString(meta, "assignee", "");
-    const roleTag = role && assignee === role ? " *" : "";
+    const reviewer = getString(meta, "reviewer", "");
+    const isMatch = role && (assignee === role || (phase === "review" && reviewer === role));
+    const roleTag = isMatch ? " *" : "";
     rows.push([`  T${id}`, `[${priority}]`, `${phase}`, `${title}${roleTag}`]);
   }
   printTable(rows);
@@ -742,7 +752,8 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     process.stdout.write(`  ... and ${claimable.length - 10} more\n`);
   }
 
-  process.stdout.write(`\n  Claim a task:  task claim <id>\n\n`);
+  process.stdout.write(`\n  Claim a task:    task claim <id>\n`);
+  process.stdout.write(`  Start your own:  task do "title"\n\n`);
 }
 
 function printHelp(): void {
@@ -754,6 +765,8 @@ function printHelp(): void {
     "  task show <id> [--events] [--children] [--deps]",
     "  task events <id> [--last N]",
     "  task attention [--format telegram]",
+    "  task do <title> [--description <desc>]        # create + claim in one shot",
+    "  task log <title> <evidence>                   # record completed work",
     "  task create <title> --description <desc> [options]",
     "  task claim <id>",
     "  task release [--reason <reason>] [--worked]",
@@ -1180,6 +1193,127 @@ function parseDependsOn(flags: Record<string, FlagValue>): string[] {
   return getFlagList(flags, "depends-on").map((id) => normalizeTaskId(id));
 }
 
+async function cmdDo(argv: string[], jsonMode: boolean): Promise<void> {
+  const agentId = requireAgentId();
+  const { positionals, flags } = parseFlags(argv);
+  const title = ensureText(positionals[0], "title");
+  const description = getFlagString(flags, "description") ?? title;
+
+  const body: Record<string, unknown> = {
+    title,
+    description,
+    skipAnalysis: true,
+  };
+
+  const priority = getFlagString(flags, "priority");
+  const reviewer = getFlagString(flags, "reviewer");
+  const informed = getFlagList(flags, "informed");
+  const dependsOn = parseDependsOn(flags);
+  const parent = getFlagString(flags, "parent");
+
+  if (priority) body["priority"] = priority;
+  if (reviewer) body["reviewer"] = reviewer;
+  if (informed.length > 0) body["informed"] = informed;
+  if (dependsOn.length > 0) body["dependsOn"] = dependsOn;
+  if (parent) body["parentId"] = normalizeTaskId(parent);
+
+  // Step 1: Create task (skips analysis, goes straight to execution.ready)
+  const createResponse = await apiRequest("POST", "/tasks", body);
+  const taskId = getString(createResponse, "taskId", "");
+  if (!taskId) throw new CliError("Failed to create task: no taskId returned.", 2);
+
+  // Step 2: Claim it
+  const claimResponse = await apiRequest("POST", `/tasks/${taskId}/claim`, {
+    agentId,
+    source: "task-cli",
+    force: true,
+  });
+
+  const task = asRecord(claimResponse["task"]);
+  if (!task) throw new CliError("Failed to claim task after creation.", 2);
+
+  const workspace = asRecord(claimResponse["workspace"]);
+  const journalWorktree = asString(workspace?.["journalWorktree"]);
+  const journalPath = asString(workspace?.["journalPath"]);
+  const codeWorktree = asString(workspace?.["codeWorktree"]);
+
+  const sessionId = asString(claimResponse["sessionId"]) ?? "";
+  const fenceToken = asNumber(claimResponse["fenceToken"]) ?? 0;
+
+  const context: TaskContext = {
+    taskId,
+    phase: "execution",
+    fenceToken,
+    sessionId,
+    journalPath: journalPath ?? "",
+    codeWorktree: codeWorktree ?? null,
+    claimedAt: Date.now(),
+    reviewNotes: [],
+  };
+
+  const roots: string[] = [];
+  if (journalWorktree) roots.push(journalWorktree);
+  if (codeWorktree) roots.push(codeWorktree);
+  if (roots.length > 0 && journalPath) {
+    writeTaskContext(context, roots);
+  }
+  writeActiveTask(agentId, context);
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ taskId, ...claimResponse }, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`--- T${taskId}: ${title} ---\n`);
+  process.stdout.write(`Created and claimed. You're working on it now.\n`);
+  if (journalPath) process.stdout.write(`Journal: ${journalPath}\n`);
+  if (codeWorktree) process.stdout.write(`Code:    ${codeWorktree}\n`);
+  process.stdout.write(`\nWhen done:\n`);
+  if (reviewer) {
+    process.stdout.write(`  task submit "what you did"    — send for review\n`);
+  } else {
+    process.stdout.write(`  task complete "what you did"  — mark done\n`);
+  }
+  process.stdout.write(`  task block "what's wrong"     — if stuck\n`);
+  process.stdout.write(`  task update "progress"        — log progress\n`);
+}
+
+async function cmdLog(argv: string[], jsonMode: boolean): Promise<void> {
+  const agentId = requireAgentId();
+  const { positionals } = parseFlags(argv);
+  const title = ensureText(positionals[0], "title");
+  const evidence = ensureText(positionals.slice(1).join(" ") || undefined, "evidence (second argument)");
+
+  // Step 1: Create task (skip analysis → execution.ready)
+  const createResponse = await apiRequest("POST", "/tasks", {
+    title,
+    description: evidence,
+    skipAnalysis: true,
+  });
+  const taskId = getString(createResponse, "taskId", "");
+  if (!taskId) throw new CliError("Failed to create task: no taskId returned.", 2);
+
+  // Step 2: Claim it
+  await apiRequest("POST", `/tasks/${taskId}/claim`, {
+    agentId,
+    source: "task-cli",
+    force: true,
+  });
+
+  // Step 3: Complete it
+  await apiRequest("POST", `/tasks/${taskId}/status`, {
+    status: "done",
+    evidence,
+  });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ taskId, title, status: "done", evidence }, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`Logged T${taskId}: ${title}\n`);
+}
+
 async function cmdCreate(argv: string[], jsonMode: boolean): Promise<void> {
   requireAgentId();
 
@@ -1200,6 +1334,8 @@ async function cmdCreate(argv: string[], jsonMode: boolean): Promise<void> {
   const dependsOn = parseDependsOn(flags);
   const repo = getFlagString(flags, "repo");
   const baseBranch = getFlagString(flags, "base-branch");
+  const parent = getFlagString(flags, "parent");
+  const skipAnalysis = getFlagBool(flags, "skip-analysis");
 
   if (assignee) body["assignee"] = assignee;
   if (reviewer) body["reviewer"] = reviewer;
@@ -1209,6 +1345,8 @@ async function cmdCreate(argv: string[], jsonMode: boolean): Promise<void> {
   if (dependsOn.length > 0) body["dependsOn"] = dependsOn;
   if (repo) body["repo"] = repo;
   if (baseBranch) body["baseBranch"] = baseBranch;
+  if (parent) body["parentId"] = normalizeTaskId(parent);
+  if (skipAnalysis) body["skipAnalysis"] = true;
 
   const response = await apiRequest("POST", "/tasks", body);
 
@@ -2232,6 +2370,32 @@ const subcommandHelp: Record<string, string> = {
     "  --format telegram   Output as Telegram-formatted text",
   ].join("\n"),
 
+  do: [
+    "task do <title> [options]",
+    "",
+    "Create a task and start working on it immediately.",
+    "Skips analysis phase — creates in execution and claims in one shot.",
+    "",
+    "Options:",
+    "  --description <text>   Task description (optional, defaults to title)",
+    "  --priority <level>     Priority (critical, high, medium, low, backlog)",
+    "  --reviewer <agent>     Set reviewer (submit sends for review)",
+    "  --informed <ids>       Comma-separated agents to notify on completion",
+    "  --depends-on <ids>     Comma-separated task IDs this depends on",
+    "  --parent <id>          Parent task ID",
+    "",
+    "When done: task complete \"evidence\" (or task submit if reviewer set)",
+  ].join("\n"),
+
+  log: [
+    "task log <title> <evidence>",
+    "",
+    "Record work that already happened. Creates a task and immediately",
+    "marks it done. Single command for retroactive tracking.",
+    "",
+    "Example: task log \"Fixed login redirect\" \"Updated auth.ts to handle callback URL\"",
+  ].join("\n"),
+
   create: [
     "task create <title> --description <desc> [options]",
     "",
@@ -2247,6 +2411,8 @@ const subcommandHelp: Record<string, string> = {
     "  --depends-on <ids>     Comma-separated task IDs this depends on",
     "  --repo <repo>          Repository for this task",
     "  --base-branch <branch> Base branch for code worktree",
+    "  --parent <id>          Parent task ID",
+    "  --skip-analysis        Skip analysis, start in execution phase",
   ].join("\n"),
 
   claim: [
@@ -2478,6 +2644,12 @@ async function run(argv: string[]): Promise<void> {
       return;
     case "attention":
       await cmdAttention(rest, jsonMode);
+      return;
+    case "do":
+      await cmdDo(rest, jsonMode);
+      return;
+    case "log":
+      await cmdLog(rest, jsonMode);
       return;
     case "create":
       await cmdCreate(rest, jsonMode);
