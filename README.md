@@ -55,7 +55,6 @@ The bridge between the pure core and the real world.
 - **http.ts** — HTTP API on `127.0.0.1:18800` with status-update translation
 - **analysis.ts** — Auto-analysis: tasks with an assignee skip straight to execution
 - **prompt.ts** — Prompt builder for work and review modes
-- **mcp-bridge.ts** — MCP stdio server (JSON-RPC 2.0) for agents that use MCP tools
 - **task-update-bridge.py** — CLI for agents to report status
 - **delegate-bridge.py** — CLI for agents to create subtasks
 - **migrate.ts** — One-shot migration from legacy `tasks.json` format
