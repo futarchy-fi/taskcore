@@ -588,6 +588,25 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     // Detect lease expiry: active file exists but task is no longer active for us
     const leaseExpired = !terminal && condition !== "active" && activeContext.fenceToken > 0;
 
+    // Auto-extend lease when viewing active task (keeps lease alive across heartbeats)
+    if (!terminal && !leaseExpired && condition === "active" && task) {
+      const fenceToken = getNumber(task, "currentFenceToken", -1);
+      if (fenceToken >= 0) {
+        try {
+          await apiRequest("POST", `/tasks/${taskId}/events`, {
+            type: "LeaseExtended",
+            taskId,
+            ts: Date.now(),
+            fenceToken,
+            leaseTimeout: 600_000, // 10 min
+            source: agentId ? { type: "agent", id: agentId } : { type: "cli" },
+          });
+        } catch {
+          // lease extend failed — not critical, continue showing task
+        }
+      }
+    }
+
     process.stdout.write(`\n  Active Task: T${taskId} — ${title}\n`);
     if (leaseExpired) {
       process.stdout.write(`\n  ⚠️  LEASE EXPIRED — task reverted to ${phase}.${condition}\n`);
