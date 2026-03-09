@@ -517,7 +517,7 @@ function phaseGuidance(phase: string, condition: string): string[] {
         "You're reviewing this task. Next steps:",
         "  task review read          # read review materials",
         "  task review approve       # approve",
-        "  task review reject        # reject",
+        "  task review reject --force # reject permanently (prefer request-changes)",
         "  task review request-changes <notes>  # request changes",
       ];
     case "decomposition.ready":
@@ -692,17 +692,21 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     .sort((a, b) => {
       const metaA = asRecord(a["metadata"]) ?? {};
       const metaB = asRecord(b["metadata"]) ?? {};
-      // Tasks assigned to my role come first (check both assignee and reviewer for review-phase tasks)
+      // Sort order: 0 = assigned to me, 1 = unassigned, 2 = assigned to someone else
       if (role) {
         const aAssignee = getString(metaA, "assignee");
         const aReviewer = getString(metaA, "reviewer");
         const aPhase = getString(a, "phase");
-        const aMatch = (aAssignee === role || (aPhase === "review" && aReviewer === role)) ? 0 : 1;
+        const aIsMe = (aAssignee === role || (aPhase === "review" && aReviewer === role));
+        const aIsUnassigned = !aAssignee || aAssignee === "unset";
+        const aRank = aIsMe ? 0 : aIsUnassigned ? 1 : 2;
         const bAssignee = getString(metaB, "assignee");
         const bReviewer = getString(metaB, "reviewer");
         const bPhase = getString(b, "phase");
-        const bMatch = (bAssignee === role || (bPhase === "review" && bReviewer === role)) ? 0 : 1;
-        if (aMatch !== bMatch) return aMatch - bMatch;
+        const bIsMe = (bAssignee === role || (bPhase === "review" && bReviewer === role));
+        const bIsUnassigned = !bAssignee || bAssignee === "unset";
+        const bRank = bIsMe ? 0 : bIsUnassigned ? 1 : 2;
+        if (aRank !== bRank) return aRank - bRank;
       }
       // Then by priority
       const pa = priorityRank(getString(metaA, "priority", "medium"));
@@ -745,7 +749,8 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     const assignee = getString(meta, "assignee", "");
     const reviewer = getString(meta, "reviewer", "");
     const isMatch = role && (assignee === role || (phase === "review" && reviewer === role));
-    const roleTag = isMatch ? " *" : "";
+    const isUnassigned = !assignee || assignee === "unset";
+    const roleTag = isMatch ? " *" : isUnassigned ? " +" : "";
     rows.push([`  T${id}`, `[${priority}]`, `${phase}`, `${title}${roleTag}`]);
   }
   printTable(rows);
@@ -754,7 +759,7 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     process.stdout.write(`  ... and ${claimable.length - 10} more\n`);
   }
 
-  process.stdout.write(`\n  * = assigned to you — claim these first\n`);
+  process.stdout.write(`\n  * = assigned to you    + = unassigned (grab these!)\n`);
   process.stdout.write(`\n  Claim a task:    task claim <id>\n`);
   process.stdout.write(`  Start your own:  task do "title"\n\n`);
 }
@@ -1518,7 +1523,7 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
   } else if (phase === "review") {
     process.stdout.write("  task review read                      — read the submitted evidence\n");
     process.stdout.write("  task review approve                   — approve the work\n");
-    process.stdout.write("  task review reject                    — reject the work\n");
+    process.stdout.write("  task review reject --force             — reject permanently (prefer request-changes)\n");
     process.stdout.write("  task review request-changes \"notes\"   — request changes\n");
   } else if (phase === "decomposition") {
     process.stdout.write("  task decompose start      — begin decomposition\n");
@@ -2108,7 +2113,7 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
       process.stdout.write(getString(response, "text", "No review context available.") + "\n");
       process.stdout.write("\n--- Review this evidence, then decide: ---\n");
       process.stdout.write("  task review approve \"summary\"              — work is acceptable\n");
-      process.stdout.write("  task review reject \"reason\"                — work is unacceptable\n");
+      process.stdout.write("  task review reject --force \"reason\"        — permanently kill task (prefer request-changes)\n");
       process.stdout.write("  task review request-changes \"feedback\"     — needs revisions\n");
       process.stdout.write("  task review note \"observation\"             — save a note before deciding\n");
       return;
@@ -2131,7 +2136,7 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
       notes.forEach((entry, idx) => process.stdout.write(`  ${idx + 1}. ${entry}\n`));
       process.stdout.write("\n  task review note \"Another observation\"\n");
       process.stdout.write("  task review approve \"Summary\"\n");
-      process.stdout.write("  task review reject \"Reason\"\n");
+      process.stdout.write("  task review reject --force \"Reason\"\n");
       process.stdout.write("  task review request-changes \"Feedback\"\n");
       return;
     }
@@ -2151,7 +2156,15 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
     }
 
     case "reject": {
-      const evidence = getReviewEvidence(taskId, args.join(" "));
+      const { positionals: rejectArgs, flags: rejectFlags } = parseFlags(args);
+      const force = getFlagBool(rejectFlags, "force");
+      if (!force) {
+        process.stderr.write("Reject is permanent — T" + taskId + " will be killed.\n");
+        process.stderr.write("Did you mean: task review request-changes \"feedback\"\n");
+        process.stderr.write("To confirm rejection: task review reject --force \"feedback\"\n");
+        throw new CliError("Use --force to confirm rejection, or request-changes to send back for revision.", 1);
+      }
+      const evidence = getReviewEvidence(taskId, rejectArgs.join(" "));
       const response = await apiRequest("POST", `/tasks/${taskId}/status`, {
         status: "reject",
         evidence,
@@ -2160,7 +2173,7 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
         process.stdout.write(JSON.stringify(response, null, 2) + "\n");
         return;
       }
-      process.stdout.write(`Rejected T${taskId}.\n`);
+      process.stdout.write(`Rejected T${taskId} (terminal).\n`);
       return;
     }
 

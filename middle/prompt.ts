@@ -160,6 +160,32 @@ function buildWorkPrompt(core: Core, task: Task, config: Config, overrides?: Pro
   sections.push("- Colony files (AGENTS.md, etc.) are read-only shared resources.");
   sections.push("");
 
+  // Phase 3 guardrail: inject plan doc content if planDoc metadata is set
+  const planDocPath = task.metadata["planDoc"] as string | undefined;
+  if (planDocPath) {
+    try {
+      const resolvedPath = path.isAbsolute(planDocPath)
+        ? planDocPath
+        : path.join(config.workspaceDir, planDocPath);
+      const planContent = fs.readFileSync(resolvedPath, "utf-8");
+      sections.push("## Implementation Plan");
+      sections.push("");
+      const maxPlanLen = 4000;
+      if (planContent.length > maxPlanLen) {
+        sections.push(planContent.slice(0, maxPlanLen));
+        sections.push(`\n... (truncated, ${planContent.length - maxPlanLen} chars omitted)`);
+      } else {
+        sections.push(planContent);
+      }
+      sections.push("");
+    } catch {
+      sections.push("## Implementation Plan");
+      sections.push("");
+      sections.push(`⚠️ Plan document not found: \`${planDocPath}\`. The task requires a plan but the file is missing.`);
+      sections.push("");
+    }
+  }
+
   // Phase-specific instructions
   if (task.phase === "analysis") {
     appendAnalysisInstructions(sections, task, config);

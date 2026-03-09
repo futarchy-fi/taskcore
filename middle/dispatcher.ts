@@ -687,6 +687,21 @@ export function createDispatcher(core: Core, config: Config): Dispatcher {
     const phase = task.phase;
     if (!phase) return;
 
+    // Phase 3 guardrail: plan-before-code gate
+    // Skip dispatch for tasks that require a plan doc but don't have one yet
+    if (
+      phase !== "analysis" &&
+      phase !== "review" &&
+      task.metadata["planRequired"] &&
+      !task.metadata["planDoc"]
+    ) {
+      console.log(
+        `[dispatcher] T${task.id} skipped: planRequired=true but no planDoc set. ` +
+        `Set metadata.planDoc to unblock dispatch.`,
+      );
+      return;
+    }
+
     // Determine agent
     const agentId = selectAgent(task, phase);
     if (!agentId) {

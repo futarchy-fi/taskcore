@@ -1194,6 +1194,12 @@ function handleCreateTask(
         base_branch: b.baseBranch ?? b.base_branch ?? null,
         createdBy: "http-api",
         createdAt: new Date().toISOString(),
+        // Phase 3 guardrail: auto-set planRequired for high/critical tasks
+        // unless explicitly opted out with planRequired: false
+        ...((b.priority === "critical" || b.priority === "high") &&
+          (b as unknown as Record<string, unknown>).planRequired !== false
+          ? { planRequired: true }
+          : {}),
       },
       source: { type: "middle", id: "daemon" },
     };
