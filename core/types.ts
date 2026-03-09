@@ -166,6 +166,8 @@ export interface Task {
 
   waitState: WaitState | null;
 
+  lastCompletionVerification: CompletionVerification | null;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
   metadata: Record<string, unknown>;
@@ -399,6 +401,35 @@ export interface ReviewPolicyMet extends BaseEvent {
   source: EventSource;
 }
 
+// ---------------------------------------------------------------------------
+// Completion verification
+// ---------------------------------------------------------------------------
+
+export type ArtifactKind = "journal" | "code" | "pr";
+
+export interface ArtifactEvidence {
+  kind: ArtifactKind;
+  repo?: string;
+  branch?: string;
+  baseRef?: string | null;
+  headRef?: string | null;
+  aheadCount?: number | null;
+  changedFiles?: string[];
+  prUrl?: string | null;
+}
+
+export interface CompletionVerification {
+  passed: boolean;
+  reason: string;
+  checkedAt: string;
+  evidence: ArtifactEvidence[];
+}
+
+export interface CompletionVerificationRecorded extends BaseEvent {
+  type: "CompletionVerificationRecorded";
+  verification: CompletionVerification;
+}
+
 export interface TaskCompleted extends BaseEvent {
   type: "TaskCompleted";
   stateRef: StateRef;
@@ -486,6 +517,7 @@ export type Event =
   | StateReverted
   | ReviewVerdictSubmitted
   | ReviewPolicyMet
+  | CompletionVerificationRecorded
   | TaskCompleted
   | TaskFailed
   | TaskExhausted
