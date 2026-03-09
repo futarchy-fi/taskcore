@@ -5,6 +5,7 @@ import {
   DEFAULT_ATTEMPT_BUDGETS,
   type Event,
   type FailureSummary,
+  isDependencyWait,
   type Phase,
   type ReduceResult,
   type Result,
@@ -127,6 +128,7 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
       contextIsolation: event.reviewConfig?.isolationRules ?? [],
       contextBudget: 0,
       waitState: null,
+      coordination: null,
       lastCompletionVerification: null,
       createdAt: event.ts,
       updatedAt: event.ts,
@@ -176,6 +178,7 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
     contextIsolation: event.reviewConfig?.isolationRules ?? [],
     contextBudget: 0,
     waitState: null,
+    coordination: null,
     lastCompletionVerification: null,
     createdAt: event.ts,
     updatedAt: event.ts,
@@ -233,6 +236,7 @@ function createChildTaskFromDecomposition(parent: Task, event: Extract<Event, { 
     contextIsolation: child.reviewConfig?.isolationRules ?? [],
     contextBudget: 0,
     waitState: null,
+    coordination: null,
     lastCompletionVerification: null,
     createdAt: event.ts,
     updatedAt: event.ts,
@@ -366,10 +370,11 @@ function applyWaitResolved(state: SystemState, event: Extract<Event, { type: "Wa
   }
 
   if (event.action === "resume") {
-    if (t.waitState) {
-      t.phase = t.waitState.returnPhase;
-      t.condition = t.waitState.returnCondition;
-      t.sessionPolicy = sessionPolicyForPhase(t.waitState.returnPhase);
+    if (t.waitState && isDependencyWait(t.waitState)) {
+      const ws = t.waitState;
+      t.phase = ws.returnPhase;
+      t.condition = ws.returnCondition;
+      t.sessionPolicy = sessionPolicyForPhase(ws.returnPhase);
     } else {
       t.condition = "active";
     }
@@ -406,14 +411,16 @@ function applyDependencySatisfied(state: SystemState, event: Extract<Event, { ty
   }
 
   if (t.condition === "waiting" && allBlockingBeforeStartDepsSatisfied(t)) {
-    if (t.waitState) {
-      t.phase = t.waitState.returnPhase;
-      t.condition = t.waitState.returnCondition;
-      t.sessionPolicy = sessionPolicyForPhase(t.waitState.returnPhase);
+    if (t.waitState && isDependencyWait(t.waitState)) {
+      const ws = t.waitState;
+      t.phase = ws.returnPhase;
+      t.condition = ws.returnCondition;
+      t.sessionPolicy = sessionPolicyForPhase(ws.returnPhase);
       t.waitState = null;
-    } else {
+    } else if (!t.waitState) {
       t.condition = "ready";
     }
+    // If waitState is sibling_turn, don't change condition — wait for ChildActivated
   }
 
   t.lastAgentExitAt = null;
@@ -488,8 +495,54 @@ function applyDecompositionCreated(state: SystemState, event: Extract<Event, { t
     failureSummary: null,
   });
 
+  // Sequential coordination: park all children except the first
+  if (event.coordinationMode?.mode === "sequential_children" && childIds.length > 0) {
+    const firstChildId = childIds[0]!;
+    for (let i = 1; i < childIds.length; i++) {
+      const childId = childIds[i]!;
+      const child = state.tasks[childId];
+      if (child) {
+        const childClone = deepCloneTask(child);
+        childClone.condition = "waiting";
+        childClone.waitState = { kind: "sibling_turn", parentId: t.id };
+        childClone.updatedAt = event.ts;
+        state.tasks[childClone.id] = childClone;
+      }
+    }
+
+    t.coordination = {
+      mode: "sequential_children",
+      reviewBetweenChildren: event.coordinationMode.reviewBetweenChildren,
+      childOrder: [...childIds],
+      nextChildIndex: 1,
+      activeChildId: firstChildId,
+      lastCompletedChildId: null,
+    };
+  }
+
   t.updatedAt = event.ts;
   state.tasks[t.id] = t;
+}
+
+function applyChildActivated(state: SystemState, event: Extract<Event, { type: "ChildActivated" }>, task: Task): void {
+  // task = the child being activated (event.taskId)
+  const childClone = deepCloneTask(task);
+  childClone.condition = "ready";
+  childClone.waitState = null;
+  childClone.updatedAt = event.ts;
+  state.tasks[childClone.id] = childClone;
+
+  // Update parent's coordination state
+  const parent = state.tasks[event.parentId];
+  if (parent && parent.coordination) {
+    const parentClone = deepCloneTask(parent);
+    parentClone.coordination = { ...parentClone.coordination! };
+    parentClone.coordination.lastCompletedChildId = parentClone.coordination.activeChildId;
+    parentClone.coordination.activeChildId = event.taskId;
+    parentClone.coordination.nextChildIndex = event.index + 1;
+    parentClone.updatedAt = event.ts;
+    state.tasks[parentClone.id] = parentClone;
+  }
 }
 
 function applyChildCostRecovered(state: SystemState, event: Extract<Event, { type: "ChildCostRecovered" }>, task: Task): void {
@@ -859,6 +912,9 @@ function applyUnchecked(state: SystemState, event: Event): void {
       break;
     case "DecompositionCreated":
       applyDecompositionCreated(state, event, task);
+      break;
+    case "ChildActivated":
+      applyChildActivated(state, event, task);
       break;
     case "ChildCostRecovered":
       applyChildCostRecovered(state, event, task);

@@ -11,6 +11,7 @@ import { reduce, replay } from "../reducer.js";
 import {
   computeCostRemaining,
   createInitialState,
+  isSiblingTurnWait,
   type Condition,
   type Event,
   type FailureSummary,
@@ -2161,7 +2162,8 @@ test("Scenario AE: redirect_wait intermediate state is explicit and sequential",
 
   assert.equal(state.tasks.T3000?.condition, "waiting");
   assert.notEqual(state.tasks.T3000?.waitState, null);
-  assert.equal(state.tasks.T3000?.waitState?.dependencyId, "dep-3000-b");
+  const ws3000 = state.tasks.T3000?.waitState;
+  assert.equal(ws3000 && "dependencyId" in ws3000 ? ws3000.dependencyId : undefined, "dep-3000-b");
 
   state = mustReduce(state, {
     type: "WaitResolved",
@@ -2534,4 +2536,291 @@ test("Full lifecycle: exhaust → budget increase → dispatch → complete", ()
   assert.equal(state.tasks["TEX103"]!.terminal, "done");
   v = checkInvariants(state);
   assert.equal(v.length, 0, `Final invariants: ${JSON.stringify(v)}`);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: Sequential child execution tests
+// ---------------------------------------------------------------------------
+
+const agentCtx = (agentId: string, sessionId: string) => ({
+  sessionId,
+  agentId,
+  memoryRef: null,
+  contextTokens: 500,
+  modelId: "gpt-5",
+});
+
+function sequentialDecomposition(parentId: string, ts: number, fenceToken: number, children: Array<{ taskId: string; title: string }>, reviewBetweenChildren = false): Event {
+  return {
+    type: "DecompositionCreated",
+    taskId: parentId,
+    ts,
+    fenceToken,
+    version: 1,
+    children: children.map((c) => ({
+      taskId: c.taskId,
+      title: c.title,
+      description: `Description for ${c.title}`,
+      costAllocation: 10,
+      skipAnalysis: true,
+      dependencies: [],
+    })),
+    checkpoints: [],
+    completionRule: "and",
+    agentContext: agentCtx("decomposer", `d-${parentId}`),
+    coordinationMode: { mode: "sequential_children", reviewBetweenChildren },
+  };
+}
+
+test("Sequential decomposition: only first child is ready, others waiting", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("TSEQ1", 1, { costBudget: 50 }));
+  state = mustReduce(state, lease("TSEQ1", 2, 1, "analysis", "analyst", "a-seq1"));
+  state = mustReduce(state, transition("TSEQ1", 3, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-seq1"));
+  state = mustReduce(state, lease("TSEQ1", 4, 2, "decomposition", "decomposer", "d-seq1"));
+  state = mustReduce(state, sequentialDecomposition("TSEQ1", 5, 2, [
+    { taskId: "TSEQ1C1", title: "Child 1" },
+    { taskId: "TSEQ1C2", title: "Child 2" },
+    { taskId: "TSEQ1C3", title: "Child 3" },
+  ]));
+
+  // First child should be ready (execution because skipAnalysis=true)
+  assert.equal(state.tasks["TSEQ1C1"]!.condition, "ready");
+  assert.equal(state.tasks["TSEQ1C1"]!.phase, "execution");
+  assert.equal(state.tasks["TSEQ1C1"]!.waitState, null);
+
+  // Second and third children should be waiting with sibling_turn
+  assert.equal(state.tasks["TSEQ1C2"]!.condition, "waiting");
+  assert.notEqual(state.tasks["TSEQ1C2"]!.waitState, null);
+  assert.ok(isSiblingTurnWait(state.tasks["TSEQ1C2"]!.waitState!));
+  assert.equal((state.tasks["TSEQ1C2"]!.waitState as { kind: "sibling_turn"; parentId: string }).parentId, "TSEQ1");
+
+  assert.equal(state.tasks["TSEQ1C3"]!.condition, "waiting");
+  assert.ok(isSiblingTurnWait(state.tasks["TSEQ1C3"]!.waitState!));
+
+  // Parent should have sequential coordination
+  assert.notEqual(state.tasks["TSEQ1"]!.coordination, null);
+  assert.equal(state.tasks["TSEQ1"]!.coordination!.mode, "sequential_children");
+  assert.equal(state.tasks["TSEQ1"]!.coordination!.activeChildId, "TSEQ1C1");
+  assert.equal(state.tasks["TSEQ1"]!.coordination!.nextChildIndex, 1);
+  assert.deepEqual(state.tasks["TSEQ1"]!.coordination!.childOrder, ["TSEQ1C1", "TSEQ1C2", "TSEQ1C3"]);
+
+  const v = checkInvariants(state);
+  assert.equal(v.length, 0, `Invariants: ${JSON.stringify(v)}`);
+});
+
+test("Sequential: C1 completes → clock emits ChildActivated for C2", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("TSEQ2", 1, { costBudget: 50 }));
+  state = mustReduce(state, lease("TSEQ2", 2, 1, "analysis", "analyst", "a-seq2"));
+  state = mustReduce(state, transition("TSEQ2", 3, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-seq2"));
+  state = mustReduce(state, lease("TSEQ2", 4, 2, "decomposition", "decomposer", "d-seq2"));
+  state = mustReduce(state, sequentialDecomposition("TSEQ2", 5, 2, [
+    { taskId: "TSEQ2C1", title: "Child 1" },
+    { taskId: "TSEQ2C2", title: "Child 2" },
+    { taskId: "TSEQ2C3", title: "Child 3" },
+  ]));
+  state = mustReduce(state, transition("TSEQ2", 6, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-seq2"));
+
+  // Complete C1
+  state = mustReduce(state, lease("TSEQ2C1", 10, 1, "execution", "coder", "e-c1"));
+  state = mustReduce(state, complete("TSEQ2C1", 15));
+
+  assert.equal(state.tasks["TSEQ2C1"]!.terminal, "done");
+  assert.equal(state.tasks["TSEQ2C2"]!.condition, "waiting"); // still waiting before clock
+
+  // Run clock — should emit ChildActivated for C2
+  const clock = new CoreClock();
+  const due = clock.collectDueEvents(state, 20);
+
+  const childActivated = due.find((e) => e.type === "ChildActivated");
+  assert.ok(childActivated, "Expected ChildActivated event");
+  assert.equal(childActivated!.taskId, "TSEQ2C2");
+  assert.equal((childActivated as any).parentId, "TSEQ2");
+  assert.equal((childActivated as any).index, 1);
+
+  // Apply ChildActivated
+  state = mustReduce(state, childActivated!);
+
+  // C2 should now be ready
+  assert.equal(state.tasks["TSEQ2C2"]!.condition, "ready");
+  assert.equal(state.tasks["TSEQ2C2"]!.waitState, null);
+
+  // C3 still waiting
+  assert.equal(state.tasks["TSEQ2C3"]!.condition, "waiting");
+  assert.ok(isSiblingTurnWait(state.tasks["TSEQ2C3"]!.waitState!));
+
+  // Parent coordination updated
+  assert.equal(state.tasks["TSEQ2"]!.coordination!.activeChildId, "TSEQ2C2");
+  assert.equal(state.tasks["TSEQ2"]!.coordination!.lastCompletedChildId, "TSEQ2C1");
+  assert.equal(state.tasks["TSEQ2"]!.coordination!.nextChildIndex, 2);
+
+  const v = checkInvariants(state);
+  assert.equal(v.length, 0, `Invariants: ${JSON.stringify(v)}`);
+});
+
+test("Sequential: all children complete → parent wakes with children_complete", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("TSEQ3", 1, { costBudget: 50 }));
+  state = mustReduce(state, lease("TSEQ3", 2, 1, "analysis", "analyst", "a-seq3"));
+  state = mustReduce(state, transition("TSEQ3", 3, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-seq3"));
+  state = mustReduce(state, lease("TSEQ3", 4, 2, "decomposition", "decomposer", "d-seq3"));
+  state = mustReduce(state, sequentialDecomposition("TSEQ3", 5, 2, [
+    { taskId: "TSEQ3C1", title: "Child 1" },
+    { taskId: "TSEQ3C2", title: "Child 2" },
+  ]));
+  state = mustReduce(state, transition("TSEQ3", 6, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-seq3"));
+
+  // Complete C1
+  state = mustReduce(state, lease("TSEQ3C1", 10, 1, "execution", "coder", "e-c1"));
+  state = mustReduce(state, complete("TSEQ3C1", 15));
+
+  // Clock: activate C2
+  const clock = new CoreClock();
+  let due = clock.collectDueEvents(state, 20);
+  const activate = due.find((e) => e.type === "ChildActivated");
+  assert.ok(activate);
+  state = mustReduce(state, activate!);
+
+  // Complete C2
+  state = mustReduce(state, lease("TSEQ3C2", 25, 1, "execution", "coder", "e-c2"));
+  state = mustReduce(state, complete("TSEQ3C2", 30));
+
+  // All children done. Clock should emit children_complete PhaseTransition for parent
+  due = clock.collectDueEvents(state, 35);
+  const parentWake = due.find((e) => e.type === "PhaseTransition" && e.taskId === "TSEQ3");
+  assert.ok(parentWake, "Expected PhaseTransition for parent after all children complete");
+  assert.equal((parentWake as any).reasonCode, "children_complete");
+
+  state = mustReduce(state, parentWake!);
+  assert.equal(state.tasks["TSEQ3"]!.phase, "analysis");
+  assert.equal(state.tasks["TSEQ3"]!.condition, "ready");
+
+  const v = checkInvariants(state);
+  assert.equal(v.length, 0, `Invariants: ${JSON.stringify(v)}`);
+});
+
+test("Sequential: C1 fails → parent wakes for mediation, C2 stays waiting", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("TSEQ4", 1, { costBudget: 50 }));
+  state = mustReduce(state, lease("TSEQ4", 2, 1, "analysis", "analyst", "a-seq4"));
+  state = mustReduce(state, transition("TSEQ4", 3, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-seq4"));
+  state = mustReduce(state, lease("TSEQ4", 4, 2, "decomposition", "decomposer", "d-seq4"));
+  state = mustReduce(state, sequentialDecomposition("TSEQ4", 5, 2, [
+    { taskId: "TSEQ4C1", title: "Child 1" },
+    { taskId: "TSEQ4C2", title: "Child 2" },
+    { taskId: "TSEQ4C3", title: "Child 3" },
+  ]));
+  state = mustReduce(state, transition("TSEQ4", 6, "decomposition", "active", "analysis", "waiting", "children_created", 2, "decomposer", "d-seq4"));
+
+  // C1 fails
+  state = mustReduce(state, lease("TSEQ4C1", 10, 1, "execution", "coder", "e-c1"));
+  state = mustReduce(state, {
+    type: "TaskFailed",
+    taskId: "TSEQ4C1",
+    ts: 15,
+    reason: "budget_exhausted",
+    phase: "execution",
+    summary: failureSummary(),
+  });
+
+  assert.equal(state.tasks["TSEQ4C1"]!.terminal, "failed");
+
+  // Clock should wake parent (NOT activate C2)
+  const clock = new CoreClock();
+  const due = clock.collectDueEvents(state, 20);
+
+  const childActivated = due.find((e) => e.type === "ChildActivated");
+  assert.equal(childActivated, undefined, "C2 should NOT be activated when C1 fails");
+
+  const parentWake = due.find((e) => e.type === "PhaseTransition" && e.taskId === "TSEQ4");
+  assert.ok(parentWake, "Parent should be woken for mediation");
+  assert.equal((parentWake as any).reasonCode, "children_all_failed");
+
+  // C2 and C3 stay waiting
+  assert.equal(state.tasks["TSEQ4C2"]!.condition, "waiting");
+  assert.equal(state.tasks["TSEQ4C3"]!.condition, "waiting");
+
+  state = mustReduce(state, parentWake!);
+  assert.equal(state.tasks["TSEQ4"]!.phase, "analysis");
+  assert.equal(state.tasks["TSEQ4"]!.condition, "ready");
+
+  const v = checkInvariants(state);
+  assert.equal(v.length, 0, `Invariants: ${JSON.stringify(v)}`);
+});
+
+test("Legacy parallel decomposition: all children ready immediately", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("TLEG1", 1, { costBudget: 50 }));
+  state = mustReduce(state, lease("TLEG1", 2, 1, "analysis", "analyst", "a-leg1"));
+  state = mustReduce(state, transition("TLEG1", 3, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-leg1"));
+  state = mustReduce(state, lease("TLEG1", 4, 2, "decomposition", "decomposer", "d-leg1"));
+
+  // Decompose WITHOUT coordinationMode (legacy behavior)
+  state = mustReduce(state, {
+    type: "DecompositionCreated",
+    taskId: "TLEG1",
+    ts: 5,
+    fenceToken: 2,
+    version: 1,
+    children: [
+      { taskId: "TLEG1C1", title: "Child 1", description: "C1", costAllocation: 10, skipAnalysis: true, dependencies: [] },
+      { taskId: "TLEG1C2", title: "Child 2", description: "C2", costAllocation: 10, skipAnalysis: true, dependencies: [] },
+      { taskId: "TLEG1C3", title: "Child 3", description: "C3", costAllocation: 10, skipAnalysis: true, dependencies: [] },
+    ],
+    checkpoints: [],
+    completionRule: "and",
+    agentContext: agentCtx("decomposer", "d-leg1"),
+  });
+
+  // ALL children should be ready (legacy parallel)
+  assert.equal(state.tasks["TLEG1C1"]!.condition, "ready");
+  assert.equal(state.tasks["TLEG1C2"]!.condition, "ready");
+  assert.equal(state.tasks["TLEG1C3"]!.condition, "ready");
+
+  // No coordination on parent
+  assert.equal(state.tasks["TLEG1"]!.coordination, null);
+
+  const v = checkInvariants(state);
+  assert.equal(v.length, 0, `Invariants: ${JSON.stringify(v)}`);
+});
+
+test("Sequential: child order matches decomposition order", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("TORD1", 1, { costBudget: 50 }));
+  state = mustReduce(state, lease("TORD1", 2, 1, "analysis", "analyst", "a-ord1"));
+  state = mustReduce(state, transition("TORD1", 3, "analysis", "active", "decomposition", "ready", "decision_decompose", 1, "analyst", "a-ord1"));
+  state = mustReduce(state, lease("TORD1", 4, 2, "decomposition", "decomposer", "d-ord1"));
+  state = mustReduce(state, sequentialDecomposition("TORD1", 5, 2, [
+    { taskId: "TORD1A", title: "Alpha" },
+    { taskId: "TORD1B", title: "Bravo" },
+    { taskId: "TORD1C", title: "Charlie" },
+    { taskId: "TORD1D", title: "Delta" },
+  ]));
+
+  const coord = state.tasks["TORD1"]!.coordination!;
+  assert.deepEqual(coord.childOrder, ["TORD1A", "TORD1B", "TORD1C", "TORD1D"]);
+  assert.equal(coord.activeChildId, "TORD1A");
+  assert.equal(coord.nextChildIndex, 1);
+
+  // Only Alpha is ready
+  assert.equal(state.tasks["TORD1A"]!.condition, "ready");
+  assert.equal(state.tasks["TORD1B"]!.condition, "waiting");
+  assert.equal(state.tasks["TORD1C"]!.condition, "waiting");
+  assert.equal(state.tasks["TORD1D"]!.condition, "waiting");
+});
+
+test("ChildActivated validation: rejects if child not in sibling_turn wait", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("TVAL1", 1, { costBudget: 50 }));
+
+  // Try to activate a task that isn't waiting with sibling_turn
+  mustReject(state, {
+    type: "ChildActivated",
+    taskId: "TVAL1",
+    ts: 5,
+    parentId: "TVAL1",
+    index: 0,
+    source: { type: "core", id: "test" },
+  }, "invalid_condition");
 });

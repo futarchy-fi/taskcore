@@ -2,6 +2,7 @@ import {
   computeCostRemaining,
   type BackoffExpired,
   type CheckpointTriggered,
+  type ChildActivated,
   type ChildCostRecovered,
   type DependencySatisfied,
   type Event,
@@ -150,6 +151,64 @@ export class CoreClock {
         due.push(dependencySatisfied);
       }
 
+      // Sequential child activation: when active child completes, activate next child
+      let emittedChildActivation = false;
+      if (
+        task.coordination &&
+        task.coordination.mode === "sequential_children" &&
+        task.phase === "analysis" &&
+        task.condition === "waiting" &&
+        task.coordination.activeChildId
+      ) {
+        const coord = task.coordination;
+        const activeChildId = coord.activeChildId!;
+        const activeChild = state.tasks[activeChildId];
+        if (activeChild && activeChild.terminal !== null) {
+          if (activeChild.terminal === "done" && !coord.reviewBetweenChildren) {
+            // Activate next child if there is one
+            if (coord.nextChildIndex < coord.childOrder.length) {
+              const nextChildId = coord.childOrder[coord.nextChildIndex]!;
+              const nextChild = state.tasks[nextChildId];
+              if (nextChild && nextChild.terminal === null && nextChild.condition === "waiting") {
+                const childActivated: ChildActivated = {
+                  type: "ChildActivated",
+                  taskId: nextChildId,
+                  ts: now,
+                  parentId: task.id,
+                  index: coord.nextChildIndex,
+                  source: { type: "core", id: this.sourceId },
+                };
+                due.push(childActivated);
+                emittedChildActivation = true;
+              }
+            }
+            // If no more children, fall through to existing childrenCompleteReady check
+          } else if (activeChild.terminal !== "done") {
+            // Active child failed/blocked/canceled → wake parent for mediation
+            const wakeParent: PhaseTransition = {
+              type: "PhaseTransition",
+              taskId: task.id,
+              ts: now,
+              from: { phase: "analysis", condition: "waiting" },
+              to: { phase: "analysis", condition: "ready" },
+              reasonCode: "children_all_failed",
+              reason: `Sequential child ${activeChildId} reached terminal state: ${activeChild.terminal}`,
+              fenceToken: task.currentFenceToken,
+              agentContext: {
+                sessionId: "core",
+                agentId: "core",
+                memoryRef: null,
+                contextTokens: null,
+                modelId: "core",
+              },
+            };
+            due.push(wakeParent);
+            emittedChildActivation = true;
+          }
+          // If reviewBetweenChildren === true and child done, don't auto-activate (Phase 3)
+        }
+      }
+
       let emittedCheckpoint = false;
       if ((task.phase === "review" || task.phase === "analysis") && task.condition === "waiting" && task.checkpoints.length > 0) {
         const alreadyTriggered = new Set(task.triggeredCheckpoints);
@@ -175,7 +234,7 @@ export class CoreClock {
       }
 
       const completion = childrenCompleteReady(state, task);
-      if (!emittedCheckpoint && task.phase === "analysis" && task.condition === "waiting" && completion.allTerminal) {
+      if (!emittedCheckpoint && !emittedChildActivation && task.phase === "analysis" && task.condition === "waiting" && completion.allTerminal) {
         const childrenTransition: PhaseTransition = {
           type: "PhaseTransition",
           taskId: task.id,

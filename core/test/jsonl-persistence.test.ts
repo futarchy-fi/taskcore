@@ -196,6 +196,7 @@ describe("JsonlPersistence", () => {
           contextIsolation: [],
           contextBudget: 200,
           waitState: null,
+          coordination: null,
           lastCompletionVerification: null,
           createdAt: 1000,
           updatedAt: 1000,

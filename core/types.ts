@@ -111,10 +111,38 @@ export interface ReviewState {
   status: "collecting" | "consensus" | "escalated";
 }
 
-export interface WaitState {
+export interface DependencyWaitState {
   dependencyId: DependencyId;
   returnPhase: Phase;
   returnCondition: Condition;
+}
+
+export interface SiblingTurnWaitState {
+  kind: "sibling_turn";
+  parentId: TaskId;
+}
+
+export type WaitState = DependencyWaitState | SiblingTurnWaitState;
+
+export function isSiblingTurnWait(ws: WaitState): ws is SiblingTurnWaitState {
+  return "kind" in ws && ws.kind === "sibling_turn";
+}
+
+export function isDependencyWait(ws: WaitState): ws is DependencyWaitState {
+  return "dependencyId" in ws;
+}
+
+// ---------------------------------------------------------------------------
+// Sequential coordination
+// ---------------------------------------------------------------------------
+
+export interface SequentialCoordination {
+  mode: "legacy_parallel" | "sequential_children";
+  reviewBetweenChildren: boolean;
+  childOrder: TaskId[];
+  nextChildIndex: number;
+  activeChildId: TaskId | null;
+  lastCompletedChildId: TaskId | null;
 }
 
 export interface Task {
@@ -165,6 +193,8 @@ export interface Task {
   contextBudget: number;
 
   waitState: WaitState | null;
+
+  coordination: SequentialCoordination | null;
 
   lastCompletionVerification: CompletionVerification | null;
 
@@ -351,6 +381,14 @@ export interface DecompositionCreated extends BaseEvent {
   checkpoints: TaskId[];
   completionRule: "and";
   agentContext: AgentContext;
+  coordinationMode?: { mode: "sequential_children"; reviewBetweenChildren: boolean } | null;
+}
+
+export interface ChildActivated extends BaseEvent {
+  type: "ChildActivated";
+  parentId: TaskId;
+  index: number;
+  source: EventSource;
 }
 
 export interface ChildCostRecovered extends BaseEvent {
@@ -511,6 +549,7 @@ export type Event =
   | RetryScheduled
   | BackoffExpired
   | DecompositionCreated
+  | ChildActivated
   | ChildCostRecovered
   | CheckpointTriggered
   | CheckpointCreated
