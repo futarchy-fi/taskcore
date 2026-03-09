@@ -647,13 +647,15 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
       for (const line of guidance) {
         process.stdout.write(`  ${line}\n`);
       }
-    } else {
-      process.stdout.write(`\n  Task is terminal (${terminal}). No active work.\n`);
-      process.stdout.write(`  Run: task release   # to clear active context\n`);
+      process.stdout.write("\n");
+      return;
     }
 
-    process.stdout.write("\n");
-    return;
+    // Terminal task — auto-clear context and fall through to available tasks
+    process.stdout.write(`\n  Task is terminal (${terminal}). Clearing active context.\n\n`);
+    if (agentId) clearActiveTask(agentId);
+    clearTaskContextFile();
+    // Fall through to show available work below
   }
 
   // --- No active task: show available work ---
@@ -1512,8 +1514,22 @@ async function cmdRelease(argv: string[], jsonMode: boolean): Promise<void> {
   const taskId = currentTaskId();
   const task = await getTask(taskId);
 
+  const terminal = getString(task, "terminal", "");
   const fenceToken = getNumber(task, "currentFenceToken", -1);
   const phase = getString(task, "phase", "execution");
+
+  // Terminal tasks — just clear local context, no API event needed
+  if (terminal) {
+    clearActiveTask(agentId);
+    clearTaskContextFile();
+    if (jsonMode) {
+      process.stdout.write(JSON.stringify({ released: true, taskId, terminal }, null, 2) + "\n");
+    } else {
+      process.stdout.write(`Released T${taskId} (${terminal}).\n`);
+    }
+    return;
+  }
+
   if (fenceToken < 0) throw new CliError(`Task ${taskId} has no active lease to release.`, 1);
 
   const reason = getFlagString(flags, "reason") ?? "Released by task CLI";
