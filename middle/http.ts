@@ -625,7 +625,7 @@ function handleClaimTask(
       ? b.agentId.trim()
       : typeof b.agent === "string" && b.agent.trim().length > 0
       ? b.agent.trim()
-      : "agent-mcp";
+      : "unknown";
 
     const fenceToken = task.currentFenceToken + 1;
     const sessionId = crypto.randomUUID();
@@ -638,7 +638,7 @@ function handleClaimTask(
     const modelId = typeof b.modelId === "string" && b.modelId.trim().length > 0
       ? b.modelId.trim()
       : "self-directed";
-    const claimSource = typeof b.source === "string" && b.source.trim().length > 0 ? b.source.trim() : "agent-mcp";
+    const claimSource = typeof b.source === "string" && b.source.trim().length > 0 ? b.source.trim() : "http-api";
 
     if (!Number.isInteger(leaseTimeout) || leaseTimeout <= 0) {
       return { status: 400, body: { error: "invalid_lease_timeout", message: "leaseTimeout must be a positive integer." } };
@@ -705,7 +705,7 @@ function handleClaimTask(
         claimSource,
         ...reviewerPatch,
       },
-      reason: "agent claimed task via MCP",
+      reason: "agent claimed task",
       source: { type: "agent", id: agentId },
     };
     err = submitOrError(core, metadataUpdated);
@@ -1279,7 +1279,7 @@ function handleStatusUpdate(
         return applyRejectTransition(core, task, fenceToken, ctx, now, b.evidence);
 
       case "blocked":
-        return applyBlockedTransition(core, task, now, b.blocker ?? b.evidence ?? "No reason provided");
+        return applyBlockedTransition(core, task, now, b.blocker ?? b.evidence ?? "No reason provided", ctx);
 
       case "pending":
         return applyChangesRequestedTransition(core, task, fenceToken, ctx, now, b.evidence);
@@ -1291,7 +1291,7 @@ function handleStatusUpdate(
         return applyDecomposeTransition(core, task, fenceToken, ctx, now);
 
       case "cancel":
-        return applyCancelTransition(core, task, now, b.evidence);
+        return applyCancelTransition(core, task, now, b.evidence, ctx);
 
       default:
         return { status: 400, body: { error: "unknown_status", message: `Unknown status: ${b.status}` } };
@@ -1606,6 +1606,7 @@ function applyDoneTransition(
       taskId: task.id,
       ts,
       stateRef: stateRef ?? defaultStateRef(),
+      source: { type: "agent", id: ctx.agentId },
     };
     const err = submitOrError(core, completed);
     if (err) return err;
@@ -1664,6 +1665,7 @@ function applyDoneTransition(
     taskId: task.id,
     ts: ts + 2,
     stateRef: stateRef ?? defaultStateRef(),
+    source: { type: "agent", id: ctx.agentId },
   };
   err = submitOrError(core, completed);
   if (err) return err;
@@ -1776,6 +1778,7 @@ function applyRejectTransition(
       whatWasLearned: "Reviewer rejected the submission. All review attempts exhausted.",
       artifactRef: null,
     },
+    source: { type: "agent", id: ctx.agentId },
   };
   err = submitOrError(core, failed);
   if (err) return err;
@@ -1794,6 +1797,7 @@ function applyBlockedTransition(
   task: Task,
   ts: number,
   blocker: string,
+  ctx?: AgentContext,
 ): RouteResult {
   const summary: FailureSummary = {
     childId: null,
@@ -1803,6 +1807,7 @@ function applyBlockedTransition(
     artifactRef: null,
   };
 
+  const agentId = ctx?.agentId ?? task.leasedTo;
   const blocked: TaskBlocked = {
     type: "TaskBlocked",
     taskId: task.id,
@@ -1810,7 +1815,7 @@ function applyBlockedTransition(
     reason: blocker,
     reasonCode: "agent_reported_blocked",
     summary,
-    source: { type: "middle", id: "daemon" },
+    source: agentId ? { type: "agent", id: agentId } : { type: "middle", id: "daemon" },
   };
 
   const err = submitOrError(core, blocked);
@@ -1832,13 +1837,15 @@ function applyCancelTransition(
   task: Task,
   ts: number,
   evidence?: string,
+  ctx?: AgentContext,
 ): RouteResult {
+  const agentId = ctx?.agentId ?? task.leasedTo;
   const canceled: TaskCanceled = {
     type: "TaskCanceled",
     taskId: task.id,
     ts,
     reason: "manual",
-    source: { type: "middle", id: "daemon" },
+    source: agentId ? { type: "agent", id: agentId } : { type: "middle", id: "daemon" },
   };
 
   const err = submitOrError(core, canceled);

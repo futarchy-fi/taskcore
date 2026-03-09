@@ -21,8 +21,8 @@
    the `.task` context file at the worktree root. The agent works inside the
    worktree. Everything is scoped.
 
-5. **Replaces MCP entirely.** This CLI is the sole interface between agents and
-   taskcore. The MCP server (`openclaw-mcp-server.mjs`) is retired.
+5. **Sole interface.** This CLI is the sole interface between agents and
+   taskcore.
 
 6. **Human-readable output first.** Agents consume the same text humans would
    read. `--json` flag reserved for future machine parsing.
@@ -171,7 +171,7 @@ These require `$TASKCORE_AGENT_ID`.
 
 #### `task create`
 
-Create a new task (replaces `delegate` MCP tool).
+Create a new task.
 
 ```
 task create <title> --description <desc>
@@ -842,14 +842,6 @@ cd "$WORKTREE"
 - 1: command error (bad args, missing context)
 - 2: API error (daemon unreachable, task not found, invalid state transition)
 - 3: auth error (no TASKCORE_AGENT_ID when required)
-
-### MCP Cutover Plan
-
-1. Build CLI with feature parity to MCP tools
-2. Update dispatcher to use `task` CLI in agent prompts instead of curl examples
-3. Update agent CLAUDE.md / AGENTS.md to reference `task` commands
-4. Remove MCP server from `.mcp.json`
-5. Delete `openclaw-mcp-server.mjs`
 
 ## 7. Open Questions
 
