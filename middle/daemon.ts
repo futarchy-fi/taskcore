@@ -154,7 +154,9 @@ async function main(): Promise<void> {
 
   // Cleanup stale worktrees from previous crashes
   try {
-    const cleaned = cleanupStaleWorktrees(config.worktreeBaseDir);
+    const reposToClean = [config.journalRepoPath];
+    if (config.defaultCodeRepo) reposToClean.push(config.defaultCodeRepo);
+    const cleaned = cleanupStaleWorktrees(config.worktreeBaseDir, reposToClean);
     if (cleaned > 0) {
       console.log(`[daemon] Cleaned up ${cleaned} stale worktree(s)`);
     }
