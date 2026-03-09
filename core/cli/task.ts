@@ -754,6 +754,7 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     process.stdout.write(`  ... and ${claimable.length - 10} more\n`);
   }
 
+  process.stdout.write(`\n  * = assigned to you — claim these first\n`);
   process.stdout.write(`\n  Claim a task:    task claim <id>\n`);
   process.stdout.write(`  Start your own:  task do "title"\n\n`);
 }
@@ -1497,10 +1498,36 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
     }
   }
 
+  const phase = asString(task["phase"]) ?? "execution";
   process.stdout.write("\n## Next Steps\n");
-  process.stdout.write("  task submit \"what you did\"   — when done\n");
-  process.stdout.write("  task block \"what's wrong\"    — if stuck\n");
-  process.stdout.write("  task show                    — full task details\n");
+
+  if (phase === "analysis") {
+    process.stdout.write("  Your PRIMARY job is to DECIDE how to handle this task:\n\n");
+    process.stdout.write("  task decide execute       — task is small enough, proceed to implementation\n");
+    process.stdout.write("  task decide decompose     — task is too large, break into subtasks\n");
+    process.stdout.write("  task block \"reason\"        — can't proceed at all\n\n");
+    process.stdout.write("  IMPORTANT: If this task would take more than one session to complete,\n");
+    process.stdout.write("  you MUST decompose it into smaller subtasks. Do NOT attempt to execute\n");
+    process.stdout.write("  a large task and then block when you run out of time.\n");
+  } else if (phase === "review") {
+    process.stdout.write("  task review read                      — read the submitted evidence\n");
+    process.stdout.write("  task review approve                   — approve the work\n");
+    process.stdout.write("  task review reject                    — reject the work\n");
+    process.stdout.write("  task review request-changes \"notes\"   — request changes\n");
+  } else if (phase === "decomposition") {
+    process.stdout.write("  task decompose start      — begin decomposition\n");
+    process.stdout.write("  task decompose add \"...\"  — add a child task\n");
+    process.stdout.write("  task decompose commit     — finalize children\n");
+    process.stdout.write("  task decompose cancel     — cancel decomposition\n");
+  } else {
+    process.stdout.write("  task submit \"what you did\"   — when done\n");
+    process.stdout.write("  task complete \"evidence\"     — done, no review needed\n");
+    process.stdout.write("  task block \"what's wrong\"    — if stuck\n");
+    process.stdout.write("  task update \"progress\"       — log progress\n");
+    process.stdout.write("  task do \"step\" --parent T" + taskId + "  — decompose into subtasks if too large\n");
+  }
+
+  process.stdout.write("\n  task show                    — full task details\n");
   process.stdout.write("  task extend                  — extend lease\n");
 }
 
@@ -2073,6 +2100,11 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
         return;
       }
       process.stdout.write(getString(response, "text", "No review context available.") + "\n");
+      process.stdout.write("\n--- Review this evidence, then decide: ---\n");
+      process.stdout.write("  task review approve \"summary\"              — work is acceptable\n");
+      process.stdout.write("  task review reject \"reason\"                — work is unacceptable\n");
+      process.stdout.write("  task review request-changes \"feedback\"     — needs revisions\n");
+      process.stdout.write("  task review note \"observation\"             — save a note before deciding\n");
       return;
     }
 
