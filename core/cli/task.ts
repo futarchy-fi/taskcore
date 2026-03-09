@@ -1851,10 +1851,61 @@ function getReviewEvidence(taskId: string, explicit: string | null): string {
 }
 
 async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
-  requireAgentId();
+  const agentId = requireAgentId();
 
   const sub = argv[0];
   const args = argv.slice(1);
+
+  // "list" doesn't require an active task
+  if (sub === "list") {
+    const { flags } = parseFlags(args);
+    const mine = getFlagBool(flags, "mine");
+    const body = await apiRequest("GET", "/tasks?full=true");
+    const tasks = asArray<unknown>(body["tasks"])
+      .map((t) => asRecord(t))
+      .filter((t): t is Record<string, unknown> => t !== null)
+      .filter((t) => {
+        if (getString(t, "terminal")) return false;
+        if (getString(t, "phase") !== "review") return false;
+        if (getString(t, "condition") !== "ready") return false;
+        if (mine) {
+          const meta = asRecord(t["metadata"]) ?? {};
+          const reviewer = getString(meta, "reviewer");
+          if (reviewer && reviewer !== agentRole(agentId) && reviewer !== agentId) return false;
+        }
+        return true;
+      })
+      .sort((a, b) => getNumber(a, "updatedAt") - getNumber(b, "updatedAt"));
+
+    if (jsonMode) {
+      process.stdout.write(JSON.stringify({ count: tasks.length, tasks: tasks.map((t) => ({
+        id: getString(t, "id"), title: getString(t, "title"),
+        reviewer: getString(asRecord(t["metadata"]) ?? {}, "reviewer", "-"),
+        updatedAt: getString(t, "updatedAt"),
+      }))}, null, 2) + "\n");
+      return;
+    }
+
+    if (tasks.length === 0) {
+      process.stdout.write("No tasks waiting for review.\n");
+      return;
+    }
+
+    process.stdout.write(`${tasks.length} tasks waiting for review:\n\n`);
+    for (const t of tasks) {
+      const tid = getString(t, "id");
+      const title = getString(t, "title", "(untitled)");
+      const meta = asRecord(t["metadata"]) ?? {};
+      const reviewer = getString(meta, "reviewer", "-");
+      const updatedAt = getNumber(t, "updatedAt");
+      const ago = updatedAt > 0 ? formatDuration(Date.now() - updatedAt) : "?";
+      process.stdout.write(`  T${tid}  ${title}\n`);
+      process.stdout.write(`         reviewer: ${reviewer}  waiting: ${ago}\n`);
+    }
+    process.stdout.write("\nTo review: task claim <id>, then task review read/approve/reject\n");
+    return;
+  }
+
   const taskId = currentTaskId();
 
   switch (sub) {
@@ -1935,7 +1986,7 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
     }
 
     default:
-      throw new CliError("Usage: task review <read|note|approve|reject|request-changes> ...", 1);
+      throw new CliError("Usage: task review <list|read|note|approve|reject|request-changes> ...", 1);
   }
 }
 
