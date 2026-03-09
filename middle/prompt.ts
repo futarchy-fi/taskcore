@@ -143,8 +143,9 @@ function buildWorkPrompt(core: Core, task: Task, config: Config, overrides?: Pro
   const journalBase = overrides?.journalWorktreePath
     ?? getWorktreePath(config.worktreeBaseDir, task.id, "journal");
   const journalPath = `${journalBase}/tasks/T${task.id}/`;
+  const hasRepo = !!(task.metadata["repo"] || config.defaultCodeRepo);
   const codeWorktree = overrides?.codeWorktreePath
-    ?? (task.metadata["repo"]
+    ?? (hasRepo
       ? getWorktreePath(config.worktreeBaseDir, task.id, "code")
       : null);
 
@@ -230,7 +231,7 @@ function buildReviewPrompt(core: Core, task: Task, config: Config): string {
   }
 
   // Code changes — prefer worktree branch diff, fall back to colony diff
-  const targetRepo = task.metadata["repo"] as string | undefined;
+  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
   const diff = targetRepo
     ? getTaskDiff(task, targetRepo)
     : getTaskDiff(task, config.workspaceDir);

@@ -1442,8 +1442,14 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
   process.stdout.write("\n## Your Workspace\n");
   if (journalPath) process.stdout.write(`  Journal: ${journalPath}\n`);
   if (codeWorktree) {
-    process.stdout.write(`  Code:    ${codeWorktree}\n\n`);
-    process.stdout.write(`  cd ${codeWorktree}\n`);
+    const taskMeta = asRecord(task["metadata"]);
+    const explicitRepo = taskMeta ? asString(taskMeta["repo"]) : null;
+    process.stdout.write(`  Code:    ${codeWorktree}\n`);
+    if (!explicitRepo) {
+      process.stdout.write(`  (default repo — wrong repo? Run: task metadata ${taskId} repo=<local-path>)\n`);
+      process.stdout.write(`  Known repos: colony=/home/ubuntu/.openclaw/workspace  core=/home/ubuntu/.openclaw/workspace/core\n`);
+    }
+    process.stdout.write(`\n  cd ${codeWorktree}\n`);
   } else if (journalWorktree) {
     process.stdout.write(`\n  cd ${journalWorktree}\n`);
   }

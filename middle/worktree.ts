@@ -18,26 +18,48 @@ export function createWorktree(
 ): string {
   ensureDir(path.dirname(worktreePath));
 
-  const args = ["worktree", "add", worktreePath, branch];
-  if (startPoint) {
-    // Create new branch from startPoint: git worktree add <path> -b <branch> <startPoint>
-    args.length = 0;
-    args.push("worktree", "add", worktreePath, "-b", branch, startPoint);
-  }
+  // For git-crypt repos, we must use --no-checkout first, then symlink the
+  // crypt keys, then checkout — otherwise the smudge filter fails because
+  // the worktree doesn't have the keys yet.
+  const useGitCrypt = fs.existsSync(path.join(repoPath, ".git", "git-crypt"));
 
-  try {
-    git(repoPath, args);
-  } catch (err) {
-    // Branch may already exist — try without -b
-    if (startPoint && String(err).includes("already exists")) {
-      git(repoPath, ["worktree", "add", worktreePath, branch]);
-    } else {
-      throw err;
+  if (useGitCrypt) {
+    const args = startPoint
+      ? ["worktree", "add", "--no-checkout", worktreePath, "-b", branch, startPoint]
+      : ["worktree", "add", "--no-checkout", worktreePath, branch];
+
+    try {
+      git(repoPath, args);
+    } catch (err) {
+      if (startPoint && String(err).includes("already exists")) {
+        git(repoPath, ["worktree", "add", "--no-checkout", worktreePath, branch]);
+      } else {
+        throw err;
+      }
     }
-  }
 
-  // Apply git-crypt symlink if the main repo uses it
-  applyGitCryptSymlink(repoPath, worktreePath);
+    // Symlink git-crypt keys before checkout
+    applyGitCryptSymlink(repoPath, worktreePath);
+
+    // Now checkout with the keys in place
+    git(worktreePath, ["checkout", branch, "--"]);
+  } else {
+    const args = startPoint
+      ? ["worktree", "add", worktreePath, "-b", branch, startPoint]
+      : ["worktree", "add", worktreePath, branch];
+
+    try {
+      git(repoPath, args);
+    } catch (err) {
+      if (startPoint && String(err).includes("already exists")) {
+        git(repoPath, ["worktree", "add", worktreePath, branch]);
+      } else {
+        throw err;
+      }
+    }
+
+    applyGitCryptSymlink(repoPath, worktreePath);
+  }
 
   return worktreePath;
 }
