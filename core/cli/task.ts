@@ -1276,6 +1276,9 @@ async function cmdDo(argv: string[], jsonMode: boolean): Promise<void> {
   }
   process.stdout.write(`  task block "what's wrong"     — if stuck\n`);
   process.stdout.write(`  task update "progress"        — log progress\n`);
+  process.stdout.write(`\nMultiple steps? Break it down:\n`);
+  process.stdout.write(`  task do "step 1" --parent T${taskId}\n`);
+  process.stdout.write(`  task do "step 2" --parent T${taskId}\n`);
 }
 
 async function cmdLog(argv: string[], jsonMode: boolean): Promise<void> {
