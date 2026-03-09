@@ -38,6 +38,52 @@ import { agentRole, loadRegistry, validateMetadataRoles, type Registry } from ".
 import { createWorktree, getWorktreePath } from "./worktree.js";
 
 // ---------------------------------------------------------------------------
+// Auto-incident emitter
+// ---------------------------------------------------------------------------
+
+function appendIncident(
+  config: Config,
+  severity: "critical" | "error" | "warning" | "info",
+  category: string,
+  summary: string,
+  detail?: string,
+  tags?: string[],
+): void {
+  try {
+    const now = new Date();
+    const day = now.toISOString().slice(0, 10);
+    const dir = path.join(config.workspaceDir, "data", "incidents");
+    fs.mkdirSync(dir, { recursive: true });
+    const ts = now.toISOString();
+    const idSuffix = crypto.randomUUID().slice(0, 5);
+    const id = `inc_${day.replace(/-/g, "")}_${ts.slice(11, 19).replace(/:/g, "")}_${idSuffix}`;
+    const record = {
+      id,
+      ts,
+      severity,
+      category,
+      source: "taskcore",
+      detection: "auto",
+      summary,
+      detail: detail ?? null,
+      context: null,
+      chain_id: null,
+      parent_id: null,
+      tags: tags ?? [],
+      resolved: false,
+      resolved_at: null,
+      resolved_by: null,
+    };
+    fs.appendFileSync(path.join(dir, `${day}.jsonl`), JSON.stringify(record) + "\n");
+  } catch {
+    // Non-fatal — don't break task operations for incident logging
+  }
+}
+
+// Module-level config ref, set once in createHttpServer()
+let _config: Config | null = null;
+
+// ---------------------------------------------------------------------------
 // Priority helpers
 // ---------------------------------------------------------------------------
 
@@ -325,7 +371,47 @@ function submitOrError(core: Core, event: Event): RouteResult | null {
     };
   }
   broadcastTransition(core, event);
+  emitAutoIncident(core, event);
   return null;
+}
+
+/** Emit incidents for terminal/blocked events automatically. */
+function emitAutoIncident(core: Core, event: Event): void {
+  if (!_config) return;
+  const task = core.getTask(event.taskId);
+  const title = task ? task.title.slice(0, 80) : `T${event.taskId}`;
+  const tid = `T${event.taskId}`;
+
+  switch (event.type) {
+    case "TaskFailed": {
+      const tf = event as TaskFailed;
+      appendIncident(_config, "error", "task-failure",
+        `${tid} failed: ${tf.reason}`,
+        `Task: ${title}. ${tf.summary?.whatFailed ?? ""}`.trim(),
+        ["task-failed", `task-${event.taskId}`],
+      );
+      break;
+    }
+    case "TaskBlocked": {
+      const tb = event as TaskBlocked;
+      appendIncident(_config, "warning", "task-blocked",
+        `${tid} blocked: ${tb.reason.slice(0, 100)}`,
+        `Task: ${title}. ${tb.reason}`,
+        ["task-blocked", `task-${event.taskId}`],
+      );
+      break;
+    }
+    case "TaskExhausted": {
+      appendIncident(_config, "warning", "task-exhausted",
+        `${tid} exhausted budget`,
+        `Task: ${title}. All attempt budgets consumed.`,
+        ["task-exhausted", `task-${event.taskId}`],
+      );
+      break;
+    }
+    default:
+      break;
+  }
 }
 
 function defaultStateRef(): StateRef {
@@ -512,6 +598,7 @@ export function createHttpServer(
   core: Core,
   config: Config,
 ): http.Server {
+  _config = config;
   const registry = loadRegistry(config.agentRegistry);
   const routes = buildRoutes(core, config, registry);
 
