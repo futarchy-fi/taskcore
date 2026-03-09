@@ -59,6 +59,8 @@ export interface Config {
   journalRepoPath: string;
   /** Base directory for git worktrees (journal + code) */
   worktreeBaseDir: string;
+  /** Default code repo path — used when task.metadata.repo is not set */
+  defaultCodeRepo: string;
 }
 
 export function loadConfig(): Config {
@@ -108,5 +110,6 @@ export function loadConfig(): Config {
       `${process.env["HOME"]}/.openclaw/journal`,
     ),
     worktreeBaseDir: envStr("WORKTREE_BASE_DIR", "/tmp/taskcore-worktrees"),
+    defaultCodeRepo: envStr("DEFAULT_CODE_REPO", ""),
   };
 }

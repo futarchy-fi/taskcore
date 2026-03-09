@@ -370,7 +370,7 @@ function ensureTaskWorkspaces(config: Config, task: Task): {
     warnings.push(`journal worktree setup failed: ${String(err)}`);
   }
 
-  const targetRepo = task.metadata["repo"] as string | undefined;
+  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
   if (targetRepo) {
     try {
       const cPath = getWorktreePath(config.worktreeBaseDir, task.id, "code");
@@ -1687,12 +1687,52 @@ function applyRejectTransition(
   let err = submitOrError(core, verdict);
   if (err) return err;
 
+  // Check if review attempts remain — if so, send back to execution for revision
+  const reviewUsed = task.attempts.review.used;
+  const reviewMax = task.attempts.review.max;
+  const canRetry = reviewUsed < reviewMax;
+
+  if (canRetry) {
+    const policyMet: ReviewPolicyMet = {
+      type: "ReviewPolicyMet",
+      taskId: task.id,
+      ts: ts + 1,
+      outcome: "changes_requested",
+      summary: evidence ?? "Rejected by reviewer — sending back for revision",
+      source: { type: "middle", id: "daemon" },
+    };
+    err = submitOrError(core, policyMet);
+    if (err) return err;
+
+    const transition: PhaseTransition = {
+      type: "PhaseTransition",
+      taskId: task.id,
+      ts: ts + 2,
+      from: { phase: "review", condition: "active" },
+      to: { phase: "execution", condition: "ready" },
+      reasonCode: "changes_requested",
+      reason: evidence ?? "Rejected by reviewer — revision needed",
+      fenceToken,
+      agentContext: ctx,
+    };
+    err = submitOrError(core, transition);
+    if (err) return err;
+
+    notifyInformed(task, "🔄 Changes requested", evidence ?? "Rejected by reviewer — sent back for revision");
+
+    return {
+      status: 200,
+      body: { ok: true, taskId: task.id, transition: "review.active → execution.ready (changes requested)" },
+    };
+  }
+
+  // No review attempts left — terminal failure
   const policyMet: ReviewPolicyMet = {
     type: "ReviewPolicyMet",
     taskId: task.id,
     ts: ts + 1,
     outcome: "escalated",
-    summary: evidence ?? "Rejected by reviewer",
+    summary: evidence ?? "Rejected by reviewer — no review attempts remaining",
     source: { type: "middle", id: "daemon" },
   };
   err = submitOrError(core, policyMet);
@@ -1708,18 +1748,18 @@ function applyRejectTransition(
       childId: null,
       approach: "review phase",
       whatFailed: evidence ?? "Rejected by reviewer",
-      whatWasLearned: "Reviewer rejected the submission.",
+      whatWasLearned: "Reviewer rejected the submission. All review attempts exhausted.",
       artifactRef: null,
     },
   };
   err = submitOrError(core, failed);
   if (err) return err;
 
-  notifyInformed(task, "❌ Rejected", evidence ?? "Rejected by reviewer");
+  notifyInformed(task, "❌ Rejected (final)", evidence ?? "Rejected by reviewer — all attempts exhausted");
 
   return {
     status: 200,
-    body: { ok: true, taskId: task.id, transition: "review.active → failed" },
+    body: { ok: true, taskId: task.id, transition: "review.active → failed (review budget exhausted)" },
   };
 }
 
