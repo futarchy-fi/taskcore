@@ -6,6 +6,7 @@ import {
   type Event,
   type EventType,
   type FailureSummary,
+  isSiblingTurnWait,
   type Phase,
   type PhaseTransitionReason,
   type SystemState,
@@ -18,6 +19,7 @@ const CORE_ONLY_EVENTS = new Set<EventType>([
   "LeaseExpired",
   "BackoffExpired",
   "DependencySatisfied",
+  "ChildActivated",
   "ChildCostRecovered",
   "CheckpointTriggered",
   "TaskExhausted",
@@ -821,6 +823,33 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
 
     case "TaskCanceled":
       return null;
+
+    case "ChildActivated": {
+      // Child must be waiting with sibling_turn wait state
+      if (task.condition !== "waiting") {
+        return mkError(event, "invalid_condition", "ChildActivated requires child in waiting condition.");
+      }
+      if (!task.waitState || !isSiblingTurnWait(task.waitState)) {
+        return mkError(event, "invalid_wait_state", "ChildActivated requires child with sibling_turn wait state.");
+      }
+      // Parent must exist and have sequential coordination
+      const parent = state.tasks[event.parentId];
+      if (!parent) {
+        return mkError(event, "parent_missing", `Parent task ${event.parentId} does not exist.`);
+      }
+      if (!parent.coordination || parent.coordination.mode !== "sequential_children") {
+        return mkError(event, "no_sequential_coordination", "Parent must have sequential_children coordination.");
+      }
+      // Index must be valid
+      if (event.index < 0 || event.index >= parent.coordination.childOrder.length) {
+        return mkError(event, "invalid_index", "ChildActivated index out of bounds.");
+      }
+      // The child at this index must match taskId
+      if (parent.coordination.childOrder[event.index] !== event.taskId) {
+        return mkError(event, "index_mismatch", "ChildActivated index does not match taskId in coordination order.");
+      }
+      return null;
+    }
 
     default: {
       const neverEvent: never = event;

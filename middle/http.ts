@@ -170,6 +170,7 @@ interface DecomposeBody {
     dependsOnSiblings?: number[];
   }>;
   approach?: string;
+  coordinationMode?: "sequential" | "parallel";
 }
 
 // ---------------------------------------------------------------------------
@@ -2384,7 +2385,7 @@ function handleDecomposeCommit(
       };
     }
 
-    const b = body as { approach?: string };
+    const b = body as { approach?: string; coordinationMode?: string };
     const approach = b.approach ?? (pending.approach || "Decomposed via incremental CLI");
 
     // Delegate to the one-shot handler logic by constructing a DecomposeBody
@@ -2514,6 +2515,9 @@ function handleDecomposeCommit(
       .filter((id): id is string => id !== undefined);
 
     // Submit DecompositionCreated
+    // Default to sequential_children for new decompositions; pass "parallel" to opt out
+    const coordMode = b.coordinationMode === "parallel" ? null : { mode: "sequential_children" as const, reviewBetweenChildren: false };
+
     const decomp: DecompositionCreated = {
       type: "DecompositionCreated",
       taskId, ts: now + 3,
@@ -2523,6 +2527,7 @@ function handleDecomposeCommit(
       checkpoints: checkpointTaskIds,
       completionRule: "and",
       agentContext: ctx,
+      coordinationMode: coordMode,
     };
 
     let err = submitOrError(core, decomp);
@@ -2749,6 +2754,9 @@ function handleDecompose(
     }
 
     // Submit DecompositionCreated
+    // Default to sequential_children for new decompositions; pass "parallel" to opt out
+    const coordMode2 = b.coordinationMode === "parallel" ? null : { mode: "sequential_children" as const, reviewBetweenChildren: false };
+
     const decomp: DecompositionCreated = {
       type: "DecompositionCreated",
       taskId, ts: now + 3,
@@ -2758,6 +2766,7 @@ function handleDecompose(
       checkpoints: [],
       completionRule: "and",
       agentContext: ctx,
+      coordinationMode: coordMode2,
     };
 
     let err = submitOrError(core, decomp);
