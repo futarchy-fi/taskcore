@@ -204,8 +204,28 @@ export class CoreClock {
             };
             due.push(wakeParent);
             emittedChildActivation = true;
+          } else if (activeChild.terminal === "done" && coord.reviewBetweenChildren) {
+            // Parent mediation: wake parent for review instead of auto-activating next child
+            const wakeForReview: PhaseTransition = {
+              type: "PhaseTransition",
+              taskId: task.id,
+              ts: now,
+              from: { phase: "analysis", condition: "waiting" },
+              to: { phase: "analysis", condition: "ready" },
+              reasonCode: "child_review_due",
+              reason: `Sequential child ${activeChildId} completed; parent review required`,
+              fenceToken: task.currentFenceToken,
+              agentContext: {
+                sessionId: "core",
+                agentId: "core",
+                memoryRef: null,
+                contextTokens: null,
+                modelId: "core",
+              },
+            };
+            due.push(wakeForReview);
+            emittedChildActivation = true;
           }
-          // If reviewBetweenChildren === true and child done, don't auto-activate (Phase 3)
         }
       }
 
