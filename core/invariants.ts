@@ -265,6 +265,141 @@ function checkEventMonotonicity(events: Array<{ sequence: number; event: Event }
   }
 }
 
+/**
+ * Runtime contract: Validate analyzer/decomposition cost integrity.
+ * Ensures that children cannot collectively cost more than parent allocation.
+ */
+function validateDecompositionCostIntegrity(
+  tasks: Record<TaskId, Task>,
+  violations: InvariantViolation[],
+): void {
+  for (const task of Object.values(tasks)) {
+    if (task.children.length === 0) {
+      continue;
+    }
+
+    // Sum all child allocations
+    let totalChildAllocated = 0;
+    for (const childId of task.children) {
+      const child = tasks[childId];
+      if (child) {
+        totalChildAllocated += child.cost.allocated;
+      }
+    }
+
+    // Check that parent has enough budget for all children
+    if (totalChildAllocated > task.cost.allocated) {
+      push(
+        violations,
+        "decomposition_cost_overflow",
+        "Total child cost allocations exceed parent allocated cost.",
+        task.id,
+        {
+          totalChildAllocated,
+          parentAllocated: task.cost.allocated,
+        },
+      );
+    }
+
+    // Check that recovered + remaining + consumed accounts for all allocated
+    const accounted = task.cost.consumed + task.cost.childAllocated - task.cost.childRecovered + computeCostRemaining(task.cost);
+    if (Math.abs(accounted - task.cost.allocated) > 0.001) {
+      push(
+        violations,
+        "cost_accounting_mismatch",
+        "Cost accounting does not balance: consumed + childAllocated - childRecovered + remaining != allocated.",
+        task.id,
+        {
+          allocated: task.cost.allocated,
+          consumed: task.cost.consumed,
+          childAllocated: task.cost.childAllocated,
+          childRecovered: task.cost.childRecovered,
+          remaining: computeCostRemaining(task.cost),
+          accounted,
+        },
+      );
+    }
+  }
+}
+
+/**
+ * Runtime contract: Validate that all decomposition children are accounted for.
+ * Ensures that children referenced in checkpoints or triggeredCheckpoints exist.
+ */
+function validateDecompositionIntegrity(
+  tasks: Record<TaskId, Task>,
+  violations: InvariantViolation[],
+): void {
+  for (const task of Object.values(tasks)) {
+    // Validate checkpoints reference existing children
+    for (const checkpointId of task.checkpoints) {
+      if (!task.children.includes(checkpointId)) {
+        push(
+          violations,
+          "orphaned_checkpoint",
+          "Checkpoint references non-existent child.",
+          task.id,
+          { checkpointId },
+        );
+      }
+    }
+
+    // Validate triggeredCheckpoints are subset of checkpoints
+    for (const triggeredId of task.triggeredCheckpoints) {
+      if (!task.checkpoints.includes(triggeredId)) {
+        push(
+          violations,
+          "unknown_triggered_checkpoint",
+          "Triggered checkpoint is not in checkpoints list.",
+          task.id,
+          { triggeredId },
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Runtime contract: Validate audit trail completeness.
+ * Ensures that terminal tasks have proper failure summaries.
+ */
+function validateAuditTrail(tasks: Record<TaskId, Task>, violations: InvariantViolation[]): void {
+  for (const task of Object.values(tasks)) {
+    // Terminal tasks (failed/blocked) must have terminalSummary
+    if ((task.terminal === "failed" || task.terminal === "blocked") && task.terminalSummary === null) {
+      push(
+        violations,
+        "missing_terminal_audit_trail",
+        "Terminal task in failed/blocked state must have terminalSummary.",
+        task.id,
+        { terminal: task.terminal },
+      );
+    }
+
+    // Tasks with failureSummaries should have valid entries
+    for (const summary of task.failureSummaries) {
+      if (!summary.whatFailed || summary.whatFailed.trim().length === 0) {
+        push(
+          violations,
+          "incomplete_failure_summary",
+          "Failure summary missing whatFailed field.",
+          task.id,
+          { childId: summary.childId },
+        );
+      }
+      if (!summary.whatWasLearned || summary.whatWasLearned.trim().length === 0) {
+        push(
+          violations,
+          "incomplete_failure_summary",
+          "Failure summary missing whatWasLearned field.",
+          task.id,
+          { childId: summary.childId },
+        );
+      }
+    }
+  }
+}
+
 export function checkInvariants(state: SystemState): InvariantViolation[] {
   const violations: InvariantViolation[] = [];
 
@@ -282,6 +417,11 @@ export function checkInvariants(state: SystemState): InvariantViolation[] {
   detectParentCycles(state.tasks, violations);
   validateParentChildLinks(state.tasks, violations);
   checkEventMonotonicity(state.events, violations);
+
+  // Analyzer/decomposer runtime contracts
+  validateDecompositionCostIntegrity(state.tasks, violations);
+  validateDecompositionIntegrity(state.tasks, violations);
+  validateAuditTrail(state.tasks, violations);
 
   return violations;
 }

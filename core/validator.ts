@@ -238,6 +238,87 @@ function validatePhaseTransition(event: Extract<Event, { type: "PhaseTransition"
   return null;
 }
 
+function validateChildDependencies(
+  children: Extract<Event, { type: "DecompositionCreated" }>["children"],
+  parentId: string,
+): ValidationError | null {
+  // Build dependency graph for cycle detection
+  const childIds = new Set(children.map((c) => c.taskId));
+  const dependencyGraph = new Map<string, string[]>();
+
+  for (const child of children) {
+    const deps: string[] = [];
+    for (const dep of child.dependencies) {
+      if (dep.type === "task" && childIds.has(dep.target)) {
+        deps.push(dep.target);
+      }
+      // Check for self-dependency
+      if (dep.type === "task" && dep.target === child.taskId) {
+        return {
+          ok: false as const,
+          error: {
+            code: "child_self_dependency",
+            message: `Child ${child.taskId} cannot depend on itself.`,
+            taskId: child.taskId,
+          } as ValidationError,
+        }.error;
+      }
+      // Check for dependency on parent (not yet created)
+      if (dep.type === "task" && dep.target === parentId) {
+        return {
+          ok: false as const,
+          error: {
+            code: "child_parent_dependency",
+            message: `Child ${child.taskId} cannot depend on its parent task.`,
+            taskId: child.taskId,
+          } as ValidationError,
+        }.error;
+      }
+    }
+    dependencyGraph.set(child.taskId, deps);
+  }
+
+  // Detect cycles using DFS
+  const visited = new Set<string>();
+  const recStack = new Set<string>();
+
+  function hasCycle(node: string, path: string[]): boolean {
+    visited.add(node);
+    recStack.add(node);
+
+    const neighbors = dependencyGraph.get(node) || [];
+    for (const neighbor of neighbors) {
+      if (!visited.has(neighbor)) {
+        if (hasCycle(neighbor, [...path, neighbor])) {
+          return true;
+        }
+      } else if (recStack.has(neighbor)) {
+        // Found a cycle
+        return true;
+      }
+    }
+
+    recStack.delete(node);
+    return false;
+  }
+
+  for (const childId of childIds) {
+    if (!visited.has(childId)) {
+      if (hasCycle(childId, [childId])) {
+        return {
+          ok: false as const,
+          error: {
+            code: "child_dependency_cycle",
+            message: `Cycle detected in child dependencies involving ${childId}.`,
+          } as ValidationError,
+        }.error;
+      }
+    }
+  }
+
+  return null;
+}
+
 function validateChildren(
   event: Extract<Event, { type: "DecompositionCreated" }>,
   state: SystemState,
@@ -268,6 +349,14 @@ function validateChildren(
       });
     }
 
+    // Cost guard: minimum allocation to prevent dust allocations
+    if (child.costAllocation < 1) {
+      return mkError(event, "cost_allocation_too_small", "Child cost allocation must be at least 1.", {
+        childId: child.taskId,
+        costAllocation: child.costAllocation,
+      });
+    }
+
     const depDup = duplicateIds(child.dependencies.map((dependency) => dependency.id));
     if (depDup.length > 0) {
       return mkError(event, "duplicate_dependency", "Child dependencies must have unique ids.", {
@@ -275,6 +364,12 @@ function validateChildren(
         duplicateIds: depDup,
       });
     }
+  }
+
+  // Runtime contract: detect cycles in child dependencies
+  const cycleError = validateChildDependencies(event.children, task.id);
+  if (cycleError) {
+    return cycleError;
   }
 
   const checkpointsNotChild = event.checkpoints.filter((checkpoint) => !ids.includes(checkpoint));
@@ -289,6 +384,15 @@ function validateChildren(
     return mkError(event, "cost_over_allocation", "Child allocation exceeds parent remaining cost.", {
       totalAllocation,
       remaining: computeCostRemaining(task.cost),
+    });
+  }
+
+  // Cost guard: warn if allocating more than 80% of budget (soft limit for future warnings)
+  const remainingAfterAllocation = computeCostRemaining(task.cost) - totalAllocation;
+  if (remainingAfterAllocation < 0) {
+    return mkError(event, "cost_over_allocation", "Total child allocation exceeds available budget.", {
+      totalAllocation,
+      available: computeCostRemaining(task.cost),
     });
   }
 
