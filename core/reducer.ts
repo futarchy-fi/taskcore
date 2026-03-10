@@ -545,6 +545,85 @@ function applyChildActivated(state: SystemState, event: Extract<Event, { type: "
   }
 }
 
+function applyChildReviewDecisionSubmitted(
+  state: SystemState,
+  event: Extract<Event, { type: "ChildReviewDecisionSubmitted" }>,
+  task: Task,
+): void {
+  const t = deepCloneTask(task);
+
+  if (!t.coordination) return;
+  const coord = { ...t.coordination };
+
+  coord.lastCompletedChildId = event.childId;
+
+  switch (event.decision) {
+    case "continue_next_child": {
+      if (coord.nextChildIndex < coord.childOrder.length) {
+        const nextChildId = coord.childOrder[coord.nextChildIndex]!;
+        const nextChild = state.tasks[nextChildId];
+
+        // Activate the next child
+        if (nextChild && nextChild.terminal === null) {
+          const nextClone = deepCloneTask(nextChild);
+          nextClone.condition = "ready";
+          nextClone.waitState = null;
+          nextClone.updatedAt = event.ts;
+          state.tasks[nextClone.id] = nextClone;
+        }
+
+        coord.activeChildId = nextChildId;
+        coord.nextChildIndex += 1;
+
+        // Parent goes back to waiting for the next child
+        t.condition = "waiting";
+        t.leasedTo = null;
+        t.leaseExpiresAt = null;
+        t.retryAfter = null;
+        t.lastAgentExitAt = null;
+      }
+      // If no more children, parent stays analysis.active — agent decides next
+      break;
+    }
+
+    case "redecompose_remaining": {
+      // Cancel remaining non-terminal children
+      for (let i = coord.nextChildIndex; i < coord.childOrder.length; i++) {
+        const childId = coord.childOrder[i]!;
+        const child = state.tasks[childId];
+        if (child && child.terminal === null) {
+          const childClone = deepCloneTask(child);
+          childClone.terminal = "canceled";
+          childClone.phase = null;
+          childClone.condition = null;
+          childClone.waitState = null;
+          childClone.updatedAt = event.ts;
+          state.tasks[childClone.id] = childClone;
+        }
+      }
+
+      // Parent transitions to decomposition.ready
+      t.phase = "decomposition";
+      t.condition = "ready";
+      t.sessionPolicy = sessionPolicyForPhase("decomposition");
+      t.leasedTo = null;
+      t.leaseExpiresAt = null;
+      t.retryAfter = null;
+      t.lastAgentExitAt = null;
+      break;
+    }
+
+    case "stop_children": {
+      // Parent stays analysis.active — agent decides what to do next
+      break;
+    }
+  }
+
+  t.coordination = coord;
+  t.updatedAt = event.ts;
+  state.tasks[t.id] = t;
+}
+
 function applyChildCostRecovered(state: SystemState, event: Extract<Event, { type: "ChildCostRecovered" }>, task: Task): void {
   const t = deepCloneTask(task);
 
@@ -915,6 +994,9 @@ function applyUnchecked(state: SystemState, event: Event): void {
       break;
     case "ChildActivated":
       applyChildActivated(state, event, task);
+      break;
+    case "ChildReviewDecisionSubmitted":
+      applyChildReviewDecisionSubmitted(state, event, task);
       break;
     case "ChildCostRecovered":
       applyChildCostRecovered(state, event, task);

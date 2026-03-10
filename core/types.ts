@@ -308,7 +308,8 @@ export type PhaseTransitionReason =
   | "add_children"
   | "children_all_failed"
   | "children_created"
-  | "children_complete";
+  | "children_complete"
+  | "child_review_due";
 
 export interface PhaseTransition extends BaseEvent {
   type: "PhaseTransition";
@@ -389,6 +390,24 @@ export interface ChildActivated extends BaseEvent {
   parentId: TaskId;
   index: number;
   source: EventSource;
+}
+
+// ---------------------------------------------------------------------------
+// Child review decisions (Phase 3: parent mediation)
+// ---------------------------------------------------------------------------
+
+export type ChildReviewDecision =
+  | "continue_next_child"
+  | "redecompose_remaining"
+  | "stop_children";
+
+export interface ChildReviewDecisionSubmitted extends BaseEvent {
+  type: "ChildReviewDecisionSubmitted";
+  childId: TaskId;
+  decision: ChildReviewDecision;
+  fenceToken: number;
+  notes: string;
+  agentContext: AgentContext;
 }
 
 export interface ChildCostRecovered extends BaseEvent {
@@ -550,6 +569,7 @@ export type Event =
   | BackoffExpired
   | DecompositionCreated
   | ChildActivated
+  | ChildReviewDecisionSubmitted
   | ChildCostRecovered
   | CheckpointTriggered
   | CheckpointCreated

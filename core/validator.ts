@@ -41,6 +41,7 @@ const PHASE_TRANSITION_TABLE = new Set<string>([
   transitionKey("decomposition", "active", "analysis", "waiting", "children_created"),
   transitionKey("analysis", "waiting", "analysis", "ready", "children_complete"),
   transitionKey("analysis", "waiting", "analysis", "ready", "children_all_failed"),
+  transitionKey("analysis", "waiting", "analysis", "ready", "child_review_due"),
 ]);
 
 function transitionKey(
@@ -847,6 +848,34 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       // The child at this index must match taskId
       if (parent.coordination.childOrder[event.index] !== event.taskId) {
         return mkError(event, "index_mismatch", "ChildActivated index does not match taskId in coordination order.");
+      }
+      return null;
+    }
+
+    case "ChildReviewDecisionSubmitted": {
+      // Parent must be analysis.active (agent is reviewing)
+      if (task.phase !== "analysis" || task.condition !== "active") {
+        return mkError(event, "invalid_state", "ChildReviewDecisionSubmitted requires parent in analysis.active.");
+      }
+      // Fence token must match
+      if (event.fenceToken !== task.currentFenceToken) {
+        return mkError(event, "stale_fence_token", "ChildReviewDecisionSubmitted fence token mismatch.");
+      }
+      // Parent must have sequential coordination
+      if (!task.coordination || task.coordination.mode !== "sequential_children") {
+        return mkError(event, "no_sequential_coordination", "Parent must have sequential_children coordination.");
+      }
+      // Referenced child must exist and be terminal
+      const reviewedChild = state.tasks[event.childId];
+      if (!reviewedChild) {
+        return mkError(event, "child_missing", `Child task ${event.childId} does not exist.`);
+      }
+      if (reviewedChild.terminal === null) {
+        return mkError(event, "child_not_terminal", "Referenced child must be in terminal state.");
+      }
+      // Notes must be non-empty
+      if (!nonEmptyText(event.notes)) {
+        return mkError(event, "invalid_notes", "ChildReviewDecisionSubmitted.notes must be non-empty.");
       }
       return null;
     }
