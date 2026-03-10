@@ -38,6 +38,7 @@ import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent
 import { agentRole, loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
 import { createWorktree, getWorktreePath } from "./worktree.js";
 import { verifyArtifacts } from "./finalize.js";
+import { createOrFindPr } from "./github.js";
 
 // ---------------------------------------------------------------------------
 // Auto-incident emitter
@@ -1680,6 +1681,47 @@ function mergeCodeBranch(config: Config, task: Task): void {
   }
 }
 
+/**
+ * For root-level code tasks (no parent or parent has no repo),
+ * create a GitHub PR from task/T{id} → baseBranch.
+ * Stores PR URL in task metadata via a side-effect log (non-blocking).
+ */
+function maybeCreatePr(config: Config, task: Task, core: Core): void {
+  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
+  if (!targetRepo) return;
+
+  // Only create PR for root code tasks (no parent, or parent without repo)
+  if (task.parentId) {
+    const parent = core.getState().tasks[task.parentId];
+    if (parent) {
+      const parentRepo = (parent.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
+      if (parentRepo) return; // parent also has a repo — child merges locally, parent creates PR
+    }
+  }
+
+  const branch = taskBranch(task.id);
+  const baseBranch = (task.metadata["baseBranch"] as string | undefined) || "main";
+  const title = `T${task.id}: ${task.title}`;
+  const body = [
+    `## Task ${task.id}`,
+    "",
+    task.title,
+    "",
+    `Branch: \`${branch}\` → \`${baseBranch}\``,
+  ].join("\n");
+
+  try {
+    const result = createOrFindPr(targetRepo, branch, baseBranch, title, body);
+    if (result.url) {
+      console.log(`[http] T${task.id} PR ${result.created ? "created" : "found"}: ${result.url}`);
+    } else if (result.error) {
+      console.warn(`[http] T${task.id} PR creation failed (non-fatal): ${result.error}`);
+    }
+  } catch (err) {
+    console.warn(`[http] T${task.id} PR creation failed (non-fatal):`, err);
+  }
+}
+
 function applyDoneTransition(
   core: Core,
   config: Config,
@@ -1725,6 +1767,7 @@ function applyDoneTransition(
 
     notifyInformed(task, "✅ Done");
     mergeCodeBranch(config, task);
+    maybeCreatePr(config, task, core);
 
     return {
       status: 200,
@@ -1806,6 +1849,7 @@ function applyDoneTransition(
 
   notifyInformed(task, "✅ Done");
   mergeCodeBranch(config, task);
+  maybeCreatePr(config, task, core);
 
   return {
     status: 200,
