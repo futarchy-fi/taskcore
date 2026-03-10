@@ -4,6 +4,14 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 
+// Handle EPIPE errors gracefully (e.g., when piping to head)
+process.stdout.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EPIPE") {
+    process.exit(0);
+  }
+  throw err;
+});
+
 const PORT = Number.parseInt(process.env["ORCHESTRATOR_PORT"] ?? "18800", 10);
 const BASE_URL = `http://127.0.0.1:${Number.isFinite(PORT) ? PORT : 18800}`;
 const ACTIVE_DIR = path.join(os.homedir(), ".taskcore", "active");
@@ -1223,15 +1231,19 @@ async function cmdDo(argv: string[], jsonMode: boolean): Promise<void> {
     skipAnalysis: true,
   };
 
+  const assignee = getFlagString(flags, "assignee");
   const priority = getFlagString(flags, "priority");
   const reviewer = getFlagString(flags, "reviewer");
   const informed = getFlagList(flags, "informed");
+  const repo = getFlagString(flags, "repo");
   const dependsOn = parseDependsOn(flags);
   const parent = getFlagString(flags, "parent");
 
+  if (assignee) body["assignee"] = assignee;
   if (priority) body["priority"] = priority;
   if (reviewer) body["reviewer"] = reviewer;
   if (informed.length > 0) body["informed"] = informed;
+  if (repo) body["repo"] = repo;
   if (dependsOn.length > 0) body["dependsOn"] = dependsOn;
   if (parent) body["parentId"] = normalizeTaskId(parent);
 
@@ -1284,6 +1296,14 @@ async function cmdDo(argv: string[], jsonMode: boolean): Promise<void> {
 
   process.stdout.write(`--- T${taskId}: ${title} ---\n`);
   process.stdout.write(`Created and claimed. You're working on it now.\n`);
+  const createWarnings = createResponse["warnings"];
+  if (Array.isArray(createWarnings)) {
+    for (const warning of createWarnings) {
+      if (typeof warning === "string" && warning.trim()) {
+        process.stdout.write(`Warning: ${warning}\n`);
+      }
+    }
+  }
   if (journalPath) process.stdout.write(`Journal: ${journalPath}\n`);
   if (codeWorktree) process.stdout.write(`Code:    ${codeWorktree}\n`);
   process.stdout.write(`\nWhen done:\n`);
@@ -2512,9 +2532,11 @@ const subcommandHelp: Record<string, string> = {
     "",
     "Options:",
     "  --description <text>   Task description (optional, defaults to title)",
+    "  --assignee <agent>     Assign to a specific agent",
     "  --priority <level>     Priority (critical, high, medium, low, backlog)",
     "  --reviewer <agent>     Set reviewer (submit sends for review)",
     "  --informed <ids>       Comma-separated agents to notify on completion",
+    "  --repo <repo>          Repository for this task",
     "  --depends-on <ids>     Comma-separated task IDs this depends on",
     "  --parent <id>          Parent task ID",
     "",
