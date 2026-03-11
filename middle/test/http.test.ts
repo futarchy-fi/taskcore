@@ -505,7 +505,7 @@ describe("HTTP API", () => {
       title: "Repo task",
       description: "Task with repo in metadata",
       assignee: "coder",
-      reviewer: "hermes",
+      reviewer: "overseer",
       skipAnalysis: true,
     });
     const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;
@@ -529,7 +529,7 @@ describe("HTTP API", () => {
       title: "Repo task zeroed",
       description: "Task with repo and zeroed stateRef",
       assignee: "coder",
-      reviewer: "hermes",
+      reviewer: "overseer",
       skipAnalysis: true,
     });
     const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;
@@ -554,7 +554,7 @@ describe("HTTP API", () => {
       title: "Parent task",
       description: "Will be decomposed",
       assignee: "coder",
-      reviewer: "hermes",
+      reviewer: "overseer",
       skipAnalysis: true,
     });
     const dummyId = (dummyRes.body as Record<string, unknown>)["taskId"] as string;
@@ -631,7 +631,7 @@ describe("HTTP API", () => {
       title: "Decomposable parent",
       description: "This one will be decomposed",
       assignee: "coder",
-      reviewer: "hermes",
+      reviewer: "overseer",
     });
     const parentId = (parentRes.body as Record<string, unknown>)["taskId"] as string;
 
@@ -813,7 +813,7 @@ describe("HTTP API", () => {
       title: "Repo task happy",
       description: "Task with repo and real stateRef",
       assignee: "coder",
-      reviewer: "hermes",
+      reviewer: "overseer",
       skipAnalysis: true,
     });
     const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;

@@ -966,6 +966,9 @@ function applyDoneTransition(
   evidence?: string,
   stateRef?: StateRef,
 ): RouteResult {
+  const completionErr = verifyCompletion(core, task, stateRef);
+  if (completionErr) return completionErr;
+
   if (task.phase !== "review" || task.condition !== "active") {
     return {
       status: 409,
@@ -975,9 +978,6 @@ function applyDoneTransition(
       },
     };
   }
-
-  const completionErr = verifyCompletion(core, task, stateRef);
-  if (completionErr) return completionErr;
 
   const round = task.reviewState?.round ?? 1;
 
