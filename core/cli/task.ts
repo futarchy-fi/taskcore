@@ -4,6 +4,14 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import {
+  agentRole,
+  claimabilityRoleTag,
+  compareClaimableTasks,
+  filterClaimableTasks,
+  includeReviewQueueTask,
+} from "./claimability.js";
+
 // Handle EPIPE errors gracefully (e.g., when piping to head)
 process.stdout.on("error", (err: NodeJS.ErrnoException) => {
   if (err.code === "EPIPE") {
@@ -350,12 +358,6 @@ function requireAgentId(): string {
   return agentId;
 }
 
-/** Extract agent role from instance ID: "claude.3" → "claude", "coder" → "coder" */
-function agentRole(agentId: string): string {
-  const dot = agentId.indexOf(".");
-  return dot >= 0 ? agentId.slice(0, dot) : agentId;
-}
-
 function currentTaskId(explicit?: string): string {
   if (explicit) return normalizeTaskId(explicit);
 
@@ -695,43 +697,9 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     return;
   }
 
-  // Filter to claimable tasks (*.ready, not terminal)
-  const claimable = tasks
-    .filter((t) => {
-      const terminal = getString(t, "terminal", "");
-      if (terminal) return false;
-      const condition = getString(t, "condition", "");
-      return condition === "ready";
-    })
-    .filter((t) => {
-      // If agent has a role, prefer tasks assigned to that role (but show all)
-      return true;
-    })
-    .sort((a, b) => {
-      const metaA = asRecord(a["metadata"]) ?? {};
-      const metaB = asRecord(b["metadata"]) ?? {};
-      // Sort order: 0 = assigned to me, 1 = unassigned, 2 = assigned to someone else
-      if (role) {
-        const aAssignee = getString(metaA, "assignee");
-        const aReviewer = getString(metaA, "reviewer");
-        const aPhase = getString(a, "phase");
-        const aIsMe = (aAssignee === role || (aPhase === "review" && aReviewer === role));
-        const aIsUnassigned = !aAssignee || aAssignee === "unset";
-        const aRank = aIsMe ? 0 : aIsUnassigned ? 1 : 2;
-        const bAssignee = getString(metaB, "assignee");
-        const bReviewer = getString(metaB, "reviewer");
-        const bPhase = getString(b, "phase");
-        const bIsMe = (bAssignee === role || (bPhase === "review" && bReviewer === role));
-        const bIsUnassigned = !bAssignee || bAssignee === "unset";
-        const bRank = bIsMe ? 0 : bIsUnassigned ? 1 : 2;
-        if (aRank !== bRank) return aRank - bRank;
-      }
-      // Then by priority
-      const pa = priorityRank(getString(metaA, "priority", "medium"));
-      const pb = priorityRank(getString(metaB, "priority", "medium"));
-      if (pa !== pb) return pa - pb;
-      return getNumber(b, "updatedAt") - getNumber(a, "updatedAt");
-    });
+  // Filter to claimable tasks (*.ready, not terminal, matching role)
+  const claimable = filterClaimableTasks(tasks, role)
+    .sort((a, b) => compareClaimableTasks(a, b, role));
 
   if (jsonMode) {
     process.stdout.write(JSON.stringify({
@@ -764,11 +732,7 @@ async function cmdHome(jsonMode: boolean): Promise<void> {
     const phase = getString(t, "phase", "?");
     const meta = asRecord(t["metadata"]) ?? {};
     const priority = getString(meta, "priority", "medium");
-    const assignee = getString(meta, "assignee", "");
-    const reviewer = getString(meta, "reviewer", "");
-    const isMatch = role && (assignee === role || (phase === "review" && reviewer === role));
-    const isUnassigned = !assignee || assignee === "unset";
-    const roleTag = isMatch ? " *" : isUnassigned ? " +" : "";
+    const roleTag = claimabilityRoleTag(t, role);
     rows.push([`  T${id}`, `[${priority}]`, `${phase}`, `${title}${roleTag}`]);
   }
   printTable(rows);
@@ -2088,21 +2052,14 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
   if (sub === "list") {
     const { flags } = parseFlags(args);
     const mine = getFlagBool(flags, "mine");
+    const all = getFlagBool(flags, "all");
     const body = await apiRequest("GET", "/tasks?full=true");
+    const myRole = agentRole(agentId);
+    const reviewScope = all ? "all" : mine ? "mine" : "claimable";
     const tasks = asArray<unknown>(body["tasks"])
       .map((t) => asRecord(t))
       .filter((t): t is Record<string, unknown> => t !== null)
-      .filter((t) => {
-        if (getString(t, "terminal")) return false;
-        if (getString(t, "phase") !== "review") return false;
-        if (getString(t, "condition") !== "ready") return false;
-        if (mine) {
-          const meta = asRecord(t["metadata"]) ?? {};
-          const reviewer = getString(meta, "reviewer");
-          if (reviewer && reviewer !== agentRole(agentId) && reviewer !== agentId) return false;
-        }
-        return true;
-      })
+      .filter((t) => includeReviewQueueTask(t, myRole, reviewScope))
       .sort((a, b) => getNumber(a, "updatedAt") - getNumber(b, "updatedAt"));
 
     if (jsonMode) {
@@ -2124,12 +2081,14 @@ async function cmdReview(argv: string[], jsonMode: boolean): Promise<void> {
       const tid = getString(t, "id");
       const title = getString(t, "title", "(untitled)");
       const meta = asRecord(t["metadata"]) ?? {};
-      const reviewer = getString(meta, "reviewer", "-");
+      const reviewer = getString(meta, "reviewer", "");
       const updatedAt = getNumber(t, "updatedAt");
       const ago = updatedAt > 0 ? formatDuration(Date.now() - updatedAt) : "?";
-      process.stdout.write(`  T${tid}  ${title}\n`);
-      process.stdout.write(`         reviewer: ${reviewer}  waiting: ${ago}\n`);
+      const roleTag = claimabilityRoleTag(t, myRole);
+      process.stdout.write(`  T${tid}  ${title}${roleTag}\n`);
+      process.stdout.write(`         reviewer: ${reviewer || "-"}  waiting: ${ago}\n`);
     }
+    process.stdout.write(`\n  * = assigned to you    + = unassigned (grab these!)\n`);
     process.stdout.write("\nTo review: task claim <id>, then task review read/approve/reject\n");
     return;
   }
