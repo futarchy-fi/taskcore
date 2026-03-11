@@ -501,19 +501,20 @@ describe("HTTP API", () => {
 
   test("verifyCompletion: rejects done when metadata.repo is set but stateRef is missing", async () => {
     // Create task, then set metadata.repo via PATCH
-    await request("POST", "/tasks", {
+    const createRes = await request("POST", "/tasks", {
       title: "Repo task",
       description: "Task with repo in metadata",
       assignee: "coder",
       reviewer: "hermes",
       skipAnalysis: true,
     });
-    await request("PATCH", "/tasks/1/metadata", { repo: "my-org/my-repo" });
+    const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;
+    await request("PATCH", `/tasks/${taskId}/metadata`, { repo: "my-org/my-repo" });
 
-    await bringToReviewActive("1");
+    await bringToReviewActive(taskId);
 
     // Attempt done without stateRef — should get 422
-    const doneRes = await request("POST", "/tasks/1/status", {
+    const doneRes = await request("POST", `/tasks/${taskId}/status`, {
       status: "done",
       evidence: "Looks good",
       // no stateRef
@@ -524,19 +525,20 @@ describe("HTTP API", () => {
   });
 
   test("verifyCompletion: rejects done when metadata.repo is set and stateRef is zeroed", async () => {
-    await request("POST", "/tasks", {
+    const createRes = await request("POST", "/tasks", {
       title: "Repo task zeroed",
       description: "Task with repo and zeroed stateRef",
       assignee: "coder",
       reviewer: "hermes",
       skipAnalysis: true,
     });
-    await request("PATCH", "/tasks/1/metadata", { repo: "my-org/my-repo" });
+    const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;
+    await request("PATCH", `/tasks/${taskId}/metadata`, { repo: "my-org/my-repo" });
 
-    await bringToReviewActive("1");
+    await bringToReviewActive(taskId);
 
     // Attempt done with zeroed stateRef — should get 422
-    const doneRes = await request("POST", "/tasks/1/status", {
+    const doneRes = await request("POST", `/tasks/${taskId}/status`, {
       status: "done",
       evidence: "Looks good",
       stateRef: { branch: "main", commit: "0000000", parentCommit: "0000000" },
@@ -547,24 +549,20 @@ describe("HTTP API", () => {
   });
 
   test("verifyCompletion: rejects done when children with completionRule='and' are not all done", async () => {
-    // Create parent task
-    await request("POST", "/tasks", {
+    // Create a dummy first task (skipAnalysis) to consume an ID, then the real parent
+    const dummyRes = await request("POST", "/tasks", {
       title: "Parent task",
       description: "Will be decomposed",
       assignee: "coder",
       reviewer: "hermes",
       skipAnalysis: true,
     });
+    const dummyId = (dummyRes.body as Record<string, unknown>)["taskId"] as string;
 
-    // Bring to execution.active so we can transition to analysis for decompose
-    // Actually, skipAnalysis puts us at execution.ready. We need to go through
-    // the decompose flow. Let's use analysis flow instead.
-    // Re-create without skipAnalysis and with the decompose endpoint.
-
-    // Lease for execution phase
-    await request("POST", "/tasks/1/events", {
+    // Bring dummy through lifecycle so it doesn't interfere
+    await request("POST", `/tasks/${dummyId}/events`, {
       type: "LeaseGranted",
-      taskId: "1",
+      taskId: dummyId,
       ts: Date.now(),
       fenceToken: 1,
       agentId: "coder",
@@ -575,9 +573,9 @@ describe("HTTP API", () => {
       contextBudget: 100,
     });
 
-    await request("POST", "/tasks/1/events", {
+    await request("POST", `/tasks/${dummyId}/events`, {
       type: "AgentStarted",
-      taskId: "1",
+      taskId: dummyId,
       ts: Date.now(),
       fenceToken: 1,
       agentContext: {
@@ -590,15 +588,15 @@ describe("HTTP API", () => {
     });
 
     // Submit review to move to review.ready
-    await request("POST", "/tasks/1/status", {
+    await request("POST", `/tasks/${dummyId}/status`, {
       status: "review",
       evidence: "Work done",
     });
 
     // Reviewer lease + start
-    await request("POST", "/tasks/1/events", {
+    await request("POST", `/tasks/${dummyId}/events`, {
       type: "LeaseGranted",
-      taskId: "1",
+      taskId: dummyId,
       ts: Date.now(),
       fenceToken: 2,
       agentId: "hermes",
@@ -608,9 +606,9 @@ describe("HTTP API", () => {
       sessionType: "fresh",
       contextBudget: 100,
     });
-    await request("POST", "/tasks/1/events", {
+    await request("POST", `/tasks/${dummyId}/events`, {
       type: "AgentStarted",
-      taskId: "1",
+      taskId: dummyId,
       ts: Date.now(),
       fenceToken: 2,
       agentContext: {
@@ -623,25 +621,24 @@ describe("HTTP API", () => {
     });
 
     // Send changes_requested to get back to execution
-    await request("POST", "/tasks/1/status", {
+    await request("POST", `/tasks/${dummyId}/status`, {
       status: "pending",
       evidence: "Need to decompose instead",
     });
 
-    // Now at execution.ready — but we need analysis.active to decompose.
-    // Simpler approach: create a fresh task without skipAnalysis.
-    // Let's create a second task for decomposition.
-    await request("POST", "/tasks", {
+    // Create the real decomposable parent (without skipAnalysis)
+    const parentRes = await request("POST", "/tasks", {
       title: "Decomposable parent",
       description: "This one will be decomposed",
       assignee: "coder",
       reviewer: "hermes",
     });
+    const parentId = (parentRes.body as Record<string, unknown>)["taskId"] as string;
 
-    // Task 2 is in analysis.ready. Lease and start it.
-    await request("POST", "/tasks/2/events", {
+    // Parent is in analysis.ready. Lease and start it.
+    await request("POST", `/tasks/${parentId}/events`, {
       type: "LeaseGranted",
-      taskId: "2",
+      taskId: parentId,
       ts: Date.now(),
       fenceToken: 1,
       agentId: "coder",
@@ -651,9 +648,9 @@ describe("HTTP API", () => {
       sessionType: "fresh",
       contextBudget: 100,
     });
-    await request("POST", "/tasks/2/events", {
+    await request("POST", `/tasks/${parentId}/events`, {
       type: "AgentStarted",
-      taskId: "2",
+      taskId: parentId,
       ts: Date.now(),
       fenceToken: 1,
       agentContext: {
@@ -665,8 +662,8 @@ describe("HTTP API", () => {
       },
     });
 
-    // Decompose task 2 into two children
-    const decompRes = await request("POST", "/tasks/2/decompose", {
+    // Decompose parent into two children
+    const decompRes = await request("POST", `/tasks/${parentId}/decompose`, {
       approach: "Split into two subtasks",
       children: [
         { title: "Child A", description: "First child", costAllocation: 30 },
@@ -767,18 +764,16 @@ describe("HTTP API", () => {
     });
     assert.equal(childADone.status, 200);
 
-    // Parent task 2 should now be in review.waiting (children not all done).
-    // We need it in review.active to attempt done. Lease it.
-    // After child A completes, parent may still be review.waiting since child B is not done.
-    let parentCheck = await request("GET", "/tasks/2");
+    // Parent should now be in review.waiting (children not all done).
+    let parentCheck = await request("GET", `/tasks/${parentId}`);
     let parentTask = (parentCheck.body as { task: { phase: string; condition: string } }).task;
     assert.equal(parentTask.phase, "review");
     assert.equal(parentTask.condition, "waiting");
 
     // Force the parent into review.active by granting lease
-    await request("POST", "/tasks/2/events", {
+    await request("POST", `/tasks/${parentId}/events`, {
       type: "LeaseGranted",
-      taskId: "2",
+      taskId: parentId,
       ts: Date.now(),
       fenceToken: 3,
       agentId: "hermes",
@@ -788,9 +783,9 @@ describe("HTTP API", () => {
       sessionType: "fresh",
       contextBudget: 100,
     });
-    await request("POST", "/tasks/2/events", {
+    await request("POST", `/tasks/${parentId}/events`, {
       type: "AgentStarted",
-      taskId: "2",
+      taskId: parentId,
       ts: Date.now(),
       fenceToken: 3,
       agentContext: {
@@ -803,7 +798,7 @@ describe("HTTP API", () => {
     });
 
     // Attempt to mark parent done — should be rejected because child B is not done
-    const parentDoneRes = await request("POST", "/tasks/2/status", {
+    const parentDoneRes = await request("POST", `/tasks/${parentId}/status`, {
       status: "done",
       evidence: "Trying to complete parent",
     });
@@ -814,22 +809,23 @@ describe("HTTP API", () => {
   });
 
   test("verifyCompletion: happy path — metadata.repo with valid stateRef succeeds", async () => {
-    await request("POST", "/tasks", {
+    const createRes = await request("POST", "/tasks", {
       title: "Repo task happy",
       description: "Task with repo and real stateRef",
       assignee: "coder",
       reviewer: "hermes",
       skipAnalysis: true,
     });
-    await request("PATCH", "/tasks/1/metadata", { repo: "my-org/my-repo" });
+    const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;
+    await request("PATCH", `/tasks/${taskId}/metadata`, { repo: "my-org/my-repo" });
 
-    await bringToReviewActive("1");
+    await bringToReviewActive(taskId);
 
     // Attempt done with a real stateRef — should succeed
-    const doneRes = await request("POST", "/tasks/1/status", {
+    const doneRes = await request("POST", `/tasks/${taskId}/status`, {
       status: "done",
       evidence: "Looks good",
-      stateRef: { branch: "task/T1", commit: "abc1234", parentCommit: "def5678" },
+      stateRef: { branch: `task/T${taskId}`, commit: "abc1234", parentCommit: "def5678" },
     });
     assert.equal(doneRes.status, 200);
     const body = doneRes.body as Record<string, unknown>;
