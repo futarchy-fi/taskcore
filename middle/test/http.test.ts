@@ -423,4 +423,416 @@ describe("HTTP API", () => {
     const finalTask = (taskRes.body as { task: { terminal: string | null } }).task;
     assert.equal(finalTask.terminal, "done");
   });
+
+  // ---------------------------------------------------------------------------
+  // verifyCompletion tests
+  // ---------------------------------------------------------------------------
+
+  /** Bring a task into review.active so we can test the done transition. */
+  async function bringToReviewActive(taskId: string): Promise<void> {
+    const fenceToken = 1;
+    const sessionId = "test-session";
+    const agentCtx = {
+      sessionId,
+      agentId: "coder",
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "test",
+    };
+
+    await request("POST", `/tasks/${taskId}/events`, {
+      type: "LeaseGranted",
+      taskId,
+      ts: Date.now(),
+      fenceToken,
+      agentId: "coder",
+      phase: "execution",
+      leaseTimeout: 600000,
+      sessionId,
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+
+    await request("POST", `/tasks/${taskId}/events`, {
+      type: "AgentStarted",
+      taskId,
+      ts: Date.now(),
+      fenceToken,
+      agentContext: agentCtx,
+    });
+
+    // Push to review.ready
+    await request("POST", `/tasks/${taskId}/status`, {
+      status: "review",
+      evidence: "Work is done",
+    });
+
+    // Simulate reviewer taking the lease
+    const reviewFence = 2;
+    const reviewCtx = {
+      sessionId: "review-session",
+      agentId: "hermes",
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "test",
+    };
+
+    await request("POST", `/tasks/${taskId}/events`, {
+      type: "LeaseGranted",
+      taskId,
+      ts: Date.now(),
+      fenceToken: reviewFence,
+      agentId: "hermes",
+      phase: "review",
+      leaseTimeout: 600000,
+      sessionId: "review-session",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+
+    await request("POST", `/tasks/${taskId}/events`, {
+      type: "AgentStarted",
+      taskId,
+      ts: Date.now(),
+      fenceToken: reviewFence,
+      agentContext: reviewCtx,
+    });
+  }
+
+  test("verifyCompletion: rejects done when metadata.repo is set but stateRef is missing", async () => {
+    // Create task, then set metadata.repo via PATCH
+    await request("POST", "/tasks", {
+      title: "Repo task",
+      description: "Task with repo in metadata",
+      assignee: "coder",
+      reviewer: "hermes",
+      skipAnalysis: true,
+    });
+    await request("PATCH", "/tasks/1/metadata", { repo: "my-org/my-repo" });
+
+    await bringToReviewActive("1");
+
+    // Attempt done without stateRef — should get 422
+    const doneRes = await request("POST", "/tasks/1/status", {
+      status: "done",
+      evidence: "Looks good",
+      // no stateRef
+    });
+    assert.equal(doneRes.status, 422);
+    const body = doneRes.body as Record<string, unknown>;
+    assert.equal(body["error"], "missing_state_ref");
+  });
+
+  test("verifyCompletion: rejects done when metadata.repo is set and stateRef is zeroed", async () => {
+    await request("POST", "/tasks", {
+      title: "Repo task zeroed",
+      description: "Task with repo and zeroed stateRef",
+      assignee: "coder",
+      reviewer: "hermes",
+      skipAnalysis: true,
+    });
+    await request("PATCH", "/tasks/1/metadata", { repo: "my-org/my-repo" });
+
+    await bringToReviewActive("1");
+
+    // Attempt done with zeroed stateRef — should get 422
+    const doneRes = await request("POST", "/tasks/1/status", {
+      status: "done",
+      evidence: "Looks good",
+      stateRef: { branch: "main", commit: "0000000", parentCommit: "0000000" },
+    });
+    assert.equal(doneRes.status, 422);
+    const body = doneRes.body as Record<string, unknown>;
+    assert.equal(body["error"], "missing_state_ref");
+  });
+
+  test("verifyCompletion: rejects done when children with completionRule='and' are not all done", async () => {
+    // Create parent task
+    await request("POST", "/tasks", {
+      title: "Parent task",
+      description: "Will be decomposed",
+      assignee: "coder",
+      reviewer: "hermes",
+      skipAnalysis: true,
+    });
+
+    // Bring to execution.active so we can transition to analysis for decompose
+    // Actually, skipAnalysis puts us at execution.ready. We need to go through
+    // the decompose flow. Let's use analysis flow instead.
+    // Re-create without skipAnalysis and with the decompose endpoint.
+
+    // Lease for execution phase
+    await request("POST", "/tasks/1/events", {
+      type: "LeaseGranted",
+      taskId: "1",
+      ts: Date.now(),
+      fenceToken: 1,
+      agentId: "coder",
+      phase: "execution",
+      leaseTimeout: 600000,
+      sessionId: "test-session",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+
+    await request("POST", "/tasks/1/events", {
+      type: "AgentStarted",
+      taskId: "1",
+      ts: Date.now(),
+      fenceToken: 1,
+      agentContext: {
+        sessionId: "test-session",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+
+    // Submit review to move to review.ready
+    await request("POST", "/tasks/1/status", {
+      status: "review",
+      evidence: "Work done",
+    });
+
+    // Reviewer lease + start
+    await request("POST", "/tasks/1/events", {
+      type: "LeaseGranted",
+      taskId: "1",
+      ts: Date.now(),
+      fenceToken: 2,
+      agentId: "hermes",
+      phase: "review",
+      leaseTimeout: 600000,
+      sessionId: "review-session",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    await request("POST", "/tasks/1/events", {
+      type: "AgentStarted",
+      taskId: "1",
+      ts: Date.now(),
+      fenceToken: 2,
+      agentContext: {
+        sessionId: "review-session",
+        agentId: "hermes",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+
+    // Send changes_requested to get back to execution
+    await request("POST", "/tasks/1/status", {
+      status: "pending",
+      evidence: "Need to decompose instead",
+    });
+
+    // Now at execution.ready — but we need analysis.active to decompose.
+    // Simpler approach: create a fresh task without skipAnalysis.
+    // Let's create a second task for decomposition.
+    await request("POST", "/tasks", {
+      title: "Decomposable parent",
+      description: "This one will be decomposed",
+      assignee: "coder",
+      reviewer: "hermes",
+    });
+
+    // Task 2 is in analysis.ready. Lease and start it.
+    await request("POST", "/tasks/2/events", {
+      type: "LeaseGranted",
+      taskId: "2",
+      ts: Date.now(),
+      fenceToken: 1,
+      agentId: "coder",
+      phase: "analysis",
+      leaseTimeout: 600000,
+      sessionId: "test-session-2",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    await request("POST", "/tasks/2/events", {
+      type: "AgentStarted",
+      taskId: "2",
+      ts: Date.now(),
+      fenceToken: 1,
+      agentContext: {
+        sessionId: "test-session-2",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+
+    // Decompose task 2 into two children
+    const decompRes = await request("POST", "/tasks/2/decompose", {
+      approach: "Split into two subtasks",
+      children: [
+        { title: "Child A", description: "First child", costAllocation: 30 },
+        { title: "Child B", description: "Second child", costAllocation: 30 },
+      ],
+    });
+    assert.equal(decompRes.status, 200);
+    const decompBody = decompRes.body as { children: Array<{ id: string }> };
+    const childAId = decompBody.children[0]!.id;
+    const childBId = decompBody.children[1]!.id;
+
+    // Complete child A only (leave child B incomplete)
+    // Child A: analysis.ready → lease → start → exec → review → done
+    await request("POST", `/tasks/${childAId}/events`, {
+      type: "LeaseGranted",
+      taskId: childAId,
+      ts: Date.now(),
+      fenceToken: 1,
+      agentId: "coder",
+      phase: "analysis",
+      leaseTimeout: 600000,
+      sessionId: "child-session",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    await request("POST", `/tasks/${childAId}/events`, {
+      type: "AgentStarted",
+      taskId: childAId,
+      ts: Date.now(),
+      fenceToken: 1,
+      agentContext: {
+        sessionId: "child-session",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+    // Skip to execution
+    await request("POST", `/tasks/${childAId}/status`, { status: "execute" });
+    await request("POST", `/tasks/${childAId}/events`, {
+      type: "LeaseGranted",
+      taskId: childAId,
+      ts: Date.now(),
+      fenceToken: 2,
+      agentId: "coder",
+      phase: "execution",
+      leaseTimeout: 600000,
+      sessionId: "child-session-2",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    await request("POST", `/tasks/${childAId}/events`, {
+      type: "AgentStarted",
+      taskId: childAId,
+      ts: Date.now(),
+      fenceToken: 2,
+      agentContext: {
+        sessionId: "child-session-2",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+    await request("POST", `/tasks/${childAId}/status`, {
+      status: "review",
+      evidence: "Child A done",
+    });
+    await request("POST", `/tasks/${childAId}/events`, {
+      type: "LeaseGranted",
+      taskId: childAId,
+      ts: Date.now(),
+      fenceToken: 3,
+      agentId: "hermes",
+      phase: "review",
+      leaseTimeout: 600000,
+      sessionId: "child-review",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    await request("POST", `/tasks/${childAId}/events`, {
+      type: "AgentStarted",
+      taskId: childAId,
+      ts: Date.now(),
+      fenceToken: 3,
+      agentContext: {
+        sessionId: "child-review",
+        agentId: "hermes",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+    const childADone = await request("POST", `/tasks/${childAId}/status`, {
+      status: "done",
+      evidence: "Approved",
+    });
+    assert.equal(childADone.status, 200);
+
+    // Parent task 2 should now be in review.waiting (children not all done).
+    // We need it in review.active to attempt done. Lease it.
+    // After child A completes, parent may still be review.waiting since child B is not done.
+    let parentCheck = await request("GET", "/tasks/2");
+    let parentTask = (parentCheck.body as { task: { phase: string; condition: string } }).task;
+    assert.equal(parentTask.phase, "review");
+    assert.equal(parentTask.condition, "waiting");
+
+    // Force the parent into review.active by granting lease
+    await request("POST", "/tasks/2/events", {
+      type: "LeaseGranted",
+      taskId: "2",
+      ts: Date.now(),
+      fenceToken: 3,
+      agentId: "hermes",
+      phase: "review",
+      leaseTimeout: 600000,
+      sessionId: "parent-review",
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+    await request("POST", "/tasks/2/events", {
+      type: "AgentStarted",
+      taskId: "2",
+      ts: Date.now(),
+      fenceToken: 3,
+      agentContext: {
+        sessionId: "parent-review",
+        agentId: "hermes",
+        memoryRef: null,
+        contextTokens: null,
+        modelId: "test",
+      },
+    });
+
+    // Attempt to mark parent done — should be rejected because child B is not done
+    const parentDoneRes = await request("POST", "/tasks/2/status", {
+      status: "done",
+      evidence: "Trying to complete parent",
+    });
+    assert.equal(parentDoneRes.status, 422);
+    const parentDoneBody = parentDoneRes.body as Record<string, unknown>;
+    assert.equal(parentDoneBody["error"], "children_not_done");
+    assert.ok((parentDoneBody["message"] as string).includes(childBId));
+  });
+
+  test("verifyCompletion: happy path — metadata.repo with valid stateRef succeeds", async () => {
+    await request("POST", "/tasks", {
+      title: "Repo task happy",
+      description: "Task with repo and real stateRef",
+      assignee: "coder",
+      reviewer: "hermes",
+      skipAnalysis: true,
+    });
+    await request("PATCH", "/tasks/1/metadata", { repo: "my-org/my-repo" });
+
+    await bringToReviewActive("1");
+
+    // Attempt done with a real stateRef — should succeed
+    const doneRes = await request("POST", "/tasks/1/status", {
+      status: "done",
+      evidence: "Looks good",
+      stateRef: { branch: "task/T1", commit: "abc1234", parentCommit: "def5678" },
+    });
+    assert.equal(doneRes.status, 200);
+    const body = doneRes.body as Record<string, unknown>;
+    assert.equal(body["ok"], true);
+  });
 });

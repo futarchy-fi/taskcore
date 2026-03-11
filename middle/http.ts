@@ -911,6 +911,52 @@ function notifyInformed(task: Task, event: string, detail?: string): void {
   }
 }
 
+function isZeroedStateRef(ref: StateRef): boolean {
+  return ref.commit === "0000000" && ref.parentCommit === "0000000";
+}
+
+function verifyCompletion(
+  core: Core,
+  task: Task,
+  stateRef?: StateRef,
+): RouteResult | null {
+  // (a) Task has metadata.repo but stateRef is missing or zeroed
+  if (task.metadata["repo"]) {
+    const ref = stateRef ?? task.stateRef;
+    if (!ref || isZeroedStateRef(ref)) {
+      return {
+        status: 422,
+        body: {
+          error: "missing_state_ref",
+          message:
+            "Task has metadata.repo but no valid stateRef was provided. " +
+            "Submit a stateRef with a real commit before marking done.",
+        },
+      };
+    }
+  }
+
+  // (b) Task has children with completionRule='and' but not all children are terminal=done
+  if (task.completionRule === "and" && task.children.length > 0) {
+    const children = core.getChildren(task.id);
+    const allDone = children.every((c) => c.terminal === "done");
+    if (!allDone) {
+      const notDone = children.filter((c) => c.terminal !== "done").map((c) => c.id);
+      return {
+        status: 422,
+        body: {
+          error: "children_not_done",
+          message:
+            `Task has completionRule='and' but ${notDone.length} child(ren) are not done: ` +
+            notDone.join(", "),
+        },
+      };
+    }
+  }
+
+  return null;
+}
+
 function applyDoneTransition(
   core: Core,
   task: Task,
@@ -929,6 +975,9 @@ function applyDoneTransition(
       },
     };
   }
+
+  const completionErr = verifyCompletion(core, task, stateRef);
+  if (completionErr) return completionErr;
 
   const round = task.reviewState?.round ?? 1;
 
