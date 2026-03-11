@@ -499,6 +499,67 @@ describe("HTTP API", () => {
     });
   }
 
+  test("verifyCompletion: rejects done from review.ready before reviewer lease starts", async () => {
+    const createRes = await request("POST", "/tasks", {
+      title: "Review ready task",
+      description: "Should not complete before review starts",
+      assignee: "coder",
+      reviewer: "overseer",
+      skipAnalysis: true,
+    });
+    const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;
+
+    const fenceToken = 1;
+    const sessionId = "test-session";
+    const agentCtx = {
+      sessionId,
+      agentId: "coder",
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "test",
+    };
+
+    await request("POST", `/tasks/${taskId}/events`, {
+      type: "LeaseGranted",
+      taskId,
+      ts: Date.now(),
+      fenceToken,
+      agentId: "coder",
+      phase: "execution",
+      leaseTimeout: 600000,
+      sessionId,
+      sessionType: "fresh",
+      contextBudget: 100,
+    });
+
+    await request("POST", `/tasks/${taskId}/events`, {
+      type: "AgentStarted",
+      taskId,
+      ts: Date.now(),
+      fenceToken,
+      agentContext: agentCtx,
+    });
+
+    await request("POST", `/tasks/${taskId}/status`, {
+      status: "review",
+      evidence: "Ready for review",
+    });
+
+    const doneRes = await request("POST", `/tasks/${taskId}/status`, {
+      status: "done",
+      evidence: "Trying to skip reviewer lease",
+    });
+    assert.equal(doneRes.status, 409);
+    const body = doneRes.body as Record<string, unknown>;
+    assert.equal(body["error"], "invalid_state");
+
+    const taskRes = await request("GET", `/tasks/${taskId}`);
+    const task = (taskRes.body as { task: { phase: string; condition: string; terminal: string | null } }).task;
+    assert.equal(task.phase, "review");
+    assert.equal(task.condition, "ready");
+    assert.equal(task.terminal, null);
+  });
+
   test("verifyCompletion: rejects done when metadata.repo is set but stateRef is missing", async () => {
     // Create task, then set metadata.repo via PATCH
     const createRes = await request("POST", "/tasks", {
@@ -806,6 +867,46 @@ describe("HTTP API", () => {
     const parentDoneBody = parentDoneRes.body as Record<string, unknown>;
     assert.equal(parentDoneBody["error"], "children_not_done");
     assert.ok((parentDoneBody["message"] as string).includes(childBId));
+  });
+
+  test("verifyCompletion: missing proof is recoverable with a later valid retry", async () => {
+    const createRes = await request("POST", "/tasks", {
+      title: "Recoverable repo task",
+      description: "Task can retry done after supplying proof",
+      assignee: "coder",
+      reviewer: "overseer",
+      skipAnalysis: true,
+    });
+    const taskId = (createRes.body as Record<string, unknown>)["taskId"] as string;
+    await request("PATCH", `/tasks/${taskId}/metadata`, { repo: "my-org/my-repo" });
+
+    await bringToReviewActive(taskId);
+
+    const firstDoneRes = await request("POST", `/tasks/${taskId}/status`, {
+      status: "done",
+      evidence: "First attempt without proof",
+    });
+    assert.equal(firstDoneRes.status, 422);
+    const firstBody = firstDoneRes.body as Record<string, unknown>;
+    assert.equal(firstBody["error"], "missing_state_ref");
+
+    let taskRes = await request("GET", `/tasks/${taskId}`);
+    let task = (taskRes.body as { task: { phase: string; condition: string; terminal: string | null } }).task;
+    assert.equal(task.phase, "review");
+    assert.equal(task.condition, "active");
+    assert.equal(task.terminal, null);
+
+    const retryDoneRes = await request("POST", `/tasks/${taskId}/status`, {
+      status: "done",
+      evidence: "Second attempt with proof",
+      stateRef: { branch: `task/T${taskId}`, commit: "abc1234", parentCommit: "def5678" },
+    });
+    assert.equal(retryDoneRes.status, 200);
+
+    taskRes = await request("GET", `/tasks/${taskId}`);
+    task = (taskRes.body as { task: { phase: string; condition: string; terminal: string | null; stateRef?: { commit: string } } }).task;
+    assert.equal(task.terminal, "done");
+    assert.equal(task.stateRef?.commit, "abc1234");
   });
 
   test("verifyCompletion: happy path — metadata.repo with valid stateRef succeeds", async () => {

@@ -458,3 +458,127 @@ test("TaskReparented: reparent of terminal task succeeds", () => {
   const error = validateEvent(state, event);
   assert.equal(error, null);
 });
+
+function reviewActiveState(): SystemState {
+  let state = createInitialState();
+  const events: Event[] = [
+    {
+      type: "TaskCreated",
+      taskId: "RV1",
+      ts: 1,
+      title: "Review validation",
+      description: "Review fence coverage",
+      parentId: null,
+      rootId: "RV1",
+      initialPhase: "execution",
+      initialCondition: "ready",
+      attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+      costBudget: 5,
+      dependencies: [],
+      reviewConfig: { reviewers: ["overseer"], policy: "all" },
+      skipAnalysis: true,
+      metadata: {},
+      source: { type: "middle", id: "test" },
+    },
+    {
+      type: "LeaseGranted",
+      taskId: "RV1",
+      ts: 2,
+      fenceToken: 1,
+      agentId: "coder",
+      phase: "execution",
+      leaseTimeout: 60_000,
+      sessionId: "exec-1",
+      sessionType: "fresh",
+      contextBudget: 512,
+    },
+    {
+      type: "AgentStarted",
+      taskId: "RV1",
+      ts: 3,
+      fenceToken: 1,
+      agentContext: {
+        sessionId: "exec-1",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: 128,
+        modelId: "test",
+      },
+    },
+    {
+      type: "PhaseTransition",
+      taskId: "RV1",
+      ts: 4,
+      from: { phase: "execution", condition: "active" },
+      to: { phase: "review", condition: "ready" },
+      reasonCode: "work_complete",
+      reason: "work_complete",
+      fenceToken: 1,
+      agentContext: {
+        sessionId: "exec-1",
+        agentId: "coder",
+        memoryRef: null,
+        contextTokens: 128,
+        modelId: "test",
+      },
+    },
+    {
+      type: "LeaseGranted",
+      taskId: "RV1",
+      ts: 5,
+      fenceToken: 2,
+      agentId: "overseer",
+      phase: "review",
+      leaseTimeout: 60_000,
+      sessionId: "review-1",
+      sessionType: "fresh",
+      contextBudget: 512,
+    },
+    {
+      type: "AgentStarted",
+      taskId: "RV1",
+      ts: 6,
+      fenceToken: 2,
+      agentContext: {
+        sessionId: "review-1",
+        agentId: "overseer",
+        memoryRef: null,
+        contextTokens: 128,
+        modelId: "test",
+      },
+    },
+  ];
+
+  for (const event of events) {
+    const reduced = reduce(state, event);
+    assert.equal(reduced.ok, true, `Event ${event.type} failed: ${!reduced.ok ? reduced.error.message : ""}`);
+    state = reduced.ok ? reduced.value.state : state;
+  }
+
+  return state;
+}
+
+test("ReviewVerdictSubmitted rejects stale review fence token", () => {
+  const state = reviewActiveState();
+  const event: Event = {
+    type: "ReviewVerdictSubmitted",
+    taskId: "RV1",
+    ts: 7,
+    fenceToken: 1,
+    reviewer: "overseer",
+    round: 1,
+    verdict: "approve",
+    reasoning: "Looks good",
+    agentContext: {
+      sessionId: "review-1",
+      agentId: "overseer",
+      memoryRef: null,
+      contextTokens: 128,
+      modelId: "test",
+    },
+  };
+
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "stale_fence_token");
+});
