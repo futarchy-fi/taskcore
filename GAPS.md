@@ -3,7 +3,7 @@
 Fields, events, and code paths that exist in the codebase but are incomplete —
 validated but not enforced, handled but never emitted, or written but never read.
 
-Last updated: 2026-03-03.
+Last updated: 2026-03-12.
 
 ---
 
@@ -62,6 +62,26 @@ until `TaskRevived`). The permanent failure path is dead code.
 ---
 
 ## HTTP API
+
+### Daemon event loop blocking during claim (latent)
+
+`POST /tasks/:id/claim` calls `ensureTaskWorkspaces()` which runs multiple git
+operations via `execFileSync` — up to 4 commits for journal branch creation plus
+a worktree add. Each call blocks the Node.js event loop for up to 30 seconds.
+While blocked, the daemon cannot process tick events, serve the dashboard, or
+respond to any other HTTP request.
+
+**Partial fix (T2098)**: Added a 90-second client-side timeout to `httpRequest()`
+in `core/cli/task.ts` so agents get a readable error instead of hanging forever.
+
+**Remaining gap**: The `execFileSync` calls should be replaced with async
+`execFile` (promisified) or delegated to a worker thread. Until then, a slow git
+repo can stall the entire daemon for up to ~120s per claim.
+
+- middle/http.ts:811 (`ensureTaskWorkspaces` in claim handler)
+- middle/worktree.ts:210 (`execFileSync` with 30s timeout)
+- middle/journal.ts:54–60 (`createTaskBranch` — 4 sync git calls)
+- core/cli/task.ts:419 (fix: `req.setTimeout(90_000)`)
 
 ### `"decompose"` status — returns 501
 

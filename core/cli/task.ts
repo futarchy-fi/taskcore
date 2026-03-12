@@ -417,6 +417,9 @@ async function httpRequest(method: "GET" | "POST" | "PATCH", urlPath: string, bo
     );
 
     req.on("error", reject);
+    req.setTimeout(90_000, () => {
+      req.destroy(new Error("request timed out after 90s — daemon may be busy or unresponsive"));
+    });
     if (payload) req.write(payload);
     req.end();
   });
