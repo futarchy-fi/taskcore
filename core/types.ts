@@ -105,6 +105,62 @@ export interface ReviewVerdict {
   reasoning: string;
 }
 
+export type CompletionVerificationMode = "code-task" | "journal-only" | "coordinator" | "aggregate";
+
+export interface CodeTaskCompletionProof {
+  kind: "code-task";
+  commitRef: string;
+  changedFiles: string[];
+  testsPassed: boolean;
+  testResults?: string;
+  prRef?: string;
+}
+
+export interface JournalOnlyCompletionProof {
+  kind: "journal-only";
+  journalPath: string;
+  summary: string;
+  actionable: boolean;
+}
+
+export interface CoordinatorCompletionProof {
+  kind: "coordinator";
+  childTaskIds: TaskId[];
+  summary: string;
+  allChildrenSucceeded: boolean;
+}
+
+export interface AggregateCompletionProof {
+  kind: "aggregate";
+  componentResults: Array<{
+    name: string;
+    status: "succeeded" | "failed" | "skipped";
+    evidenceRef?: string;
+  }>;
+  summary: string;
+  criticalPathMet: boolean;
+}
+
+export type CompletionProof =
+  | CodeTaskCompletionProof
+  | JournalOnlyCompletionProof
+  | CoordinatorCompletionProof
+  | AggregateCompletionProof;
+
+export interface CompletionVerification {
+  mode: CompletionVerificationMode;
+  proof: CompletionProof;
+  verifiedAt: Timestamp;
+  verifiedBy?: AgentId;
+}
+
+export interface TaskVerificationState {
+  requiredMode: CompletionVerificationMode;
+  satisfied: boolean;
+  verification: CompletionVerification | null;
+  satisfiedAt: Timestamp | null;
+}
+
 export interface ReviewState {
   round: number;
   verdicts: ReviewVerdict[];
@@ -169,6 +225,7 @@ export interface Task {
   createdAt: Timestamp;
   updatedAt: Timestamp;
   metadata: Record<string, unknown>;
+  verification: TaskVerificationState;
 }
 
 export interface AgentContext {
@@ -205,6 +262,7 @@ export interface TaskCreated extends BaseEvent {
   skipAnalysis: boolean;
   metadata: Record<string, unknown>;
   source: EventSource;
+  completionVerificationMode?: CompletionVerificationMode;
 }
 
 export interface LeaseGranted extends BaseEvent {
@@ -314,6 +372,7 @@ export interface DecompositionChildSpec {
   attemptBudgets?: AttemptBudgetMaxInput;
   reviewConfig?: ReviewConfig | null;
   metadata?: Record<string, unknown>;
+  completionVerificationMode?: CompletionVerificationMode;
 }
 
 export interface DecompositionCreated extends BaseEvent {
@@ -377,6 +436,7 @@ export interface ReviewPolicyMet extends BaseEvent {
 export interface TaskCompleted extends BaseEvent {
   type: "TaskCompleted";
   stateRef: StateRef;
+  verification: CompletionVerification;
 }
 
 export interface TaskFailed extends BaseEvent {

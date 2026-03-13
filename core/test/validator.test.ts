@@ -5,6 +5,19 @@ import { reduce } from "../reducer.js";
 import { validateEvent } from "../validator.js";
 import { createInitialState, type Event, type SystemState } from "../types.js";
 
+function completionVerification(ts = 1, taskId = "T10"): Extract<Event, { type: "TaskCompleted" }>["verification"] {
+  return {
+    mode: "code-task",
+    verifiedAt: ts,
+    proof: {
+      kind: "code-task",
+      commitRef: `commit-${taskId}-${ts}`,
+      changedFiles: ["src/index.ts"],
+      testsPassed: true,
+    },
+  };
+}
+
 function bootstrapState(): SystemState {
   const created: Event = {
     type: "TaskCreated",
@@ -77,6 +90,118 @@ test("validator enforces failure summary on TaskFailed", () => {
   const error = validateEvent(state, invalidFail);
   assert.ok(error);
   assert.equal(error.code, "missing_failure_summary");
+});
+
+
+test("validator rejects TaskCompleted without verification", () => {
+  let state = bootstrapState();
+  const lease: Event = {
+    type: "LeaseGranted",
+    taskId: "T10",
+    ts: 2,
+    fenceToken: 1,
+    agentId: "coder",
+    phase: "analysis",
+    leaseTimeout: 60_000,
+    sessionId: "sess-1",
+    sessionType: "fresh",
+    contextBudget: 512,
+  };
+  const toExec: Event = {
+    type: "PhaseTransition",
+    taskId: "T10",
+    ts: 3,
+    from: { phase: "analysis", condition: "active" },
+    to: { phase: "execution", condition: "ready" },
+    reasonCode: "decision_execute",
+    reason: "go",
+    fenceToken: 1,
+    agentContext: { sessionId: "sess-1", agentId: "coder", memoryRef: null, contextTokens: 100, modelId: "gpt-5" },
+  };
+  for (const e of [lease, { ...lease, type: "AgentStarted", ts: 2, agentContext: { sessionId: "sess-1", agentId: "coder", memoryRef: null, contextTokens: 100, modelId: "gpt-5" } } as Event, toExec]) {
+    const r = reduce(state, e);
+    assert.equal(r.ok, true);
+    state = r.ok ? r.value.state : state;
+  }
+  const event = {
+    type: "TaskCompleted",
+    taskId: "T10",
+    ts: 4,
+    stateRef: { branch: "task/T10", commit: "abc", parentCommit: "def" },
+  } as Event;
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "missing_verification");
+});
+
+test("validator rejects TaskCompleted with mismatched verification mode", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T20",
+    ts: 1,
+    title: "Journal task",
+    description: "Task for validator tests",
+    parentId: null,
+    rootId: "T20",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "journal-only",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T20",
+    ts: 2,
+    stateRef: { branch: "task/T20", commit: "abc", parentCommit: "def" },
+    verification: completionVerification(2, "T20"),
+  };
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "verification_mode_mismatch");
+});
+
+test("validator accepts TaskCompleted with matching proof", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T30",
+    ts: 1,
+    title: "Code task",
+    description: "Task for validator tests",
+    parentId: null,
+    rootId: "T30",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T30",
+    ts: 2,
+    stateRef: { branch: "task/T30", commit: "abc", parentCommit: "def" },
+    verification: completionVerification(2, "T30"),
+  };
+  const error = validateEvent(state, event);
+  assert.equal(error, null);
 });
 
 // ---------------------------------------------------------------------------

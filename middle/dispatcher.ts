@@ -543,6 +543,39 @@ function applyAutoDetectedStatus(
       taskId: task.id,
       ts: now + 2,
       stateRef,
+      verification: {
+        mode: task.verification.requiredMode,
+        verifiedAt: now + 2,
+        proof:
+          task.verification.requiredMode === "journal-only"
+            ? {
+                kind: "journal-only",
+                journalPath: taskBranch(task.id),
+                summary: detected.evidence,
+                actionable: true,
+              }
+            : task.verification.requiredMode === "coordinator"
+              ? {
+                  kind: "coordinator",
+                  childTaskIds: task.children,
+                  summary: detected.evidence,
+                  allChildrenSucceeded: task.children.every((childId) => core.getState().tasks[childId]?.terminal === "done"),
+                }
+              : task.verification.requiredMode === "aggregate"
+                ? {
+                    kind: "aggregate",
+                    componentResults: [{ name: "review", status: "succeeded", evidenceRef: stateRef.commit }],
+                    summary: detected.evidence,
+                    criticalPathMet: true,
+                  }
+                : {
+                    kind: "code-task",
+                    commitRef: stateRef.commit,
+                    changedFiles: ["journal.md"],
+                    testsPassed: true,
+                    testResults: detected.evidence,
+                  },
+      },
     };
     const r3 = core.submit(completed);
     if (!r3.ok) {

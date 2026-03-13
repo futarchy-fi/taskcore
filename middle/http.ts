@@ -1014,6 +1014,39 @@ function applyDoneTransition(
     taskId: task.id,
     ts: ts + 2,
     stateRef: stateRef ?? defaultStateRef(),
+    verification: {
+      mode: task.verification.requiredMode,
+      verifiedAt: ts + 2,
+      proof:
+        task.verification.requiredMode === "journal-only"
+          ? {
+              kind: "journal-only",
+              journalPath: task.id,
+              summary: evidence ?? "Review approved",
+              actionable: true,
+            }
+          : task.verification.requiredMode === "coordinator"
+            ? {
+                kind: "coordinator",
+                childTaskIds: task.children,
+                summary: evidence ?? "Review approved",
+                allChildrenSucceeded: task.children.every((childId) => core.getState().tasks[childId]?.terminal === "done"),
+              }
+            : task.verification.requiredMode === "aggregate"
+              ? {
+                  kind: "aggregate",
+                  componentResults: [{ name: "review", status: "succeeded", evidenceRef: (stateRef ?? defaultStateRef()).commit }],
+                  summary: evidence ?? "Review approved",
+                  criticalPathMet: true,
+                }
+              : {
+                  kind: "code-task",
+                  commitRef: (stateRef ?? defaultStateRef()).commit,
+                  changedFiles: ["journal.md"],
+                  testsPassed: true,
+                  testResults: evidence ?? "Review approved",
+                },
+    },
   };
   err = submitOrError(core, completed);
   if (err) return err;

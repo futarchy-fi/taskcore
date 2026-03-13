@@ -130,6 +130,12 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
       createdAt: event.ts,
       updatedAt: event.ts,
       metadata: event.metadata,
+      verification: {
+        requiredMode: event.completionVerificationMode ?? "code-task",
+        satisfied: false,
+        verification: null,
+        satisfiedAt: null,
+      },
     })
       ? event.initialCondition
       : "waiting";
@@ -178,6 +184,12 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
     createdAt: event.ts,
     updatedAt: event.ts,
     metadata: structuredClone(event.metadata),
+    verification: {
+      requiredMode: event.completionVerificationMode ?? "code-task",
+      satisfied: false,
+      verification: null,
+      satisfiedAt: null,
+    },
   };
 }
 
@@ -234,6 +246,12 @@ function createChildTaskFromDecomposition(parent: Task, event: Extract<Event, { 
     createdAt: event.ts,
     updatedAt: event.ts,
     metadata: structuredClone(child.metadata ?? {}),
+    verification: {
+      requiredMode: child.completionVerificationMode ?? "code-task",
+      satisfied: false,
+      verification: null,
+      satisfiedAt: null,
+    },
   };
 }
 
@@ -597,6 +615,13 @@ function applyTaskCompleted(state: SystemState, event: Extract<Event, { type: "T
   if (activeApproach) {
     activeApproach.outcome = "succeeded";
   }
+
+  t.verification = {
+    requiredMode: task.verification.requiredMode,
+    satisfied: true,
+    verification: structuredClone(event.verification),
+    satisfiedAt: event.ts,
+  };
 
   t.updatedAt = event.ts;
   state.tasks[t.id] = t;

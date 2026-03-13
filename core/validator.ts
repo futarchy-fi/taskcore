@@ -85,6 +85,80 @@ function validFailureSummary(summary: FailureSummary | undefined): boolean {
   );
 }
 
+function validateCompletionVerification(
+  event: Extract<Event, { type: "TaskCompleted" }>,
+  task: Task,
+): ValidationError | null {
+  const verification = event.verification;
+  if (!verification) {
+    return mkError(event, "missing_verification", "TaskCompleted requires verification.");
+  }
+
+  if (verification.mode !== task.verification.requiredMode) {
+    return mkError(
+      event,
+      "verification_mode_mismatch",
+      "TaskCompleted verification mode must match the task's required completion mode.",
+      { requiredMode: task.verification.requiredMode, actualMode: verification.mode },
+    );
+  }
+
+  if (!isPositiveInt(verification.verifiedAt)) {
+    return mkError(event, "invalid_verification_timestamp", "TaskCompleted verification must include a valid verifiedAt timestamp.");
+  }
+
+  const proof = verification.proof;
+  switch (verification.mode) {
+    case "code-task": {
+      if (proof.kind !== "code-task") {
+        return mkError(event, "invalid_completion_proof", "code-task verification requires code-task proof.");
+      }
+      if (!nonEmptyText(proof.commitRef)) {
+        return mkError(event, "invalid_completion_proof", "code-task proof requires commitRef.");
+      }
+      if (proof.changedFiles.length === 0 || proof.changedFiles.some((file) => !nonEmptyText(file))) {
+        return mkError(event, "invalid_completion_proof", "code-task proof requires non-empty changedFiles.");
+      }
+      return null;
+    }
+
+    case "journal-only": {
+      if (proof.kind !== "journal-only") {
+        return mkError(event, "invalid_completion_proof", "journal-only verification requires journal-only proof.");
+      }
+      if (!nonEmptyText(proof.journalPath) || !nonEmptyText(proof.summary)) {
+        return mkError(event, "invalid_completion_proof", "journal-only proof requires journalPath and summary.");
+      }
+      return null;
+    }
+
+    case "coordinator": {
+      if (proof.kind !== "coordinator") {
+        return mkError(event, "invalid_completion_proof", "coordinator verification requires coordinator proof.");
+      }
+      if (proof.childTaskIds.length === 0 || proof.childTaskIds.some((id) => !nonEmptyText(id)) || !nonEmptyText(proof.summary)) {
+        return mkError(event, "invalid_completion_proof", "coordinator proof requires childTaskIds and summary.");
+      }
+      return null;
+    }
+
+    case "aggregate": {
+      if (proof.kind !== "aggregate") {
+        return mkError(event, "invalid_completion_proof", "aggregate verification requires aggregate proof.");
+      }
+      if (proof.componentResults.length === 0 || !nonEmptyText(proof.summary)) {
+        return mkError(event, "invalid_completion_proof", "aggregate proof requires componentResults and summary.");
+      }
+      for (const result of proof.componentResults) {
+        if (!nonEmptyText(result.name)) {
+          return mkError(event, "invalid_completion_proof", "aggregate proof component names must be non-empty.");
+        }
+      }
+      return null;
+    }
+  }
+}
+
 function duplicateIds(ids: string[]): string[] {
   const seen = new Set<string>();
   const dup = new Set<string>();
@@ -728,7 +802,7 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       } else if (task.phase !== "execution" && task.phase !== "review") {
         return mkError(event, "invalid_phase", "TaskCompleted without review requires execution or review phase.");
       }
-      return null;
+      return validateCompletionVerification(event, task);
     }
 
     case "TaskFailed": {

@@ -63,6 +63,19 @@ function createTask(taskId: string, ts: number, options?: { initialPhase?: Phase
   };
 }
 
+function completionVerification(taskId: string, ts: number): Extract<Event, { type: "TaskCompleted" }>["verification"] {
+  return {
+    mode: "code-task",
+    verifiedAt: ts,
+    proof: {
+      kind: "code-task",
+      commitRef: `c-${taskId}-${ts}`,
+      changedFiles: ["src/index.ts"],
+      testsPassed: true,
+    },
+  };
+}
+
 function collectSubtreeTaskIds(state: SystemState, rootTaskId: string): string[] {
   const out: string[] = [];
   const stack = [rootTaskId];
@@ -385,6 +398,7 @@ test("property A: cost conservation", () => {
           commit: `c-${childId}`,
           parentCommit: `p-${childId}`,
         },
+        verification: completionVerification(childId, ts),
       });
       ts += 1;
 
@@ -427,6 +441,7 @@ test("property B: terminal absorption", () => {
           commit: `c-${taskId}`,
           parentCommit: `p-${taskId}`,
         },
+        verification: completionVerification(taskId, 2),
       });
     } else if (terminalChoice === 1) {
       state = mustReduce(state, {

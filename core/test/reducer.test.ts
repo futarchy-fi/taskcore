@@ -28,6 +28,19 @@ function stateRef(): StateRef {
   };
 }
 
+function completionVerification(ts = 1, taskId = "T1") {
+  return {
+    mode: "code-task" as const,
+    verifiedAt: ts,
+    proof: {
+      kind: "code-task" as const,
+      commitRef: `commit-${taskId}-${ts}`,
+      changedFiles: ["src/index.ts"],
+      testsPassed: true,
+    },
+  };
+}
+
 test("reducer applies create -> lease -> start -> phase transition", () => {
   let state = createInitialState();
 
@@ -751,6 +764,7 @@ test("MetadataUpdated works on terminal tasks", () => {
       taskId: "M3",
       ts: 2,
       stateRef: stateRef(),
+      verification: completionVerification(2, "M3"),
     },
     {
       type: "MetadataUpdated",

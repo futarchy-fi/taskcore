@@ -369,6 +369,17 @@ function approveAndComplete(
       taskId,
       ts: baseTs + 44,
       stateRef: { branch: "main", commit: "migration", parentCommit: "migration" },
+      verification: {
+        mode: "code-task",
+        verifiedAt: baseTs + 44,
+        proof: {
+          kind: "code-task",
+          commitRef: "migration",
+          changedFiles: ["migration"],
+          testsPassed: true,
+          testResults: evidence ?? "Migration completion",
+        },
+      },
     },
   ];
 

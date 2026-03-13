@@ -222,6 +222,16 @@ function complete(taskId: string, ts: number): Event {
       commit: `c-${taskId}-${ts}`,
       parentCommit: `p-${taskId}-${ts - 1}`,
     },
+    verification: {
+      mode: "code-task",
+      verifiedAt: ts,
+      proof: {
+        kind: "code-task",
+        commitRef: `c-${taskId}-${ts}`,
+        changedFiles: ["src/index.ts"],
+        testsPassed: true,
+      },
+    },
   };
 }
 

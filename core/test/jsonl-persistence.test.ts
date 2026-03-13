@@ -192,6 +192,12 @@ describe("JsonlPersistence", () => {
           createdAt: 1000,
           updatedAt: 1000,
           metadata: {},
+          verification: {
+            requiredMode: "code-task",
+            satisfied: false,
+            verification: null,
+            satisfiedAt: null,
+          },
         },
       },
       events: [],
