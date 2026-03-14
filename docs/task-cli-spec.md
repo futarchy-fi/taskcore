@@ -510,6 +510,105 @@ Abort a pending decomposition session without committing.
 task decompose cancel
 ```
 
+#### `task plan` / `task decompose plan` — one-shot plan-based decomposition
+
+Submit a complete decomposition in one command from a structured plan text.
+Uses the same `POST /tasks/:id/decompose` endpoint as a regular commit, so
+children appear in the dashboard immediately.
+
+`task plan` is the low-friction shortcut for agents; `task decompose plan` is
+its explicit decomposition-scoped equivalent.
+
+```
+task plan "<markdown>"
+task plan --file <path-to-plan.md>
+task plan --stdin
+    [--strategy sequential|parallel]    (default: sequential)
+
+# Equivalent forms
+task decompose plan --items "<markdown>"
+task decompose plan --file <path-to-plan.md>
+task decompose plan --stdin
+    [--strategy sequential|parallel]    (default: sequential)
+```
+
+**Plan format:**
+
+```markdown
+# Optional Section Heading
+- [ ] Checklist step title (cost: 10, assignee: coder)
+- [x] Already-checked step (cost: 5)
+1. Ordered list step
+- Plain bullet step
+  Indented lines (2+ spaces) become the child description.
+  Multiple continuation lines are joined with newlines.
+```
+
+Supported item types: checklist (`- [ ]`), ordered (`1.`), plain bullet (`-`).
+
+Headings (`#`, `##`, etc.) set a context prefix applied to all following items
+until the next heading: `"Section: Step title"`.
+
+**Trailing metadata** (optional, at end of item line):
+
+```
+(cost: 15, assignee: coder, reviewer: overseer, skip-analysis: true)
+```
+
+Supported keys: `cost`, `assignee`, `reviewer`, `skip-analysis`.
+
+**Plan editing / propagation semantics (v1):**
+
+- The imported list order becomes the child task order. With the default
+  `sequential` strategy, that order also drives which child is ready first.
+- Checkbox state in the source markdown is **not** treated as task completion.
+  Checked and unchecked items both import as child tasks; completion is tracked
+  by taskcore child state after materialization.
+- Before materialization, edit the markdown and re-run `task plan`.
+- After materialization, the child tasks become the durable source of truth
+  shown in taskcore/dashboard. If the remaining plan needs to change, create a
+  new decomposition version for the remaining work rather than mutating
+  completed child history in place.
+
+**Cost allocation:**
+
+- Items with explicit `cost` keep that value.
+- Items without `cost` share the remaining budget evenly (integer-cent
+  arithmetic — no float drift).
+- Errors clearly if explicit costs exceed the parent's remaining budget, or
+  if there is no budget left for uncosted items.
+
+**Example:**
+
+```markdown
+# Infrastructure
+- [ ] Provision database (cost: 15, assignee: infra)
+- [ ] Configure networking (cost: 10, assignee: infra)
+
+# Application
+- [ ] Implement API endpoints (assignee: coder, reviewer: lead)
+  Build REST endpoints for user CRUD operations.
+- [ ] Write integration tests
+```
+
+```
+task plan --file plan.md --strategy sequential
+```
+
+**Output:**
+
+```
+--- Plan materialized for T42 ---
+
+Created 4 child tasks:
+  T101: Infrastructure: Provision database   15.00
+  T102: Infrastructure: Configure networking  10.00
+  T103: Application: Implement API endpoints  12.50
+  T104: Application: Write integration tests  12.50
+
+Parent task is now a coordinator. Children will execute the plan.
+```
+
 ### 3.6 Review Workflow (guided, multi-step)
 
 When a task is in the `review` phase and claimed by a reviewer.
