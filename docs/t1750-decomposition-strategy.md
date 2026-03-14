@@ -1,41 +1,54 @@
-# T1750 — Decomposition Strategy
+# T1750 — Decomposition Strategy (v3, reconciled)
 
 ## Epic scope
 
 Five critical taskcore control-plane fixes, all prerequisites for T1726 orchestration work.
 
-## Children
+## Child inventory — current state
 
-### T2271: Metadata inheritance for child tasks
-- **Files:** `middle/http.ts` (handleDecomposeCommit, handleDecompose), `middle/test/http.test.ts`
-- **Fix:** Default child metadata (priority, assignee, reviewer) from parent when not explicitly provided during decomposition.
-- **Independent** — can start immediately.
+Two decomposition rounds produced T2267-T2275. After reconciliation:
 
-### T2272: Queue claimability false positives and review deadlocks
-- **Files:** `core/dist/core/cli/claimability.js` (source), CLI task list
-- **Fix:** (a) Review tasks only claimable by designated reviewer role, (b) tasks with active leases not shown as available, (c) deadlock detection for reviewer-less review tasks.
-- **Independent** — can start immediately.
+### Active children (work remaining)
 
-### T2273: Decomposition state reconciliation for already-materialized children
-- **Files:** `middle/http.ts` (decompose/start, decompose/commit), `core/reducer.ts`
-- **Fix:** Detect existing children on re-decomposition, cancel stale children, validate version increment.
-- **Depends on T2271** — metadata fix informs decomposition state handling.
+| Task | Bug | Status | Scope |
+|------|-----|--------|-------|
+| **T2268** | Queue claimability & review deadlocks | analysis.waiting | Merged scope from original T2268 (scheduler/dispatcher) + canceled T2272 (claimability.js/CLI). Covers: isDispatchable guard, escalation logic, claimability classifier false positives, lease-aware queue filtering, reviewer deadlock detection. |
+| **T2271** | Metadata inheritance | analysis.waiting | Full scope: propagate ALL parent metadata (priority, assignee, reviewer, tags, informed, repo, base_branch, custom fields) to children during decomposition. Subsumes T2267's analysis. |
+| **T2270** | Attention formatter wiring | analysis.waiting | Wire collectAttentionTasks to periodic dispatch hook or cron; consolidate duplicated notify logic between dispatcher.ts and http.ts. |
+| **T2274** | Attention formatter crash | analysis.waiting | Null-safety guards in collectAttentionTasks/toSummary; harden CLI cmdAttention error handling. |
+| **T2275** | Obsolete task cleanup | analysis.waiting | Cleanup script for 165 blocked tasks per T1749 audit: stale claims, metadata mismatches, genuinely obsolete tasks. Dry-run default. |
 
-### T2274: Attention formatter crash
-- **Files:** `middle/http.ts` (collectAttentionTasks, toSummary), CLI `task.js` (cmdAttention)
-- **Fix:** Null-safety for task metadata in attention endpoints, graceful error handling in CLI.
-- **Independent** — can start immediately.
+### Terminal children (no work remaining)
 
-### T2275: Obsolete and blocked task cleanup
-- **Files:** New script `scripts/taskcore_cleanup_obsolete.ts`
-- **Fix:** Bulk cleanup of 165 blocked tasks per T1749 audit: remove stale claims, reconcile metadata, transition or cancel genuinely obsolete tasks. Dry-run default.
-- **Independent** — can start immediately.
+| Task | Bug | Status | Notes |
+|------|-----|--------|-------|
+| **T2273** | Decomposition reconciliation | **done** | Completed — re-decomposition detects existing children, cancels stale ones, validates version increment. |
+| **T2272** | Queue claimability (CLI scope) | canceled | Scope merged into T2268. |
+| **T2269** | Decomposition reconciliation (v1) | canceled | Superseded by completed T2273. |
+| **T2267** | Metadata inheritance (v1) | blocked/terminal | Analysis captured; scope subsumed by updated T2271 with full-field propagation. |
+
+## Bug coverage matrix
+
+| # | Bug | Owner task | Status |
+|---|-----|-----------|--------|
+| 1 | Metadata inheritance (full: repo/base_branch/informed/custom fields) | T2271 | waiting |
+| 2 | Queue claimability false positives + review deadlocks | T2268 | waiting |
+| 3 | Decomposition state reconciliation | T2273 | **done** |
+| 4a | Attention formatter crash | T2274 | waiting |
+| 4b | Attention formatter wiring | T2270 | waiting |
+| 5 | Obsolete/blocked task cleanup | T2275 | waiting |
 
 ## Sequencing
 
-T2271, T2272, T2274, T2275 can all run in parallel (assigned to coder agents).
-T2273 waits for T2271 to land first.
+All 5 active children (T2268, T2270, T2271, T2274, T2275) can run in parallel — no blocking dependencies between them. T2273 (the only dependency for decomposition reconciliation) is already done.
 
-## Note on prior children (T2267-T2270)
+## Epic status
 
-A prior decomposition v1 created T2267-T2270 with overlapping scope. Those should be superseded by the v2 children above (T2271-T2275) which have more precise descriptions and correct dependency links.
+T1750 remains open as a coordination epic. It completes when all active children reach terminal/done.
+
+## Changes in this reconciliation (v3)
+
+1. **T2268 description updated** — merged T2272's claimability.js/CLI scope into T2268.
+2. **T2271 description updated** — expanded from priority/assignee/reviewer-only to full metadata propagation (repo, base_branch, informed, tags, custom fields) per T2267's root-cause analysis.
+3. **T2269 canceled** — superseded by completed T2273.
+4. **Doc rewritten** — removed stale references to T2272/T2273 as active children.
