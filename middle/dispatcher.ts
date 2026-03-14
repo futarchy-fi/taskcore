@@ -16,6 +16,7 @@ import type {
   Task,
   TaskCompleted,
 } from "../core/types.js";
+import { buildCompletionVerificationResult } from "../core/types.js";
 import type { Config } from "./config.js";
 // autoAnalysis removed — all tasks go through real analysis unless skipAnalysis:true at creation
 import { buildPrompt } from "./prompt.js";
@@ -538,6 +539,35 @@ function applyAutoDetectedStatus(
 
     const stateRef: StateRef = getBranchRef(config.journalRepoPath, taskBranch(task.id))
       ?? { branch: "main", commit: "0000000", parentCommit: "0000000" };
+    const proof =
+      task.verification.requiredMode === "journal-only"
+        ? {
+            kind: "journal-only" as const,
+            journalPath: taskBranch(task.id),
+            summary: detected.evidence,
+            actionable: true,
+          }
+        : task.verification.requiredMode === "coordinator"
+          ? {
+              kind: "coordinator" as const,
+              childTaskIds: task.children,
+              summary: detected.evidence,
+              allChildrenSucceeded: task.children.every((childId) => core.getState().tasks[childId]?.terminal === "done"),
+            }
+          : task.verification.requiredMode === "aggregate"
+            ? {
+                kind: "aggregate" as const,
+                componentResults: [{ name: "review", status: "succeeded" as const, evidenceRef: stateRef.commit }],
+                summary: detected.evidence,
+                criticalPathMet: true,
+              }
+            : {
+                kind: "code-task" as const,
+                commitRef: stateRef.commit,
+                changedFiles: ["journal.md"],
+                testsPassed: true,
+                testResults: detected.evidence,
+              };
     const completed: TaskCompleted = {
       type: "TaskCompleted",
       taskId: task.id,
@@ -546,35 +576,8 @@ function applyAutoDetectedStatus(
       verification: {
         mode: task.verification.requiredMode,
         verifiedAt: now + 2,
-        proof:
-          task.verification.requiredMode === "journal-only"
-            ? {
-                kind: "journal-only",
-                journalPath: taskBranch(task.id),
-                summary: detected.evidence,
-                actionable: true,
-              }
-            : task.verification.requiredMode === "coordinator"
-              ? {
-                  kind: "coordinator",
-                  childTaskIds: task.children,
-                  summary: detected.evidence,
-                  allChildrenSucceeded: task.children.every((childId) => core.getState().tasks[childId]?.terminal === "done"),
-                }
-              : task.verification.requiredMode === "aggregate"
-                ? {
-                    kind: "aggregate",
-                    componentResults: [{ name: "review", status: "succeeded", evidenceRef: stateRef.commit }],
-                    summary: detected.evidence,
-                    criticalPathMet: true,
-                  }
-                : {
-                    kind: "code-task",
-                    commitRef: stateRef.commit,
-                    changedFiles: ["journal.md"],
-                    testsPassed: true,
-                    testResults: detected.evidence,
-                  },
+        proof,
+        result: buildCompletionVerificationResult(proof),
       },
     };
     const r3 = core.submit(completed);

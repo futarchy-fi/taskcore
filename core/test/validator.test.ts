@@ -15,6 +15,13 @@ function completionVerification(ts = 1, taskId = "T10"): Extract<Event, { type: 
       changedFiles: ["src/index.ts"],
       testsPassed: true,
     },
+    result: {
+      kind: "code-task",
+      status: "verified",
+      verifiedCommitRef: `commit-${taskId}-${ts}`,
+      changedFileCount: 1,
+      testsPassed: true,
+    },
   };
 }
 
@@ -200,6 +207,119 @@ test("validator accepts TaskCompleted with matching proof", () => {
     stateRef: { branch: "task/T30", commit: "abc", parentCommit: "def" },
     verification: completionVerification(2, "T30"),
   };
+  const error = validateEvent(state, event);
+  assert.equal(error, null);
+});
+
+test("validator rejects coordinator verification with mismatched child counts", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T40",
+    ts: 1,
+    title: "Coordinator task",
+    description: "Task for coordinator verification tests",
+    parentId: null,
+    rootId: "T40",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "coordinator",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T40",
+    ts: 2,
+    stateRef: { branch: "task/T40", commit: "abc", parentCommit: "def" },
+    verification: {
+      mode: "coordinator",
+      verifiedAt: 2,
+      proof: {
+        kind: "coordinator",
+        childTaskIds: ["T40-A", "T40-B"],
+        summary: "Child tasks completed",
+        allChildrenSucceeded: true,
+      },
+      result: {
+        kind: "coordinator",
+        status: "verified",
+        childTaskCount: 2,
+        successfulChildCount: 1,
+        allChildrenSucceeded: true,
+      },
+    },
+  };
+
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "invalid_completion_result");
+});
+
+test("validator accepts aggregate verification with matching component totals", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T50",
+    ts: 1,
+    title: "Aggregate task",
+    description: "Task for aggregate verification tests",
+    parentId: null,
+    rootId: "T50",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "aggregate",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T50",
+    ts: 2,
+    stateRef: { branch: "task/T50", commit: "abc", parentCommit: "def" },
+    verification: {
+      mode: "aggregate",
+      verifiedAt: 2,
+      proof: {
+        kind: "aggregate",
+        componentResults: [
+          { name: "build", status: "succeeded", evidenceRef: "build-123" },
+          { name: "docs", status: "skipped" },
+          { name: "review", status: "succeeded", evidenceRef: "review-456" },
+        ],
+        summary: "Critical path tasks finished",
+        criticalPathMet: true,
+      },
+      result: {
+        kind: "aggregate",
+        status: "verified",
+        componentCount: 3,
+        succeededCount: 2,
+        failedCount: 0,
+        skippedCount: 1,
+        criticalPathMet: true,
+      },
+    },
+  };
+
   const error = validateEvent(state, event);
   assert.equal(error, null);
 });

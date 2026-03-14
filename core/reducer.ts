@@ -620,7 +620,7 @@ function applyTaskCompleted(state: SystemState, event: Extract<Event, { type: "T
     requiredMode: task.verification.requiredMode,
     satisfied: true,
     verification: structuredClone(event.verification),
-    satisfiedAt: event.ts,
+    satisfiedAt: event.verification.verifiedAt,
   };
 
   t.updatedAt = event.ts;

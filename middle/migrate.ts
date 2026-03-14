@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import { OrchestrationCore } from "../core/index.js";
 import { checkInvariants } from "../core/invariants.js";
 import {
+  buildCompletionVerificationResult,
   DEFAULT_ATTEMPT_BUDGETS,
   type AgentContext,
   type Event,
@@ -379,6 +380,13 @@ function approveAndComplete(
           testsPassed: true,
           testResults: evidence ?? "Migration completion",
         },
+        result: buildCompletionVerificationResult({
+          kind: "code-task",
+          commitRef: "migration",
+          changedFiles: ["migration"],
+          testsPassed: true,
+          testResults: evidence ?? "Migration completion",
+        }),
       },
     },
   ];

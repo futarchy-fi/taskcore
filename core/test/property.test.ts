@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { checkInvariants } from "../invariants.js";
 import { reduce } from "../reducer.js";
 import {
+  buildCompletionVerificationResult,
   computeCostRemaining,
   createInitialState,
   type Event,
@@ -64,15 +65,18 @@ function createTask(taskId: string, ts: number, options?: { initialPhase?: Phase
 }
 
 function completionVerification(taskId: string, ts: number): Extract<Event, { type: "TaskCompleted" }>["verification"] {
+  const proof = {
+    kind: "code-task" as const,
+    commitRef: `c-${taskId}-${ts}`,
+    changedFiles: ["src/index.ts"],
+    testsPassed: true,
+  };
+
   return {
     mode: "code-task",
     verifiedAt: ts,
-    proof: {
-      kind: "code-task",
-      commitRef: `c-${taskId}-${ts}`,
-      changedFiles: ["src/index.ts"],
-      testsPassed: true,
-    },
+    proof,
+    result: buildCompletionVerificationResult(proof),
   };
 }
 

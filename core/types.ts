@@ -147,9 +147,102 @@ export type CompletionProof =
   | CoordinatorCompletionProof
   | AggregateCompletionProof;
 
+export interface CodeTaskCompletionResult {
+  kind: "code-task";
+  status: "verified";
+  verifiedCommitRef: string;
+  changedFileCount: number;
+  testsPassed: boolean;
+}
+
+export interface JournalOnlyCompletionResult {
+  kind: "journal-only";
+  status: "verified";
+  recordedJournalPath: string;
+  actionable: boolean;
+}
+
+export interface CoordinatorCompletionResult {
+  kind: "coordinator";
+  status: "verified";
+  childTaskCount: number;
+  successfulChildCount: number;
+  allChildrenSucceeded: boolean;
+}
+
+export interface AggregateCompletionResult {
+  kind: "aggregate";
+  status: "verified";
+  componentCount: number;
+  succeededCount: number;
+  failedCount: number;
+  skippedCount: number;
+  criticalPathMet: boolean;
+}
+
+export type CompletionVerificationResult =
+  | CodeTaskCompletionResult
+  | JournalOnlyCompletionResult
+  | CoordinatorCompletionResult
+  | AggregateCompletionResult;
+
+export function buildCompletionVerificationResult(proof: CompletionProof): CompletionVerificationResult {
+  switch (proof.kind) {
+    case "code-task":
+      return {
+        kind: "code-task",
+        status: "verified",
+        verifiedCommitRef: proof.commitRef,
+        changedFileCount: proof.changedFiles.length,
+        testsPassed: proof.testsPassed,
+      };
+    case "journal-only":
+      return {
+        kind: "journal-only",
+        status: "verified",
+        recordedJournalPath: proof.journalPath,
+        actionable: proof.actionable,
+      };
+    case "coordinator": {
+      const successfulChildCount = proof.allChildrenSucceeded ? proof.childTaskIds.length : 0;
+      return {
+        kind: "coordinator",
+        status: "verified",
+        childTaskCount: proof.childTaskIds.length,
+        successfulChildCount,
+        allChildrenSucceeded: proof.allChildrenSucceeded,
+      };
+    }
+    case "aggregate": {
+      let succeededCount = 0;
+      let failedCount = 0;
+      let skippedCount = 0;
+      for (const component of proof.componentResults) {
+        if (component.status === "succeeded") {
+          succeededCount += 1;
+        } else if (component.status === "failed") {
+          failedCount += 1;
+        } else {
+          skippedCount += 1;
+        }
+      }
+      return {
+        kind: "aggregate",
+        status: "verified",
+        componentCount: proof.componentResults.length,
+        succeededCount,
+        failedCount,
+        skippedCount,
+        criticalPathMet: proof.criticalPathMet,
+      };
+    }
+  }
+}
+
 export interface CompletionVerification {
   mode: CompletionVerificationMode;
   proof: CompletionProof;
+  result: CompletionVerificationResult;
   verifiedAt: Timestamp;
   verifiedBy?: AgentId;
 }

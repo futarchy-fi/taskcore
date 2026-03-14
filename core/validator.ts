@@ -69,6 +69,10 @@ function isPositiveInt(value: number): boolean {
   return Number.isInteger(value) && value > 0;
 }
 
+function isNonNegativeInt(value: number): boolean {
+  return Number.isInteger(value) && value >= 0;
+}
+
 function nonEmptyText(value: string): boolean {
   return value.trim().length > 0;
 }
@@ -103,21 +107,42 @@ function validateCompletionVerification(
     );
   }
 
-  if (!isPositiveInt(verification.verifiedAt)) {
-    return mkError(event, "invalid_verification_timestamp", "TaskCompleted verification must include a valid verifiedAt timestamp.");
+  if (!isPositiveInt(verification.verifiedAt) || verification.verifiedAt > event.ts) {
+    return mkError(
+      event,
+      "invalid_verification_timestamp",
+      "TaskCompleted verification must include a valid verifiedAt timestamp no later than the event timestamp.",
+    );
+  }
+
+  if (verification.verifiedBy !== undefined && !nonEmptyText(verification.verifiedBy)) {
+    return mkError(event, "invalid_verifier", "TaskCompleted verification verifiedBy must be non-empty when provided.");
   }
 
   const proof = verification.proof;
+  const result = verification.result;
   switch (verification.mode) {
     case "code-task": {
       if (proof.kind !== "code-task") {
         return mkError(event, "invalid_completion_proof", "code-task verification requires code-task proof.");
+      }
+      if (result.kind !== "code-task" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "code-task verification requires verified code-task result.");
       }
       if (!nonEmptyText(proof.commitRef)) {
         return mkError(event, "invalid_completion_proof", "code-task proof requires commitRef.");
       }
       if (proof.changedFiles.length === 0 || proof.changedFiles.some((file) => !nonEmptyText(file))) {
         return mkError(event, "invalid_completion_proof", "code-task proof requires non-empty changedFiles.");
+      }
+      if (!nonEmptyText(result.verifiedCommitRef) || result.verifiedCommitRef !== proof.commitRef) {
+        return mkError(event, "invalid_completion_result", "code-task result must reference the verified commitRef.");
+      }
+      if (!isPositiveInt(result.changedFileCount) || result.changedFileCount !== proof.changedFiles.length) {
+        return mkError(event, "invalid_completion_result", "code-task result changedFileCount must match proof.changedFiles.");
+      }
+      if (result.testsPassed !== proof.testsPassed) {
+        return mkError(event, "invalid_completion_result", "code-task result testsPassed must match the proof.");
       }
       return null;
     }
@@ -126,8 +151,17 @@ function validateCompletionVerification(
       if (proof.kind !== "journal-only") {
         return mkError(event, "invalid_completion_proof", "journal-only verification requires journal-only proof.");
       }
+      if (result.kind !== "journal-only" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "journal-only verification requires verified journal-only result.");
+      }
       if (!nonEmptyText(proof.journalPath) || !nonEmptyText(proof.summary)) {
         return mkError(event, "invalid_completion_proof", "journal-only proof requires journalPath and summary.");
+      }
+      if (!nonEmptyText(result.recordedJournalPath) || result.recordedJournalPath !== proof.journalPath) {
+        return mkError(event, "invalid_completion_result", "journal-only result must record the verified journalPath.");
+      }
+      if (result.actionable !== proof.actionable) {
+        return mkError(event, "invalid_completion_result", "journal-only result actionable must match the proof.");
       }
       return null;
     }
@@ -136,8 +170,23 @@ function validateCompletionVerification(
       if (proof.kind !== "coordinator") {
         return mkError(event, "invalid_completion_proof", "coordinator verification requires coordinator proof.");
       }
+      if (result.kind !== "coordinator" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "coordinator verification requires verified coordinator result.");
+      }
       if (proof.childTaskIds.length === 0 || proof.childTaskIds.some((id) => !nonEmptyText(id)) || !nonEmptyText(proof.summary)) {
         return mkError(event, "invalid_completion_proof", "coordinator proof requires childTaskIds and summary.");
+      }
+      if (!isPositiveInt(result.childTaskCount) || result.childTaskCount !== proof.childTaskIds.length) {
+        return mkError(event, "invalid_completion_result", "coordinator result childTaskCount must match proof.childTaskIds.");
+      }
+      if (!isNonNegativeInt(result.successfulChildCount) || result.successfulChildCount > result.childTaskCount) {
+        return mkError(event, "invalid_completion_result", "coordinator result successfulChildCount must be within childTaskCount.");
+      }
+      if (result.allChildrenSucceeded !== proof.allChildrenSucceeded) {
+        return mkError(event, "invalid_completion_result", "coordinator result allChildrenSucceeded must match the proof.");
+      }
+      if (result.allChildrenSucceeded && result.successfulChildCount !== result.childTaskCount) {
+        return mkError(event, "invalid_completion_result", "coordinator result must count all children as successful when allChildrenSucceeded is true.");
       }
       return null;
     }
@@ -146,13 +195,36 @@ function validateCompletionVerification(
       if (proof.kind !== "aggregate") {
         return mkError(event, "invalid_completion_proof", "aggregate verification requires aggregate proof.");
       }
+      if (result.kind !== "aggregate" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "aggregate verification requires verified aggregate result.");
+      }
       if (proof.componentResults.length === 0 || !nonEmptyText(proof.summary)) {
         return mkError(event, "invalid_completion_proof", "aggregate proof requires componentResults and summary.");
       }
-      for (const result of proof.componentResults) {
-        if (!nonEmptyText(result.name)) {
+      for (const component of proof.componentResults) {
+        if (!nonEmptyText(component.name)) {
           return mkError(event, "invalid_completion_proof", "aggregate proof component names must be non-empty.");
         }
+      }
+
+      const succeededCount = proof.componentResults.filter((component) => component.status === "succeeded").length;
+      const failedCount = proof.componentResults.filter((component) => component.status === "failed").length;
+      const skippedCount = proof.componentResults.filter((component) => component.status === "skipped").length;
+
+      if (!isPositiveInt(result.componentCount) || result.componentCount !== proof.componentResults.length) {
+        return mkError(event, "invalid_completion_result", "aggregate result componentCount must match proof.componentResults.");
+      }
+      if (!isNonNegativeInt(result.succeededCount) || result.succeededCount !== succeededCount) {
+        return mkError(event, "invalid_completion_result", "aggregate result succeededCount must match the proof.");
+      }
+      if (!isNonNegativeInt(result.failedCount) || result.failedCount !== failedCount) {
+        return mkError(event, "invalid_completion_result", "aggregate result failedCount must match the proof.");
+      }
+      if (!isNonNegativeInt(result.skippedCount) || result.skippedCount !== skippedCount) {
+        return mkError(event, "invalid_completion_result", "aggregate result skippedCount must match the proof.");
+      }
+      if (result.criticalPathMet !== proof.criticalPathMet) {
+        return mkError(event, "invalid_completion_result", "aggregate result criticalPathMet must match the proof.");
       }
       return null;
     }

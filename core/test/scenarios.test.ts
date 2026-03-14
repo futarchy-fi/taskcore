@@ -231,6 +231,13 @@ function complete(taskId: string, ts: number): Event {
         changedFiles: ["src/index.ts"],
         testsPassed: true,
       },
+      result: {
+        kind: "code-task",
+        status: "verified",
+        verifiedCommitRef: `c-${taskId}-${ts}`,
+        changedFileCount: 1,
+        testsPassed: true,
+      },
     },
   };
 }
