@@ -3,25 +3,21 @@ import assert from "node:assert/strict";
 
 import { reduce } from "../reducer.js";
 import { validateEvent } from "../validator.js";
-import { createInitialState, type Event, type SystemState } from "../types.js";
+import { buildCompletionVerificationResult, createInitialState, type Event, type SystemState } from "../types.js";
 
 function completionVerification(ts = 1, taskId = "T10"): Extract<Event, { type: "TaskCompleted" }>["verification"] {
+  const proof = {
+    kind: "code-task" as const,
+    commitRef: `commit-${taskId}-${ts}`,
+    changedFiles: ["src/index.ts"],
+    testsPassed: true,
+  };
+
   return {
     mode: "code-task",
     verifiedAt: ts,
-    proof: {
-      kind: "code-task",
-      commitRef: `commit-${taskId}-${ts}`,
-      changedFiles: ["src/index.ts"],
-      testsPassed: true,
-    },
-    result: {
-      kind: "code-task",
-      status: "verified",
-      verifiedCommitRef: `commit-${taskId}-${ts}`,
-      changedFileCount: 1,
-      testsPassed: true,
-    },
+    proof,
+    result: buildCompletionVerificationResult(proof),
   };
 }
 
@@ -207,6 +203,101 @@ test("validator accepts TaskCompleted with matching proof", () => {
     stateRef: { branch: "task/T30", commit: "abc", parentCommit: "def" },
     verification: completionVerification(2, "T30"),
   };
+  const error = validateEvent(state, event);
+  assert.equal(error, null);
+});
+
+test("validator rejects code-task verification when result does not match proof", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T31",
+    ts: 1,
+    title: "Code task",
+    description: "Task for validator tests",
+    parentId: null,
+    rootId: "T31",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const verification = completionVerification(2, "T31");
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T31",
+    ts: 2,
+    stateRef: { branch: "task/T31", commit: "abc", parentCommit: "def" },
+    verification: {
+      ...verification,
+      result: {
+        kind: "code-task",
+        status: "verified",
+        verifiedCommitRef: `commit-T31-2`,
+        changedFileCount: 2,
+        testsPassed: true,
+      },
+    },
+  };
+
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "invalid_completion_result");
+});
+
+test("validator accepts journal-only verification with matching proof and result", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T32",
+    ts: 1,
+    title: "Journal task",
+    description: "Task for journal verification tests",
+    parentId: null,
+    rootId: "T32",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "journal-only",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const proof = {
+    kind: "journal-only" as const,
+    journalPath: "journal/T32.md",
+    summary: "Captured durable journal evidence",
+    actionable: true,
+  };
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T32",
+    ts: 2,
+    stateRef: { branch: "task/T32", commit: "abc", parentCommit: "def" },
+    verification: {
+      mode: "journal-only",
+      verifiedAt: 2,
+      proof,
+      result: buildCompletionVerificationResult(proof),
+    },
+  };
+
   const error = validateEvent(state, event);
   assert.equal(error, null);
 });

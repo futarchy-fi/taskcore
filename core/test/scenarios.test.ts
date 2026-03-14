@@ -9,6 +9,7 @@ import { createCore } from "../index.js";
 import { checkInvariants } from "../invariants.js";
 import { reduce, replay } from "../reducer.js";
 import {
+  buildCompletionVerificationResult,
   computeCostRemaining,
   createInitialState,
   type Condition,
@@ -231,13 +232,12 @@ function complete(taskId: string, ts: number): Event {
         changedFiles: ["src/index.ts"],
         testsPassed: true,
       },
-      result: {
+      result: buildCompletionVerificationResult({
         kind: "code-task",
-        status: "verified",
-        verifiedCommitRef: `c-${taskId}-${ts}`,
-        changedFileCount: 1,
+        commitRef: `c-${taskId}-${ts}`,
+        changedFiles: ["src/index.ts"],
         testsPassed: true,
-      },
+      }),
     },
   };
 }
