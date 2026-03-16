@@ -229,7 +229,7 @@ export class GatewayWsClient {
     }
 
     this.db.appendRoomEvent(null, "gateway_connecting", {
-      url: url.toString(),
+      url: `${url.origin}${url.pathname}`,
       service: this.config.serviceName,
     });
 
