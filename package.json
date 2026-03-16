@@ -12,6 +12,7 @@
     "test:middle": "tsx --test middle/test/*.test.ts",
     "test:all": "tsx --test core/test/*.test.ts middle/test/*.test.ts",
     "daemon": "node --import tsx middle/daemon.ts",
+    "roomd": "node --import tsx middle/roomd.ts",
     "migrate": "node --import tsx middle/migrate.ts",
     "task": "node --import tsx core/cli/task.ts"
   },

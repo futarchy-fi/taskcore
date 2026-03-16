@@ -1,0 +1,16 @@
+[Unit]
+Description=taskcore roomd service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.openclaw/workspace/core
+Environment=NODE_ENV=production
+EnvironmentFile=-%h/.config/taskcore/roomd.env
+ExecStart=/usr/bin/env npm run roomd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
