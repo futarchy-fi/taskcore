@@ -2,6 +2,7 @@ import * as http from "node:http";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import type { Core } from "../core/index.js";
 import type {
   AgentContext,
@@ -745,12 +746,12 @@ function handleClaimTask(
       if (task.phase === "review") {
         const reviewer = task.metadata["reviewer"] as string | undefined;
         if (reviewer && agentRole(reviewer) !== claimRole) {
-          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} reviewer is "${reviewer}", not "${agentId}". Use --force to override.` } };
+          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} is assigned to a different agent for review. Use --force to override.` } };
         }
       } else {
         const assignee = task.metadata["assignee"] as string | undefined;
         if (assignee && agentRole(assignee) !== claimRole) {
-          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} assignee is "${assignee}", not "${agentId}". Use --force to override.` } };
+          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} is assigned to a different agent. Use --force to override.` } };
         }
       }
     }
@@ -1025,16 +1026,16 @@ function handleGetTaskJournal(
 
     const fromBranch = getJournalContent(config.journalRepoPath, taskId);
     if (fromBranch !== null) {
-      return { status: 200, body: { taskId, content: fromBranch } };
+      return { status: 200, body: { taskId, content: fromBranch, hasJournal: true } };
     }
 
     const journalWorktree = getWorktreePath(config.worktreeBaseDir, taskId, "journal");
     const journalFile = path.join(journalWorktree, "tasks", `T${taskId}`, "journal.md");
     if (fs.existsSync(journalFile)) {
-      return { status: 200, body: { taskId, content: fs.readFileSync(journalFile, "utf-8") } };
+      return { status: 200, body: { taskId, content: fs.readFileSync(journalFile, "utf-8"), hasJournal: true } };
     }
 
-    return { status: 200, body: { taskId, content: "" } };
+    return { status: 200, body: { taskId, content: "", hasJournal: false } };
   };
 }
 
@@ -1123,17 +1124,67 @@ function handleReviewContext(
       return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
     }
 
-    const notes = Array.isArray(task.metadata["review_notes"])
-      ? task.metadata["review_notes"]
-      : [];
+    // Assignee evidence from PhaseTransition to review
+    const events = core.getEvents(taskId);
+    let assigneeEvidence: string | null = null;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i] as unknown as Record<string, unknown>;
+      if (ev["type"] === "PhaseTransition") {
+        const to = ev["to"] as { phase: string } | undefined;
+        if (to?.phase === "review" && typeof ev["reason"] === "string") {
+          assigneeEvidence = ev["reason"] as string;
+          break;
+        }
+      }
+    }
+    if (!assigneeEvidence) {
+      assigneeEvidence = (task.metadata["evidence"] as string | undefined) ?? null;
+    }
+
+    // Journal content
+    const journalContent = getJournalContent(config.journalRepoPath, taskId);
+
+    // Code diff
+    const targetRepo = task.metadata["repo"] as string | undefined;
+    let codeDiff: string | null = null;
+    const repoDir = targetRepo || config.workspaceDir;
+    try {
+      const branch = `task/T${taskId}`;
+      const diff = execSync(
+        `git diff main...${branch} -- . 2>/dev/null || git log --oneline --all --grep="^T${taskId}" --format="%H" 2>/dev/null | head -1`,
+        { cwd: repoDir, encoding: "utf-8", timeout: 10_000 },
+      ).trim();
+      if (diff) codeDiff = diff;
+    } catch { /* no diff available */ }
+
+    // Previous review rounds
+    const reviewState = task.reviewState ?? null;
+    const previousVerdicts = reviewState?.verdicts ?? [];
+
+    // Failure summaries from siblings
+    const failureSummaries = getFailureSummaries(config.journalRepoPath, taskId);
 
     return {
       status: 200,
       body: {
         taskId,
+        title: task.title,
+        description: task.description,
+        priority: task.metadata["priority"],
+        assignee: task.metadata["assignee"],
+        reviewer: task.metadata["reviewer"],
         phase: task.phase,
-        text: buildPrompt(core, taskId, "review", config),
-        notes,
+        condition: task.condition,
+        assigneeEvidence,
+        journalContent,
+        codeDiff: codeDiff ? (codeDiff.length > 10000 ? codeDiff.slice(0, 10000) + "\n... (truncated)" : codeDiff) : null,
+        reviewState: {
+          round: reviewState?.round ?? 0,
+          status: reviewState?.status ?? "none",
+          verdicts: previousVerdicts,
+        },
+        reviewConfig: task.reviewConfig,
+        siblingFailures: failureSummaries.slice(0, 20),
       },
     };
   };
