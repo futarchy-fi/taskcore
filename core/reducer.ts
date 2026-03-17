@@ -5,7 +5,6 @@ import {
   DEFAULT_ATTEMPT_BUDGETS,
   type Event,
   type FailureSummary,
-  isDependencyWait,
   type Phase,
   type ReduceResult,
   type Result,
@@ -128,11 +127,15 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
       contextIsolation: event.reviewConfig?.isolationRules ?? [],
       contextBudget: 0,
       waitState: null,
-      coordination: null,
-      lastCompletionVerification: null,
       createdAt: event.ts,
       updatedAt: event.ts,
       metadata: event.metadata,
+      verification: {
+        requiredMode: event.completionVerificationMode ?? "code-task",
+        satisfied: false,
+        verification: null,
+        satisfiedAt: null,
+      },
     })
       ? event.initialCondition
       : "waiting";
@@ -178,11 +181,15 @@ function createTaskFromTaskCreated(event: TaskCreated): Task {
     contextIsolation: event.reviewConfig?.isolationRules ?? [],
     contextBudget: 0,
     waitState: null,
-    coordination: null,
-    lastCompletionVerification: null,
     createdAt: event.ts,
     updatedAt: event.ts,
     metadata: structuredClone(event.metadata),
+    verification: {
+      requiredMode: event.completionVerificationMode ?? "code-task",
+      satisfied: false,
+      verification: null,
+      satisfiedAt: null,
+    },
   };
 }
 
@@ -236,11 +243,15 @@ function createChildTaskFromDecomposition(parent: Task, event: Extract<Event, { 
     contextIsolation: child.reviewConfig?.isolationRules ?? [],
     contextBudget: 0,
     waitState: null,
-    coordination: null,
-    lastCompletionVerification: null,
     createdAt: event.ts,
     updatedAt: event.ts,
     metadata: structuredClone(child.metadata ?? {}),
+    verification: {
+      requiredMode: child.completionVerificationMode ?? "code-task",
+      satisfied: false,
+      verification: null,
+      satisfiedAt: null,
+    },
   };
 }
 
@@ -267,10 +278,10 @@ function applyLeaseGranted(state: SystemState, event: Extract<Event, { type: "Le
   t.leasedTo = event.agentId;
   t.leaseExpiresAt = event.ts + event.leaseTimeout;
   t.phase = event.phase;
-  t.condition = "active";
+  t.condition = "leased";
   t.retryAfter = null;
   t.waitState = null;
-  t.currentSessionId = event.agentContext.sessionId;
+  t.currentSessionId = event.sessionId;
   t.contextBudget = event.contextBudget;
   t.attempts[event.phase].used += 1;
   t.updatedAt = event.ts;
@@ -287,34 +298,11 @@ function applyLeaseExpired(state: SystemState, event: Extract<Event, { type: "Le
   state.tasks[t.id] = t;
 }
 
-function applyLeaseReleased(state: SystemState, event: Extract<Event, { type: "LeaseReleased" }>, task: Task): void {
+function applyAgentStarted(state: SystemState, event: Extract<Event, { type: "AgentStarted" }>, task: Task): void {
   const t = deepCloneTask(task);
-  t.condition = "ready";
-  t.leasedTo = null;
+  t.condition = "active";
+  t.currentSessionId = event.agentContext.sessionId;
   t.leaseExpiresAt = null;
-  t.retryAfter = null;
-  t.currentSessionId = null;
-  t.lastAgentExitAt = null;
-  t.updatedAt = event.ts;
-  state.tasks[t.id] = t;
-}
-
-function applyLeaseExtended(state: SystemState, event: Extract<Event, { type: "LeaseExtended" }>, task: Task): void {
-  const t = deepCloneTask(task);
-  t.leaseExpiresAt = event.ts + event.leaseTimeout;
-  t.updatedAt = event.ts;
-  state.tasks[t.id] = t;
-}
-
-// Legacy no-op: AgentStarted is now absorbed into LeaseGranted.
-// Kept for backward compatibility with existing event journals.
-function applyAgentStarted(_state: SystemState, _event: Extract<Event, { type: "AgentStarted" }>, _task: Task): void {
-  // no-op
-}
-
-function applyCostReported(state: SystemState, event: Extract<Event, { type: "CostReported" }>, task: Task): void {
-  const t = deepCloneTask(task);
-  t.cost.consumed += event.reportedCost;
   t.updatedAt = event.ts;
   state.tasks[t.id] = t;
 }
@@ -370,11 +358,10 @@ function applyWaitResolved(state: SystemState, event: Extract<Event, { type: "Wa
   }
 
   if (event.action === "resume") {
-    if (t.waitState && isDependencyWait(t.waitState)) {
-      const ws = t.waitState;
-      t.phase = ws.returnPhase;
-      t.condition = ws.returnCondition;
-      t.sessionPolicy = sessionPolicyForPhase(ws.returnPhase);
+    if (t.waitState) {
+      t.phase = t.waitState.returnPhase;
+      t.condition = t.waitState.returnCondition;
+      t.sessionPolicy = sessionPolicyForPhase(t.waitState.returnPhase);
     } else {
       t.condition = "active";
     }
@@ -411,16 +398,14 @@ function applyDependencySatisfied(state: SystemState, event: Extract<Event, { ty
   }
 
   if (t.condition === "waiting" && allBlockingBeforeStartDepsSatisfied(t)) {
-    if (t.waitState && isDependencyWait(t.waitState)) {
-      const ws = t.waitState;
-      t.phase = ws.returnPhase;
-      t.condition = ws.returnCondition;
-      t.sessionPolicy = sessionPolicyForPhase(ws.returnPhase);
+    if (t.waitState) {
+      t.phase = t.waitState.returnPhase;
+      t.condition = t.waitState.returnCondition;
+      t.sessionPolicy = sessionPolicyForPhase(t.waitState.returnPhase);
       t.waitState = null;
-    } else if (!t.waitState) {
+    } else {
       t.condition = "ready";
     }
-    // If waitState is sibling_turn, don't change condition — wait for ChildActivated
   }
 
   t.lastAgentExitAt = null;
@@ -495,131 +480,6 @@ function applyDecompositionCreated(state: SystemState, event: Extract<Event, { t
     failureSummary: null,
   });
 
-  // Sequential coordination: park all children except the first
-  if (event.coordinationMode?.mode === "sequential_children" && childIds.length > 0) {
-    const firstChildId = childIds[0]!;
-    for (let i = 1; i < childIds.length; i++) {
-      const childId = childIds[i]!;
-      const child = state.tasks[childId];
-      if (child) {
-        const childClone = deepCloneTask(child);
-        childClone.condition = "waiting";
-        childClone.waitState = { kind: "sibling_turn", parentId: t.id };
-        childClone.updatedAt = event.ts;
-        state.tasks[childClone.id] = childClone;
-      }
-    }
-
-    t.coordination = {
-      mode: "sequential_children",
-      reviewBetweenChildren: event.coordinationMode.reviewBetweenChildren,
-      childOrder: [...childIds],
-      nextChildIndex: 1,
-      activeChildId: firstChildId,
-      lastCompletedChildId: null,
-    };
-  }
-
-  t.updatedAt = event.ts;
-  state.tasks[t.id] = t;
-}
-
-function applyChildActivated(state: SystemState, event: Extract<Event, { type: "ChildActivated" }>, task: Task): void {
-  // task = the child being activated (event.taskId)
-  const childClone = deepCloneTask(task);
-  childClone.condition = "ready";
-  childClone.waitState = null;
-  childClone.updatedAt = event.ts;
-  state.tasks[childClone.id] = childClone;
-
-  // Update parent's coordination state
-  const parent = state.tasks[event.parentId];
-  if (parent && parent.coordination) {
-    const parentClone = deepCloneTask(parent);
-    parentClone.coordination = { ...parentClone.coordination! };
-    parentClone.coordination.lastCompletedChildId = parentClone.coordination.activeChildId;
-    parentClone.coordination.activeChildId = event.taskId;
-    parentClone.coordination.nextChildIndex = event.index + 1;
-    parentClone.updatedAt = event.ts;
-    state.tasks[parentClone.id] = parentClone;
-  }
-}
-
-function applyChildReviewDecisionSubmitted(
-  state: SystemState,
-  event: Extract<Event, { type: "ChildReviewDecisionSubmitted" }>,
-  task: Task,
-): void {
-  const t = deepCloneTask(task);
-
-  if (!t.coordination) return;
-  const coord = { ...t.coordination };
-
-  coord.lastCompletedChildId = event.childId;
-
-  switch (event.decision) {
-    case "continue_next_child": {
-      if (coord.nextChildIndex < coord.childOrder.length) {
-        const nextChildId = coord.childOrder[coord.nextChildIndex]!;
-        const nextChild = state.tasks[nextChildId];
-
-        // Activate the next child
-        if (nextChild && nextChild.terminal === null) {
-          const nextClone = deepCloneTask(nextChild);
-          nextClone.condition = "ready";
-          nextClone.waitState = null;
-          nextClone.updatedAt = event.ts;
-          state.tasks[nextClone.id] = nextClone;
-        }
-
-        coord.activeChildId = nextChildId;
-        coord.nextChildIndex += 1;
-
-        // Parent goes back to waiting for the next child
-        t.condition = "waiting";
-        t.leasedTo = null;
-        t.leaseExpiresAt = null;
-        t.retryAfter = null;
-        t.lastAgentExitAt = null;
-      }
-      // If no more children, parent stays analysis.active — agent decides next
-      break;
-    }
-
-    case "redecompose_remaining": {
-      // Cancel remaining non-terminal children
-      for (let i = coord.nextChildIndex; i < coord.childOrder.length; i++) {
-        const childId = coord.childOrder[i]!;
-        const child = state.tasks[childId];
-        if (child && child.terminal === null) {
-          const childClone = deepCloneTask(child);
-          childClone.terminal = "canceled";
-          childClone.phase = null;
-          childClone.condition = null;
-          childClone.waitState = null;
-          childClone.updatedAt = event.ts;
-          state.tasks[childClone.id] = childClone;
-        }
-      }
-
-      // Parent transitions to decomposition.ready
-      t.phase = "decomposition";
-      t.condition = "ready";
-      t.sessionPolicy = sessionPolicyForPhase("decomposition");
-      t.leasedTo = null;
-      t.leaseExpiresAt = null;
-      t.retryAfter = null;
-      t.lastAgentExitAt = null;
-      break;
-    }
-
-    case "stop_children": {
-      // Parent stays analysis.active — agent decides what to do next
-      break;
-    }
-  }
-
-  t.coordination = coord;
   t.updatedAt = event.ts;
   state.tasks[t.id] = t;
 }
@@ -756,6 +616,13 @@ function applyTaskCompleted(state: SystemState, event: Extract<Event, { type: "T
     activeApproach.outcome = "succeeded";
   }
 
+  t.verification = {
+    requiredMode: task.verification.requiredMode,
+    satisfied: true,
+    verification: structuredClone(event.verification),
+    satisfiedAt: event.verification.verifiedAt,
+  };
+
   t.updatedAt = event.ts;
   state.tasks[t.id] = t;
 }
@@ -879,17 +746,6 @@ function applyMetadataUpdated(state: SystemState, event: Extract<Event, { type: 
   state.tasks[t.id] = t;
 }
 
-function applyCompletionVerificationRecorded(
-  state: SystemState,
-  event: Extract<Event, { type: "CompletionVerificationRecorded" }>,
-  task: Task,
-): void {
-  const t = deepCloneTask(task);
-  t.lastCompletionVerification = structuredClone(event.verification);
-  t.updatedAt = event.ts;
-  state.tasks[t.id] = t;
-}
-
 function applyTaskReparented(state: SystemState, event: Extract<Event, { type: "TaskReparented" }>, task: Task): void {
   const t = deepCloneTask(task);
 
@@ -956,20 +812,11 @@ function applyUnchecked(state: SystemState, event: Event): void {
     case "LeaseExpired":
       applyLeaseExpired(state, event, task);
       break;
-    case "LeaseReleased":
-      applyLeaseReleased(state, event, task);
-      break;
-    case "LeaseExtended":
-      applyLeaseExtended(state, event, task);
-      break;
     case "AgentStarted":
       applyAgentStarted(state, event, task);
       break;
     case "AgentExited":
       applyAgentExited(state, event, task);
-      break;
-    case "CostReported":
-      applyCostReported(state, event, task);
       break;
     case "PhaseTransition":
       applyPhaseTransition(state, event, task);
@@ -991,12 +838,6 @@ function applyUnchecked(state: SystemState, event: Event): void {
       break;
     case "DecompositionCreated":
       applyDecompositionCreated(state, event, task);
-      break;
-    case "ChildActivated":
-      applyChildActivated(state, event, task);
-      break;
-    case "ChildReviewDecisionSubmitted":
-      applyChildReviewDecisionSubmitted(state, event, task);
       break;
     case "ChildCostRecovered":
       applyChildCostRecovered(state, event, task);
@@ -1042,9 +883,6 @@ function applyUnchecked(state: SystemState, event: Event): void {
       break;
     case "MetadataUpdated":
       applyMetadataUpdated(state, event, task);
-      break;
-    case "CompletionVerificationRecorded":
-      applyCompletionVerificationRecorded(state, event, task);
       break;
     default: {
       const neverEvent: never = event;

@@ -3,7 +3,23 @@ import assert from "node:assert/strict";
 
 import { reduce } from "../reducer.js";
 import { validateEvent } from "../validator.js";
-import { createInitialState, type Event, type SystemState } from "../types.js";
+import { buildCompletionVerificationResult, createInitialState, type Event, type SystemState } from "../types.js";
+
+function completionVerification(ts = 1, taskId = "T10"): Extract<Event, { type: "TaskCompleted" }>["verification"] {
+  const proof = {
+    kind: "code-task" as const,
+    commitRef: `commit-${taskId}-${ts}`,
+    changedFiles: ["src/index.ts"],
+    testsPassed: true,
+  };
+
+  return {
+    mode: "code-task",
+    verifiedAt: ts,
+    proof,
+    result: buildCompletionVerificationResult(proof),
+  };
+}
 
 function bootstrapState(): SystemState {
   const created: Event = {
@@ -49,13 +65,6 @@ test("validator rejects non-monotonic fence token", () => {
     sessionId: "sess-1",
     sessionType: "fresh",
     contextBudget: 512,
-    agentContext: {
-      sessionId: "sess-1",
-      agentId: "analyst",
-      memoryRef: null,
-      contextTokens: null,
-      modelId: "test",
-    },
   };
 
   const error = validateEvent(state, invalidLease);
@@ -84,6 +93,326 @@ test("validator enforces failure summary on TaskFailed", () => {
   const error = validateEvent(state, invalidFail);
   assert.ok(error);
   assert.equal(error.code, "missing_failure_summary");
+});
+
+
+test("validator rejects TaskCompleted without verification", () => {
+  let state = bootstrapState();
+  const lease: Event = {
+    type: "LeaseGranted",
+    taskId: "T10",
+    ts: 2,
+    fenceToken: 1,
+    agentId: "coder",
+    phase: "analysis",
+    leaseTimeout: 60_000,
+    sessionId: "sess-1",
+    sessionType: "fresh",
+    contextBudget: 512,
+  };
+  const toExec: Event = {
+    type: "PhaseTransition",
+    taskId: "T10",
+    ts: 3,
+    from: { phase: "analysis", condition: "active" },
+    to: { phase: "execution", condition: "ready" },
+    reasonCode: "decision_execute",
+    reason: "go",
+    fenceToken: 1,
+    agentContext: { sessionId: "sess-1", agentId: "coder", memoryRef: null, contextTokens: 100, modelId: "gpt-5" },
+  };
+  for (const e of [lease, { ...lease, type: "AgentStarted", ts: 2, agentContext: { sessionId: "sess-1", agentId: "coder", memoryRef: null, contextTokens: 100, modelId: "gpt-5" } } as Event, toExec]) {
+    const r = reduce(state, e);
+    assert.equal(r.ok, true);
+    state = r.ok ? r.value.state : state;
+  }
+  const event = {
+    type: "TaskCompleted",
+    taskId: "T10",
+    ts: 4,
+    stateRef: { branch: "task/T10", commit: "abc", parentCommit: "def" },
+  } as Event;
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "missing_verification");
+});
+
+test("validator rejects TaskCompleted with mismatched verification mode", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T20",
+    ts: 1,
+    title: "Journal task",
+    description: "Task for validator tests",
+    parentId: null,
+    rootId: "T20",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "journal-only",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T20",
+    ts: 2,
+    stateRef: { branch: "task/T20", commit: "abc", parentCommit: "def" },
+    verification: completionVerification(2, "T20"),
+  };
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "verification_mode_mismatch");
+});
+
+test("validator accepts TaskCompleted with matching proof", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T30",
+    ts: 1,
+    title: "Code task",
+    description: "Task for validator tests",
+    parentId: null,
+    rootId: "T30",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T30",
+    ts: 2,
+    stateRef: { branch: "task/T30", commit: "abc", parentCommit: "def" },
+    verification: completionVerification(2, "T30"),
+  };
+  const error = validateEvent(state, event);
+  assert.equal(error, null);
+});
+
+test("validator rejects code-task verification when result does not match proof", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T31",
+    ts: 1,
+    title: "Code task",
+    description: "Task for validator tests",
+    parentId: null,
+    rootId: "T31",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const verification = completionVerification(2, "T31");
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T31",
+    ts: 2,
+    stateRef: { branch: "task/T31", commit: "abc", parentCommit: "def" },
+    verification: {
+      ...verification,
+      result: {
+        kind: "code-task",
+        status: "verified",
+        verifiedCommitRef: `commit-T31-2`,
+        changedFileCount: 2,
+        testsPassed: true,
+      },
+    },
+  };
+
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "invalid_completion_result");
+});
+
+test("validator accepts journal-only verification with matching proof and result", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T32",
+    ts: 1,
+    title: "Journal task",
+    description: "Task for journal verification tests",
+    parentId: null,
+    rootId: "T32",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "journal-only",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const proof = {
+    kind: "journal-only" as const,
+    journalPath: "journal/T32.md",
+    summary: "Captured durable journal evidence",
+    actionable: true,
+  };
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T32",
+    ts: 2,
+    stateRef: { branch: "task/T32", commit: "abc", parentCommit: "def" },
+    verification: {
+      mode: "journal-only",
+      verifiedAt: 2,
+      proof,
+      result: buildCompletionVerificationResult(proof),
+    },
+  };
+
+  const error = validateEvent(state, event);
+  assert.equal(error, null);
+});
+
+test("validator rejects coordinator verification with mismatched child counts", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T40",
+    ts: 1,
+    title: "Coordinator task",
+    description: "Task for coordinator verification tests",
+    parentId: null,
+    rootId: "T40",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "coordinator",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T40",
+    ts: 2,
+    stateRef: { branch: "task/T40", commit: "abc", parentCommit: "def" },
+    verification: {
+      mode: "coordinator",
+      verifiedAt: 2,
+      proof: {
+        kind: "coordinator",
+        childTaskIds: ["T40-A", "T40-B"],
+        summary: "Child tasks completed",
+        allChildrenSucceeded: true,
+      },
+      result: {
+        kind: "coordinator",
+        status: "verified",
+        childTaskCount: 2,
+        successfulChildCount: 1,
+        allChildrenSucceeded: true,
+      },
+    },
+  };
+
+  const error = validateEvent(state, event);
+  assert.ok(error);
+  assert.equal(error.code, "invalid_completion_result");
+});
+
+test("validator accepts aggregate verification with matching component totals", () => {
+  let state = createInitialState();
+  const created: Event = {
+    type: "TaskCreated",
+    taskId: "T50",
+    ts: 1,
+    title: "Aggregate task",
+    description: "Task for aggregate verification tests",
+    parentId: null,
+    rootId: "T50",
+    initialPhase: "execution",
+    initialCondition: "ready",
+    attemptBudgets: { analysis: { max: 2 }, decomposition: { max: 2 }, execution: { max: 2 }, review: { max: 2 } },
+    costBudget: 5,
+    dependencies: [],
+    reviewConfig: null,
+    skipAnalysis: true,
+    metadata: {},
+    source: { type: "middle", id: "planner" },
+    completionVerificationMode: "aggregate",
+  };
+  const r = reduce(state, created);
+  assert.equal(r.ok, true);
+  state = r.ok ? r.value.state : state;
+
+  const event: Event = {
+    type: "TaskCompleted",
+    taskId: "T50",
+    ts: 2,
+    stateRef: { branch: "task/T50", commit: "abc", parentCommit: "def" },
+    verification: {
+      mode: "aggregate",
+      verifiedAt: 2,
+      proof: {
+        kind: "aggregate",
+        componentResults: [
+          { name: "build", status: "succeeded", evidenceRef: "build-123" },
+          { name: "docs", status: "skipped" },
+          { name: "review", status: "succeeded", evidenceRef: "review-456" },
+        ],
+        summary: "Critical path tasks finished",
+        criticalPathMet: true,
+      },
+      result: {
+        kind: "aggregate",
+        status: "verified",
+        componentCount: 3,
+        succeededCount: 2,
+        failedCount: 0,
+        skippedCount: 1,
+        criticalPathMet: true,
+      },
+    },
+  };
+
+  const error = validateEvent(state, event);
+  assert.equal(error, null);
 });
 
 // ---------------------------------------------------------------------------
@@ -323,13 +652,6 @@ test("TaskExhausted requires ready or retryWait condition", () => {
     sessionId: "s-1",
     sessionType: "fresh",
     contextBudget: 512,
-    agentContext: {
-      sessionId: "s-1",
-      agentId: "coder",
-      memoryRef: null,
-      contextTokens: null,
-      modelId: "test",
-    },
   };
   const r = reduce(state, leaseEvent);
   assert.equal(r.ok, true);

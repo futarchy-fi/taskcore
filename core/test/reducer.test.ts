@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { reduce } from "../reducer.js";
 import {
+  buildCompletionVerificationResult,
   computeCostRemaining,
   createInitialState,
   type Event,
@@ -28,7 +29,23 @@ function stateRef(): StateRef {
   };
 }
 
-test("reducer applies create -> lease -> phase transition", () => {
+function completionVerification(ts = 1, taskId = "T1") {
+  const proof = {
+    kind: "code-task" as const,
+    commitRef: `commit-${taskId}-${ts}`,
+    changedFiles: ["src/index.ts"],
+    testsPassed: true,
+  };
+
+  return {
+    mode: "code-task" as const,
+    verifiedAt: ts,
+    proof,
+    result: buildCompletionVerificationResult(proof),
+  };
+}
+
+test("reducer applies create -> lease -> start -> phase transition", () => {
   let state = createInitialState();
 
   const events: Event[] = [
@@ -66,6 +83,12 @@ test("reducer applies create -> lease -> phase transition", () => {
       sessionId: "s-1",
       sessionType: "fresh",
       contextBudget: 1024,
+    },
+    {
+      type: "AgentStarted",
+      taskId: "T1",
+      ts: 3,
+      fenceToken: 1,
       agentContext: {
         sessionId: "s-1",
         agentId: "analyst",
@@ -104,7 +127,172 @@ test("reducer applies create -> lease -> phase transition", () => {
   assert.equal(task.phase, "execution");
   assert.equal(task.condition, "ready");
   assert.equal(task.attempts.analysis.used, 1);
-  assert.equal(state.sequence, 3);
+  assert.equal(state.sequence, 4);
+});
+
+test("reducer initializes completion verification mode on created and decomposed tasks", () => {
+  let state = createInitialState();
+
+  const events: Event[] = [
+    {
+      type: "TaskCreated",
+      taskId: "V1",
+      ts: 1,
+      title: "Coordinator parent",
+      description: "Tracks explicit completion modes",
+      parentId: null,
+      rootId: "V1",
+      initialPhase: "decomposition",
+      initialCondition: "ready",
+      attemptBudgets: {
+        analysis: { max: 2 },
+        decomposition: { max: 2 },
+        execution: { max: 2 },
+        review: { max: 2 },
+      },
+      costBudget: 10,
+      dependencies: [],
+      reviewConfig: null,
+      skipAnalysis: false,
+      metadata: {},
+      source: { type: "middle", id: "planner" },
+      completionVerificationMode: "coordinator",
+    },
+    {
+      type: "LeaseGranted",
+      taskId: "V1",
+      ts: 2,
+      fenceToken: 1,
+      agentId: "planner",
+      phase: "decomposition",
+      leaseTimeout: 60_000,
+      sessionId: "s-v1",
+      sessionType: "fresh",
+      contextBudget: 256,
+    },
+    {
+      type: "AgentStarted",
+      taskId: "V1",
+      ts: 3,
+      fenceToken: 1,
+      agentContext: {
+        sessionId: "s-v1",
+        agentId: "planner",
+        memoryRef: null,
+        contextTokens: 128,
+        modelId: "gpt-5",
+      },
+    },
+    {
+      type: "DecompositionCreated",
+      taskId: "V1",
+      ts: 4,
+      fenceToken: 1,
+      version: 1,
+      completionRule: "and",
+      checkpoints: [],
+      children: [
+        {
+          taskId: "V1-CHILD-A",
+          title: "Journal child",
+          description: "Writes a journal artifact",
+          costAllocation: 4,
+          skipAnalysis: true,
+          dependencies: [],
+          completionVerificationMode: "journal-only",
+        },
+        {
+          taskId: "V1-CHILD-B",
+          title: "Default code child",
+          description: "Uses default proof mode",
+          costAllocation: 3,
+          skipAnalysis: true,
+          dependencies: [],
+        },
+      ],
+      agentContext: {
+        sessionId: "s-v1",
+        agentId: "planner",
+        memoryRef: null,
+        contextTokens: 64,
+        modelId: "gpt-5",
+      },
+    },
+  ];
+
+  for (const event of events) {
+    const result = reduce(state, event);
+    assert.equal(result.ok, true, `Event ${event.type} failed: ${!result.ok ? result.error.message : ""}`);
+    state = result.ok ? result.value.state : state;
+  }
+
+  const parent = state.tasks.V1;
+  const journalChild = state.tasks["V1-CHILD-A"];
+  const defaultChild = state.tasks["V1-CHILD-B"];
+
+  assert.ok(parent);
+  assert.ok(journalChild);
+  assert.ok(defaultChild);
+  assert.equal(parent.verification.requiredMode, "coordinator");
+  assert.equal(parent.verification.satisfied, false);
+  assert.equal(parent.verification.verification, null);
+  assert.equal(journalChild.verification.requiredMode, "journal-only");
+  assert.equal(defaultChild.verification.requiredMode, "code-task");
+});
+
+test("TaskCompleted marks verification state as satisfied", () => {
+  let state = createInitialState();
+  const verification = completionVerification(2, "VC1");
+
+  const events: Event[] = [
+    {
+      type: "TaskCreated",
+      taskId: "VC1",
+      ts: 1,
+      title: "Verified completion",
+      description: "Ensure reducer stores proof payload",
+      parentId: null,
+      rootId: "VC1",
+      initialPhase: "execution",
+      initialCondition: "ready",
+      attemptBudgets: {
+        analysis: { max: 2 },
+        decomposition: { max: 2 },
+        execution: { max: 2 },
+        review: { max: 2 },
+      },
+      costBudget: 6,
+      dependencies: [],
+      reviewConfig: null,
+      skipAnalysis: true,
+      metadata: {},
+      source: { type: "middle", id: "planner" },
+    },
+    {
+      type: "TaskCompleted",
+      taskId: "VC1",
+      ts: 2,
+      stateRef: stateRef(),
+      verification,
+    },
+  ];
+
+  for (const event of events) {
+    const result = reduce(state, event);
+    assert.equal(result.ok, true, `Event ${event.type} failed: ${!result.ok ? result.error.message : ""}`);
+    state = result.ok ? result.value.state : state;
+  }
+
+  const task = state.tasks.VC1;
+  assert.ok(task);
+  assert.equal(task.terminal, "done");
+  assert.equal(task.phase, null);
+  assert.equal(task.condition, null);
+  assert.deepEqual(task.stateRef, stateRef());
+  assert.equal(task.verification.requiredMode, "code-task");
+  assert.equal(task.verification.satisfied, true);
+  assert.equal(task.verification.satisfiedAt, 2);
+  assert.deepEqual(task.verification.verification, verification);
 });
 
 test("child terminal failure summary is accumulated on parent", () => {
@@ -462,11 +650,14 @@ test("BudgetIncreased insufficient keeps task exhausted", () => {
       costBudget: 5, dependencies: [], reviewConfig: null, skipAnalysis: true, metadata: {},
       source: { type: "middle", id: "test" },
     },
-    // Lease → retry to use up the attempt
+    // Lease → start → retry to use up the attempt
     {
       type: "LeaseGranted", taskId: "EX4", ts: 2,
       fenceToken: 1, agentId: "coder", phase: "execution",
       leaseTimeout: 60_000, sessionId: "s-ex4", sessionType: "fresh", contextBudget: 512,
+    },
+    {
+      type: "AgentStarted", taskId: "EX4", ts: 3, fenceToken: 1,
       agentContext: { sessionId: "s-ex4", agentId: "coder", memoryRef: null, contextTokens: 400, modelId: "gpt-5" },
     },
     {
@@ -715,6 +906,82 @@ test("MetadataUpdated with null value deletes metadata key", () => {
   assert.equal(task.metadata["consulted"], undefined);
 });
 
+test("TaskCompleted stores verification proof and uses verifiedAt for satisfiedAt", () => {
+  let state = createInitialState();
+
+  const events: Event[] = [
+    {
+      type: "TaskCreated",
+      taskId: "V1",
+      ts: 1,
+      title: "Journal completion task",
+      description: "Tracks explicit completion verification",
+      parentId: null,
+      rootId: "V1",
+      initialPhase: "execution",
+      initialCondition: "ready",
+      attemptBudgets: { analysis: { max: 3 }, decomposition: { max: 2 }, execution: { max: 3 }, review: { max: 2 } },
+      costBudget: 10,
+      dependencies: [],
+      reviewConfig: null,
+      skipAnalysis: true,
+      metadata: {},
+      source: { type: "middle", id: "test" },
+      completionVerificationMode: "journal-only",
+    },
+    {
+      type: "TaskCompleted",
+      taskId: "V1",
+      ts: 20,
+      stateRef: stateRef(),
+      verification: {
+        mode: "journal-only",
+        verifiedAt: 9,
+        proof: {
+          kind: "journal-only",
+          journalPath: "journal/T1779/V1.md",
+          summary: "Documented the result",
+          actionable: true,
+        },
+        result: {
+          kind: "journal-only",
+          status: "verified",
+          recordedJournalPath: "journal/T1779/V1.md",
+          actionable: true,
+        },
+      },
+    },
+  ];
+
+  for (const e of events) {
+    const r = reduce(state, e);
+    assert.equal(r.ok, true, `Event ${e.type} failed: ${!r.ok ? r.error.message : ""}`);
+    state = r.ok ? r.value.state : state;
+  }
+
+  const task = state.tasks["V1"]!;
+  assert.equal(task.terminal, "done");
+  assert.equal(task.verification.requiredMode, "journal-only");
+  assert.equal(task.verification.satisfied, true);
+  assert.equal(task.verification.satisfiedAt, 9);
+  assert.deepEqual(task.verification.verification, {
+    mode: "journal-only",
+    verifiedAt: 9,
+    proof: {
+      kind: "journal-only",
+      journalPath: "journal/T1779/V1.md",
+      summary: "Documented the result",
+      actionable: true,
+    },
+    result: {
+      kind: "journal-only",
+      status: "verified",
+      recordedJournalPath: "journal/T1779/V1.md",
+      actionable: true,
+    },
+  });
+});
+
 test("MetadataUpdated works on terminal tasks", () => {
   let state = createInitialState();
 
@@ -742,6 +1009,7 @@ test("MetadataUpdated works on terminal tasks", () => {
       taskId: "M3",
       ts: 2,
       stateRef: stateRef(),
+      verification: completionVerification(2, "M3"),
     },
     {
       type: "MetadataUpdated",

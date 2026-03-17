@@ -7,11 +7,11 @@ export type Timestamp = number;
 export type Duration = number;
 
 export type Phase = "analysis" | "decomposition" | "execution" | "review";
-export type Condition = "ready" | "active" | "waiting" | "retryWait" | "exhausted";
+export type Condition = "ready" | "leased" | "active" | "waiting" | "retryWait" | "exhausted";
 export type Terminal = "done" | "failed" | "blocked" | "canceled";
 
 export const PHASES: readonly Phase[] = ["analysis", "decomposition", "execution", "review"];
-export const CONDITIONS: readonly Condition[] = ["ready", "active", "waiting", "retryWait", "exhausted"];
+export const CONDITIONS: readonly Condition[] = ["ready", "leased", "active", "waiting", "retryWait", "exhausted"];
 export const TERMINALS: readonly Terminal[] = ["done", "failed", "blocked", "canceled"];
 
 export interface AttemptBudget {
@@ -105,44 +105,165 @@ export interface ReviewVerdict {
   reasoning: string;
 }
 
+export type CompletionVerificationMode = "code-task" | "journal-only" | "coordinator" | "aggregate";
+
+export interface CodeTaskCompletionProof {
+  kind: "code-task";
+  commitRef: string;
+  changedFiles: string[];
+  testsPassed: boolean;
+  testResults?: string;
+  prRef?: string;
+}
+
+export interface JournalOnlyCompletionProof {
+  kind: "journal-only";
+  journalPath: string;
+  summary: string;
+  actionable: boolean;
+}
+
+export interface CoordinatorCompletionProof {
+  kind: "coordinator";
+  childTaskIds: TaskId[];
+  summary: string;
+  allChildrenSucceeded: boolean;
+}
+
+export interface AggregateCompletionProof {
+  kind: "aggregate";
+  componentResults: Array<{
+    name: string;
+    status: "succeeded" | "failed" | "skipped";
+    evidenceRef?: string;
+  }>;
+  summary: string;
+  criticalPathMet: boolean;
+}
+
+export type CompletionProof =
+  | CodeTaskCompletionProof
+  | JournalOnlyCompletionProof
+  | CoordinatorCompletionProof
+  | AggregateCompletionProof;
+
+export interface CodeTaskCompletionResult {
+  kind: "code-task";
+  status: "verified";
+  verifiedCommitRef: string;
+  changedFileCount: number;
+  testsPassed: boolean;
+}
+
+export interface JournalOnlyCompletionResult {
+  kind: "journal-only";
+  status: "verified";
+  recordedJournalPath: string;
+  actionable: boolean;
+}
+
+export interface CoordinatorCompletionResult {
+  kind: "coordinator";
+  status: "verified";
+  childTaskCount: number;
+  successfulChildCount: number;
+  allChildrenSucceeded: boolean;
+}
+
+export interface AggregateCompletionResult {
+  kind: "aggregate";
+  status: "verified";
+  componentCount: number;
+  succeededCount: number;
+  failedCount: number;
+  skippedCount: number;
+  criticalPathMet: boolean;
+}
+
+export type CompletionVerificationResult =
+  | CodeTaskCompletionResult
+  | JournalOnlyCompletionResult
+  | CoordinatorCompletionResult
+  | AggregateCompletionResult;
+
+export function buildCompletionVerificationResult(proof: CompletionProof): CompletionVerificationResult {
+  switch (proof.kind) {
+    case "code-task":
+      return {
+        kind: "code-task",
+        status: "verified",
+        verifiedCommitRef: proof.commitRef,
+        changedFileCount: proof.changedFiles.length,
+        testsPassed: proof.testsPassed,
+      };
+    case "journal-only":
+      return {
+        kind: "journal-only",
+        status: "verified",
+        recordedJournalPath: proof.journalPath,
+        actionable: proof.actionable,
+      };
+    case "coordinator": {
+      const successfulChildCount = proof.allChildrenSucceeded ? proof.childTaskIds.length : 0;
+      return {
+        kind: "coordinator",
+        status: "verified",
+        childTaskCount: proof.childTaskIds.length,
+        successfulChildCount,
+        allChildrenSucceeded: proof.allChildrenSucceeded,
+      };
+    }
+    case "aggregate": {
+      let succeededCount = 0;
+      let failedCount = 0;
+      let skippedCount = 0;
+      for (const component of proof.componentResults) {
+        if (component.status === "succeeded") {
+          succeededCount += 1;
+        } else if (component.status === "failed") {
+          failedCount += 1;
+        } else {
+          skippedCount += 1;
+        }
+      }
+      return {
+        kind: "aggregate",
+        status: "verified",
+        componentCount: proof.componentResults.length,
+        succeededCount,
+        failedCount,
+        skippedCount,
+        criticalPathMet: proof.criticalPathMet,
+      };
+    }
+  }
+}
+
+export interface CompletionVerification {
+  mode: CompletionVerificationMode;
+  proof: CompletionProof;
+  result: CompletionVerificationResult;
+  verifiedAt: Timestamp;
+  verifiedBy?: AgentId;
+}
+
+export interface TaskVerificationState {
+  requiredMode: CompletionVerificationMode;
+  satisfied: boolean;
+  verification: CompletionVerification | null;
+  satisfiedAt: Timestamp | null;
+}
+
 export interface ReviewState {
   round: number;
   verdicts: ReviewVerdict[];
   status: "collecting" | "consensus" | "escalated";
 }
 
-export interface DependencyWaitState {
+export interface WaitState {
   dependencyId: DependencyId;
   returnPhase: Phase;
   returnCondition: Condition;
-}
-
-export interface SiblingTurnWaitState {
-  kind: "sibling_turn";
-  parentId: TaskId;
-}
-
-export type WaitState = DependencyWaitState | SiblingTurnWaitState;
-
-export function isSiblingTurnWait(ws: WaitState): ws is SiblingTurnWaitState {
-  return "kind" in ws && ws.kind === "sibling_turn";
-}
-
-export function isDependencyWait(ws: WaitState): ws is DependencyWaitState {
-  return "dependencyId" in ws;
-}
-
-// ---------------------------------------------------------------------------
-// Sequential coordination
-// ---------------------------------------------------------------------------
-
-export interface SequentialCoordination {
-  mode: "legacy_parallel" | "sequential_children";
-  reviewBetweenChildren: boolean;
-  childOrder: TaskId[];
-  nextChildIndex: number;
-  activeChildId: TaskId | null;
-  lastCompletedChildId: TaskId | null;
 }
 
 export interface Task {
@@ -194,13 +315,10 @@ export interface Task {
 
   waitState: WaitState | null;
 
-  coordination: SequentialCoordination | null;
-
-  lastCompletionVerification: CompletionVerification | null;
-
   createdAt: Timestamp;
   updatedAt: Timestamp;
   metadata: Record<string, unknown>;
+  verification: TaskVerificationState;
 }
 
 export interface AgentContext {
@@ -237,6 +355,7 @@ export interface TaskCreated extends BaseEvent {
   skipAnalysis: boolean;
   metadata: Record<string, unknown>;
   source: EventSource;
+  completionVerificationMode?: CompletionVerificationMode;
 }
 
 export interface LeaseGranted extends BaseEvent {
@@ -248,7 +367,6 @@ export interface LeaseGranted extends BaseEvent {
   sessionId: SessionId;
   sessionType: "fresh" | "continued";
   contextBudget: number;
-  agentContext: AgentContext;
 }
 
 export interface LeaseExpired extends BaseEvent {
@@ -258,23 +376,6 @@ export interface LeaseExpired extends BaseEvent {
   source: EventSource;
 }
 
-export interface LeaseReleased extends BaseEvent {
-  type: "LeaseReleased";
-  fenceToken: number;
-  reason: string;
-  phase: Phase;
-  workPerformed: boolean;
-  source: EventSource;
-}
-
-export interface LeaseExtended extends BaseEvent {
-  type: "LeaseExtended";
-  fenceToken: number;
-  leaseTimeout: Duration;
-  source: EventSource;
-}
-
-/** @deprecated Legacy event — now a no-op. LeaseGranted includes agentContext directly. */
 export interface AgentStarted extends BaseEvent {
   type: "AgentStarted";
   fenceToken: number;
@@ -289,13 +390,6 @@ export interface AgentExited extends BaseEvent {
   agentContext: AgentContext;
 }
 
-export interface CostReported extends BaseEvent {
-  type: "CostReported";
-  fenceToken: number;
-  reportedCost: number;
-  source: EventSource;
-}
-
 export type PhaseTransitionReason =
   | "decision_execute"
   | "decision_decompose"
@@ -308,8 +402,7 @@ export type PhaseTransitionReason =
   | "add_children"
   | "children_all_failed"
   | "children_created"
-  | "children_complete"
-  | "child_review_due";
+  | "children_complete";
 
 export interface PhaseTransition extends BaseEvent {
   type: "PhaseTransition";
@@ -372,6 +465,7 @@ export interface DecompositionChildSpec {
   attemptBudgets?: AttemptBudgetMaxInput;
   reviewConfig?: ReviewConfig | null;
   metadata?: Record<string, unknown>;
+  completionVerificationMode?: CompletionVerificationMode;
 }
 
 export interface DecompositionCreated extends BaseEvent {
@@ -381,32 +475,6 @@ export interface DecompositionCreated extends BaseEvent {
   children: DecompositionChildSpec[];
   checkpoints: TaskId[];
   completionRule: "and";
-  agentContext: AgentContext;
-  coordinationMode?: { mode: "sequential_children"; reviewBetweenChildren: boolean } | null;
-}
-
-export interface ChildActivated extends BaseEvent {
-  type: "ChildActivated";
-  parentId: TaskId;
-  index: number;
-  source: EventSource;
-}
-
-// ---------------------------------------------------------------------------
-// Child review decisions (Phase 3: parent mediation)
-// ---------------------------------------------------------------------------
-
-export type ChildReviewDecision =
-  | "continue_next_child"
-  | "redecompose_remaining"
-  | "stop_children";
-
-export interface ChildReviewDecisionSubmitted extends BaseEvent {
-  type: "ChildReviewDecisionSubmitted";
-  childId: TaskId;
-  decision: ChildReviewDecision;
-  fenceToken: number;
-  notes: string;
   agentContext: AgentContext;
 }
 
@@ -458,43 +526,15 @@ export interface ReviewPolicyMet extends BaseEvent {
   source: EventSource;
 }
 
-// ---------------------------------------------------------------------------
-// Completion verification
-// ---------------------------------------------------------------------------
-
-export type ArtifactKind = "journal" | "code" | "pr";
-
-export interface ArtifactEvidence {
-  kind: ArtifactKind;
-  repo?: string;
-  branch?: string;
-  baseRef?: string | null;
-  headRef?: string | null;
-  aheadCount?: number | null;
-  changedFiles?: string[];
-  prUrl?: string | null;
-}
-
-export interface CompletionVerification {
-  passed: boolean;
-  reason: string;
-  checkedAt: string;
-  evidence: ArtifactEvidence[];
-}
-
-export interface CompletionVerificationRecorded extends BaseEvent {
-  type: "CompletionVerificationRecorded";
-  verification: CompletionVerification;
-}
-
 export interface TaskCompleted extends BaseEvent {
   type: "TaskCompleted";
   stateRef: StateRef;
+  verification: CompletionVerification;
 }
 
 export interface TaskFailed extends BaseEvent {
   type: "TaskFailed";
-  reason: "budget_exhausted" | "cost_exhausted" | "review_rejected";
+  reason: "budget_exhausted" | "cost_exhausted";
   phase: Phase;
   summary: FailureSummary;
 }
@@ -556,11 +596,8 @@ export type Event =
   | TaskCreated
   | LeaseGranted
   | LeaseExpired
-  | LeaseReleased
-  | LeaseExtended
   | AgentStarted
   | AgentExited
-  | CostReported
   | PhaseTransition
   | WaitRequested
   | WaitResolved
@@ -568,15 +605,12 @@ export type Event =
   | RetryScheduled
   | BackoffExpired
   | DecompositionCreated
-  | ChildActivated
-  | ChildReviewDecisionSubmitted
   | ChildCostRecovered
   | CheckpointTriggered
   | CheckpointCreated
   | StateReverted
   | ReviewVerdictSubmitted
   | ReviewPolicyMet
-  | CompletionVerificationRecorded
   | TaskCompleted
   | TaskFailed
   | TaskExhausted

@@ -18,58 +18,26 @@ export function createWorktree(
 ): string {
   ensureDir(path.dirname(worktreePath));
 
-  // For git-crypt repos, we must use --no-checkout first, then symlink the
-  // crypt keys, then checkout — otherwise the smudge filter fails because
-  // the worktree doesn't have the keys yet.
-  const useGitCrypt = fs.existsSync(path.join(repoPath, ".git", "git-crypt"));
-  const noCheckout = useGitCrypt ? "--no-checkout" : null;
-
-  const addArgs = (withNewBranch: boolean): string[] => {
-    const args = ["worktree", "add"];
-    if (noCheckout) args.push(noCheckout);
-    args.push(worktreePath);
-    if (withNewBranch && startPoint) {
-      args.push("-b", branch, startPoint);
-    } else {
-      args.push(branch);
-    }
-    return args;
-  };
-
-  const tryAdd = (): void => {
-    try {
-      git(repoPath, addArgs(!!startPoint));
-    } catch (err) {
-      const msg = String(err);
-      // Branch may already exist — retry without -b
-      if (startPoint && msg.includes("already exists")) {
-        git(repoPath, addArgs(false));
-      } else {
-        throw err;
-      }
-    }
-  };
+  const args = ["worktree", "add", worktreePath, branch];
+  if (startPoint) {
+    // Create new branch from startPoint: git worktree add <path> -b <branch> <startPoint>
+    args.length = 0;
+    args.push("worktree", "add", worktreePath, "-b", branch, startPoint);
+  }
 
   try {
-    tryAdd();
+    git(repoPath, args);
   } catch (err) {
-    // "already registered worktree" — prune stale refs and retry
-    if (String(err).includes("already registered")) {
-      git(repoPath, ["worktree", "prune"]);
-      tryAdd();
+    // Branch may already exist — try without -b
+    if (startPoint && String(err).includes("already exists")) {
+      git(repoPath, ["worktree", "add", worktreePath, branch]);
     } else {
       throw err;
     }
   }
 
-  if (useGitCrypt) {
-    // Symlink git-crypt keys before checkout
-    applyGitCryptSymlink(repoPath, worktreePath);
-    // Now checkout with the keys in place
-    git(worktreePath, ["checkout", branch, "--"]);
-  } else {
-    applyGitCryptSymlink(repoPath, worktreePath);
-  }
+  // Apply git-crypt symlink if the main repo uses it
+  applyGitCryptSymlink(repoPath, worktreePath);
 
   return worktreePath;
 }
@@ -160,13 +128,8 @@ export function applyGitCryptSymlink(
 
 /**
  * On daemon startup, remove any leftover worktrees from previous crashes.
- * Also prunes stale worktree references from the given repos so that
- * subsequent `git worktree add` calls don't fail with "already registered".
  */
-export function cleanupStaleWorktrees(
-  baseDir: string,
-  repoPaths?: string[],
-): number {
+export function cleanupStaleWorktrees(baseDir: string): number {
   if (!fs.existsSync(baseDir)) return 0;
 
   let cleaned = 0;
@@ -185,18 +148,9 @@ export function cleanupStaleWorktrees(
     }
   }
 
-  // Prune stale worktree references from repos that had worktrees here
-  if (repoPaths) {
-    for (const repo of repoPaths) {
-      try {
-        if (fs.existsSync(repo)) {
-          git(repo, ["worktree", "prune"]);
-        }
-      } catch {
-        // Best effort
-      }
-    }
-  }
+  // Prune worktree references from repos that had worktrees here.
+  // We can't know which repos they belonged to, but the repos will
+  // auto-prune stale entries on next `git worktree list`.
 
   return cleaned;
 }

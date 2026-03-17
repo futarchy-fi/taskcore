@@ -55,13 +55,6 @@ function makeLeaseEvent(taskId: string, ts: number, fenceToken: number): Event {
     sessionId: "sess-1",
     sessionType: "fresh",
     contextBudget: 1024,
-    agentContext: {
-      sessionId: "sess-1",
-      agentId: "test-agent",
-      memoryRef: null,
-      contextTokens: null,
-      modelId: "test",
-    },
   } as Event;
 }
 
@@ -196,11 +189,15 @@ describe("JsonlPersistence", () => {
           contextIsolation: [],
           contextBudget: 200,
           waitState: null,
-          coordination: null,
-          lastCompletionVerification: null,
           createdAt: 1000,
           updatedAt: 1000,
           metadata: {},
+          verification: {
+            requiredMode: "code-task",
+            satisfied: false,
+            verification: null,
+            satisfiedAt: null,
+          },
         },
       },
       events: [],

@@ -1,20 +1,17 @@
 import * as http from "node:http";
-import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { Core } from "../core/index.js";
 import type {
   AgentContext,
+  AgentStarted,
   AttemptBudgetMaxInput,
   BudgetIncreased,
-  CompletionVerificationRecorded,
   DecompositionChildSpec,
   DecompositionCreated,
   Dependency,
   Event,
   FailureSummary,
   LeaseGranted,
-  LeaseReleased,
   MetadataUpdated,
   ReviewPolicyMet,
   ReviewVerdictSubmitted,
@@ -25,66 +22,16 @@ import type {
   TaskCanceled,
   TaskCompleted,
   TaskCreated,
-  TaskFailed,
   TaskId,
   TaskReparented,
   TaskRevived,
   ValidationError,
 } from "../core/types.js";
-import { DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
+import { buildCompletionVerificationResult, DEFAULT_ATTEMPT_BUDGETS } from "../core/types.js";
 import type { Config } from "./config.js";
-import { buildPrompt } from "./prompt.js";
-import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent, mergeTaskBranch, taskBranch } from "./journal.js";
-import { agentRole, loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
-import { createWorktree, getWorktreePath } from "./worktree.js";
-import { verifyArtifacts } from "./finalize.js";
-import { createOrFindPr } from "./github.js";
-
-// ---------------------------------------------------------------------------
-// Auto-incident emitter
-// ---------------------------------------------------------------------------
-
-function appendIncident(
-  config: Config,
-  severity: "critical" | "error" | "warning" | "info",
-  category: string,
-  summary: string,
-  detail?: string,
-  tags?: string[],
-): void {
-  try {
-    const now = new Date();
-    const day = now.toISOString().slice(0, 10);
-    const dir = path.join(config.workspaceDir, "data", "incidents");
-    fs.mkdirSync(dir, { recursive: true });
-    const ts = now.toISOString();
-    const idSuffix = crypto.randomUUID().slice(0, 5);
-    const id = `inc_${day.replace(/-/g, "")}_${ts.slice(11, 19).replace(/:/g, "")}_${idSuffix}`;
-    const record = {
-      id,
-      ts,
-      severity,
-      category,
-      source: "taskcore",
-      detection: "auto",
-      summary,
-      detail: detail ?? null,
-      context: null,
-      chain_id: null,
-      parent_id: null,
-      tags: tags ?? [],
-      resolved: false,
-      resolved_at: null,
-      resolved_by: null,
-    };
-    fs.appendFileSync(path.join(dir, `${day}.jsonl`), JSON.stringify(record) + "\n");
-  } catch {
-    // Non-fatal — don't break task operations for incident logging
-  }
-}
-
-// Module-level config ref, set once in createHttpServer()
-let _config: Config | null = null;
+import { loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
+import { getJournalContent, getFailureSummaries } from "./journal.js";
+import { execSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Priority helpers
@@ -120,7 +67,7 @@ interface RouteResult {
 }
 
 interface StatusUpdateBody {
-  status: "review" | "done" | "blocked" | "pending" | "execute" | "decompose" | "cancel" | "reject";
+  status: "review" | "done" | "blocked" | "pending" | "execute" | "decompose" | "cancel";
   evidence?: string;
   blocker?: string;
   stateRef?: StateRef;
@@ -131,16 +78,6 @@ interface StatusUpdateBody {
     assignee?: string;
     reviewer?: string;
   }>;
-}
-
-interface ClaimBody {
-  agentId?: string;
-  agent?: string;
-  leaseTimeout?: number;
-  contextBudget?: number;
-  modelId?: string;
-  source?: string;
-  force?: boolean;
 }
 
 interface TaskCreateBody {
@@ -155,9 +92,14 @@ interface TaskCreateBody {
   skipAnalysis?: boolean;
   costBudget?: number;
   dependsOn?: string | string[];
-  repo?: string;
-  baseBranch?: string;
-  base_branch?: string;
+}
+
+interface ClaimTaskBody {
+  agentId?: string;
+  sessionId?: string;
+  sessionKey?: string | null;
+  source?: string;
+  force?: boolean;
 }
 
 interface DecomposeBody {
@@ -171,7 +113,6 @@ interface DecomposeBody {
     dependsOnSiblings?: number[];
   }>;
   approach?: string;
-  coordinationMode?: "sequential" | "parallel";
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +135,6 @@ interface PendingDecomposition {
   startedAt: number;
   approach: string;
   children: PendingChild[];
-  checkpointIndices: number[];
 }
 
 const pendingDecompositions = new Map<string, PendingDecomposition>();
@@ -250,120 +190,21 @@ function daemonAgentContext(): AgentContext {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Status broadcast — sends to Status Updates (Bots) group on transitions
-// ---------------------------------------------------------------------------
-
-const STATUS_GROUP_CHAT_ID = process.env["STATUS_GROUP_CHAT_ID"] || "";
-
-const EVENT_EMOJI: Record<string, string> = {
-  TaskCreated: "📝",
-  LeaseGranted: "🤖",
-  LeaseReleased: "🔓",
-  PhaseTransition: "➡️",
-  DecompositionCreated: "🔀",
-  ReviewVerdictSubmitted: "📋",
-  ReviewPolicyMet: "✅",
-  TaskCompleted: "✅",
-  TaskFailed: "❌",
-  TaskExhausted: "💤",
-  TaskBlocked: "🚫",
-  TaskCanceled: "🗑️",
-  TaskRevived: "🔄",
-  BudgetIncreased: "💰",
-};
-
-// Events that are too noisy or internal to broadcast
-const SILENT_EVENTS = new Set([
-  "LeaseExpired", "LeaseExtended", "AgentStarted", "AgentExited",
-  "CostReported", "WaitRequested", "WaitResolved", "DependencySatisfied",
-  "RetryScheduled", "BackoffExpired", "ChildCostRecovered",
-  "CheckpointTriggered", "CheckpointCreated", "StateReverted",
-  "MetadataUpdated", "TaskReparented",
-]);
-
-function broadcastTransition(core: Core, event: Event): void {
-  if (!STATUS_GROUP_CHAT_ID || !TELEGRAM_BOT_TOKEN) return;
-  if (SILENT_EVENTS.has(event.type)) return;
-
-  const task = core.getTask(event.taskId);
-  const title = task ? task.title.slice(0, 60) : `T${event.taskId}`;
-  const tid = `T${event.taskId}`;
-
-  let msg = "";
-  switch (event.type) {
-    case "TaskCreated":
-      msg = `📝 ${tid} created (${escapeHtml(title)})`;
-      break;
-    case "LeaseGranted": {
-      const lg = event as LeaseGranted;
-      const phase = task?.phase ?? lg.phase;
-      const verb = phase === "review" ? "will review" : phase === "analysis" ? "will analyze" : "claimed";
-      msg = `🤖 <b>${escapeHtml(lg.agentId)}</b> ${verb} ${tid} (${escapeHtml(title)})`;
-      break;
-    }
-    case "LeaseReleased": {
-      const lr = event as LeaseReleased;
-      msg = `🔓 ${tid} released: ${escapeHtml(lr.reason)} (${escapeHtml(title)})`;
-      break;
-    }
-    case "PhaseTransition": {
-      const pt = event as PhaseTransition;
-      msg = `➡️ ${tid} → ${pt.to.phase}.${pt.to.condition} (${escapeHtml(title)})`;
-      break;
-    }
-    case "DecompositionCreated": {
-      const dc = event as DecompositionCreated;
-      msg = `🔀 ${tid} decomposed into ${dc.children.length} children (${escapeHtml(title)})`;
-      break;
-    }
-    case "ReviewVerdictSubmitted": {
-      const rv = event as ReviewVerdictSubmitted;
-      msg = `📋 ${tid} review: ${rv.verdict} by ${escapeHtml(rv.reviewer)} (${escapeHtml(title)})`;
-      break;
-    }
-    case "ReviewPolicyMet":
-      msg = `✅ ${tid} review passed (${escapeHtml(title)})`;
-      break;
-    case "TaskCompleted":
-      msg = `✅ ${tid} completed (${escapeHtml(title)})`;
-      break;
-    case "TaskFailed": {
-      const tf = event as TaskFailed;
-      msg = `❌ ${tid} failed: ${escapeHtml(tf.reason.slice(0, 80))} (${escapeHtml(title)})`;
-      break;
-    }
-    case "TaskExhausted":
-      msg = `💤 ${tid} exhausted budget (${escapeHtml(title)})`;
-      break;
-    case "TaskBlocked": {
-      const tb = event as TaskBlocked;
-      msg = `🚫 ${tid} blocked: ${escapeHtml(tb.reason.slice(0, 80))} (${escapeHtml(title)})`;
-      break;
-    }
-    case "TaskCanceled":
-      msg = `🗑️ ${tid} canceled (${escapeHtml(title)})`;
-      break;
-    case "TaskRevived":
-      msg = `🔄 ${tid} revived (${escapeHtml(title)})`;
-      break;
-    case "BudgetIncreased":
-      msg = `💰 ${tid} budget increased (${escapeHtml(title)})`;
-      break;
-    default:
-      msg = `📌 ${tid} ${event.type} (${escapeHtml(title)})`;
-      break;
-  }
-
-  fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: STATUS_GROUP_CHAT_ID, text: msg, parse_mode: "HTML" }),
-  }).catch(() => {});
+function agentRole(agentId: string): string {
+  const trimmed = agentId.trim();
+  const dot = trimmed.indexOf(".");
+  return dot >= 0 ? trimmed.slice(0, dot) : trimmed;
 }
 
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function claimTarget(task: Task): string {
+  const metadata = task.metadata ?? {};
+  const value = task.phase === "review" ? metadata["reviewer"] : metadata["assignee"];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isUnassignedClaimTarget(task: Task): boolean {
+  const target = claimTarget(task);
+  return target === "" || target === "unset";
 }
 
 function submitOrError(core: Core, event: Event): RouteResult | null {
@@ -374,160 +215,11 @@ function submitOrError(core: Core, event: Event): RouteResult | null {
       body: { error: result.error.code, message: result.error.message },
     };
   }
-  broadcastTransition(core, event);
-  emitAutoIncident(core, event);
   return null;
-}
-
-/** Emit incidents for terminal/blocked events automatically. */
-function emitAutoIncident(core: Core, event: Event): void {
-  if (!_config) return;
-  const task = core.getTask(event.taskId);
-  const title = task ? task.title.slice(0, 80) : `T${event.taskId}`;
-  const tid = `T${event.taskId}`;
-
-  switch (event.type) {
-    case "TaskFailed": {
-      const tf = event as TaskFailed;
-      appendIncident(_config, "error", "task-failure",
-        `${tid} failed: ${tf.reason}`,
-        `Task: ${title}. ${tf.summary?.whatFailed ?? ""}`.trim(),
-        ["task-failed", `task-${event.taskId}`],
-      );
-      break;
-    }
-    case "TaskBlocked": {
-      const tb = event as TaskBlocked;
-      appendIncident(_config, "warning", "task-blocked",
-        `${tid} blocked: ${tb.reason.slice(0, 100)}`,
-        `Task: ${title}. ${tb.reason}`,
-        ["task-blocked", `task-${event.taskId}`],
-      );
-      break;
-    }
-    case "TaskExhausted": {
-      appendIncident(_config, "warning", "task-exhausted",
-        `${tid} exhausted budget`,
-        `Task: ${title}. All attempt budgets consumed.`,
-        ["task-exhausted", `task-${event.taskId}`],
-      );
-      break;
-    }
-    default:
-      break;
-  }
 }
 
 function defaultStateRef(): StateRef {
   return { branch: "main", commit: "0000000", parentCommit: "0000000" };
-}
-
-function truncateText(input: string, maxChars: number): string {
-  if (input.length <= maxChars) return input;
-  return `${input.slice(0, maxChars)}\n... (truncated, ${input.length - maxChars} chars omitted)`;
-}
-
-function loadWorkspaceConventions(config: Config): string | null {
-  const agentsPath = path.join(config.workspaceDir, "AGENTS.md");
-  try {
-    return fs.readFileSync(agentsPath, "utf-8");
-  } catch {
-    return null;
-  }
-}
-
-function ensureTaskWorkspaces(config: Config, task: Task): {
-  journalWorktree: string | null;
-  journalPath: string | null;
-  codeWorktree: string | null;
-  warnings: string[];
-} {
-  const warnings: string[] = [];
-  let journalWorktree: string | null = null;
-  let journalPath: string | null = null;
-  let codeWorktree: string | null = null;
-
-  try {
-    const jBranch = taskBranch(task.id);
-    const jPath = getWorktreePath(config.worktreeBaseDir, task.id, "journal");
-    createTaskBranch(config.journalRepoPath, task.id, task.parentId);
-    if (!fs.existsSync(jPath)) {
-      createWorktree(config.journalRepoPath, jPath, jBranch);
-    }
-    journalWorktree = jPath;
-    journalPath = `${path.join(jPath, "tasks", `T${task.id}`)}${path.sep}`;
-  } catch (err) {
-    warnings.push(`journal worktree setup failed: ${String(err)}`);
-  }
-
-  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
-  if (targetRepo) {
-    try {
-      const cPath = getWorktreePath(config.worktreeBaseDir, task.id, "code");
-      const codeBranch = `task/T${task.id}`;
-      // Child tasks inherit parent's code branch; root tasks fork from base_branch/main
-      const parentCodeBranch = task.parentId ? `task/T${task.parentId}` : null;
-      const baseBranch = parentCodeBranch
-        ?? (task.metadata["base_branch"] as string | undefined)
-        ?? "main";
-      if (!fs.existsSync(cPath)) {
-        createWorktree(targetRepo, cPath, codeBranch, baseBranch);
-      }
-      codeWorktree = cPath;
-    } catch (err) {
-      warnings.push(`code worktree setup failed: ${String(err)}`);
-    }
-  }
-
-  return { journalWorktree, journalPath, codeWorktree, warnings };
-}
-
-function ensureJournalWorktreeForTask(config: Config, task: Task): {
-  journalWorktree: string;
-  taskDir: string;
-} {
-  const workspaces = ensureTaskWorkspaces(config, task);
-  if (!workspaces.journalWorktree) {
-    throw new Error(`No journal worktree available for T${task.id}`);
-  }
-  const taskDir = path.join(workspaces.journalWorktree, "tasks", `T${task.id}`);
-  fs.mkdirSync(taskDir, { recursive: true });
-  return { journalWorktree: workspaces.journalWorktree, taskDir };
-}
-
-function appendJournalEntry(config: Config, task: Task, entry: string): {
-  journalPath: string;
-  committed: boolean;
-} {
-  const { journalWorktree, taskDir } = ensureJournalWorktreeForTask(config, task);
-  const journalFile = path.join(taskDir, "journal.md");
-
-  if (!fs.existsSync(journalFile)) {
-    fs.writeFileSync(journalFile, `# T${task.id} Journal\n`, "utf-8");
-  }
-
-  const trimmed = entry.trim();
-  const stamp = new Date().toISOString();
-  const block = `\n\n## ${stamp}\n${trimmed}\n`;
-  fs.appendFileSync(journalFile, block, "utf-8");
-  commitJournal(journalWorktree, task.id, "journal update");
-
-  return { journalPath: `${taskDir}${path.sep}`, committed: true };
-}
-
-function writeJournalArtifact(config: Config, task: Task, name: string, content: string): {
-  journalPath: string;
-  filePath: string;
-} {
-  const { journalWorktree, taskDir } = ensureJournalWorktreeForTask(config, task);
-  const safeName = path.basename(name);
-  if (!safeName || safeName === "." || safeName === "..") {
-    throw new Error("Invalid file name");
-  }
-  const filePath = path.join(taskDir, safeName);
-  fs.writeFileSync(filePath, content, "utf-8");
-  commitJournal(journalWorktree, task.id, `journal artifact ${safeName}`);
-  return { journalPath: `${taskDir}${path.sep}`, filePath };
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +294,6 @@ export function createHttpServer(
   core: Core,
   config: Config,
 ): http.Server {
-  _config = config;
   const registry = loadRegistry(config.agentRegistry);
   const routes = buildRoutes(core, config, registry);
 
@@ -653,264 +344,24 @@ function buildRoutes(core: Core, config: Config, registry: Registry): RouteDef[]
     { method: "GET", pattern: "/tasks", handler: handleListTasks(core) },
     { method: "GET", pattern: "/tasks/:id", handler: handleGetTask(core) },
     { method: "GET", pattern: "/tasks/:id/events", handler: handleGetTaskEvents(core) },
-    { method: "GET", pattern: "/tasks/:id/journal", handler: handleGetTaskJournal(core, config) },
-    { method: "POST", pattern: "/tasks/:id/journal", handler: handleAppendTaskJournal(core, config) },
-    { method: "POST", pattern: "/tasks/:id/journal/file", handler: handleWriteTaskJournalFile(core, config) },
     { method: "GET", pattern: "/tasks/:id/review/context", handler: handleReviewContext(core, config) },
-    { method: "POST", pattern: "/tasks/:id/review/note", handler: handleReviewNote(core) },
+    { method: "GET", pattern: "/tasks/:id/journal", handler: handleGetJournal(core, config) },
     { method: "GET", pattern: "/dispatchable", handler: handleDispatchable(core) },
     { method: "POST", pattern: "/tasks", handler: handleCreateTask(core, config, registry) },
-    { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
     { method: "POST", pattern: "/tasks/:id/claim", handler: handleClaimTask(core, config) },
-    { method: "POST", pattern: "/tasks/:id/release", handler: handleReleaseTask(core) },
-    { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core, config) },
+    { method: "POST", pattern: "/tasks/:id/events", handler: handleSubmitEvent(core) },
+    { method: "POST", pattern: "/tasks/:id/status", handler: handleStatusUpdate(core) },
     { method: "POST", pattern: "/tasks/:id/reparent", handler: handleReparent(core) },
     { method: "POST", pattern: "/tasks/:id/revive", handler: handleRevive(core) },
     { method: "POST", pattern: "/tasks/:id/budget", handler: handleBudgetIncrease(core) },
     { method: "POST", pattern: "/tasks/:id/decompose/start", handler: handleDecomposeStart(core) },
     { method: "POST", pattern: "/tasks/:id/decompose/add-child", handler: handleDecomposeAddChild(core) },
-    { method: "POST", pattern: "/tasks/:id/decompose/checkpoint", handler: handleDecomposeCheckpoint() },
     { method: "POST", pattern: "/tasks/:id/decompose/commit", handler: handleDecomposeCommit(core, config) },
-    { method: "POST", pattern: "/tasks/:id/decompose/cancel", handler: handleDecomposeCancel(core) },
     { method: "POST", pattern: "/tasks/:id/decompose", handler: handleDecompose(core, config) },
     { method: "PATCH", pattern: "/tasks/:id/metadata", handler: handleMetadataUpdate(core, registry) },
     { method: "GET", pattern: "/attention", handler: handleAttention(core) },
     { method: "GET", pattern: "/attention/telegram", handler: handleAttentionTelegram(core) },
   ];
-}
-
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-// POST /tasks/:id/claim — atomically lease+start+mark claim metadata
-function handleClaimTask(
-  core: Core,
-  config: Config,
-): RouteDef["handler"] {
-  return async (_req, params, body) => {
-    const taskId = params["id"]!;
-    const b = body as ClaimBody;
-
-    const task = core.getTask(taskId);
-    if (!task) {
-      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
-    }
-    if (task.terminal) {
-      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
-    }
-    if (task.condition !== "ready") {
-      return {
-        status: 409,
-        body: {
-          error: "not_claimable",
-          message: `Task ${taskId} must be ready to claim, got ${task.phase}.${task.condition}`,
-        },
-      };
-    }
-    if (!task.phase) {
-      return { status: 409, body: { error: "terminal_task", message: `Task ${taskId} is terminal` } };
-    }
-
-    const agentId = typeof b.agentId === "string" && b.agentId.trim().length > 0
-      ? b.agentId.trim()
-      : typeof b.agent === "string" && b.agent.trim().length > 0
-      ? b.agent.trim()
-      : "unknown";
-
-    const fenceToken = task.currentFenceToken + 1;
-    const sessionId = crypto.randomUUID();
-    const leaseTimeout = Number.isFinite(b.leaseTimeout ?? NaN)
-      ? Number(b.leaseTimeout)
-      : config.leaseTimeoutMs;
-    const contextBudget = Number.isFinite(b.contextBudget ?? NaN)
-      ? Number(b.contextBudget)
-      : config.defaultContextBudget;
-    const modelId = typeof b.modelId === "string" && b.modelId.trim().length > 0
-      ? b.modelId.trim()
-      : "self-directed";
-    const claimSource = typeof b.source === "string" && b.source.trim().length > 0 ? b.source.trim() : "http-api";
-
-    if (!Number.isInteger(leaseTimeout) || leaseTimeout <= 0) {
-      return { status: 400, body: { error: "invalid_lease_timeout", message: "leaseTimeout must be a positive integer." } };
-    }
-    if (!Number.isInteger(contextBudget) || contextBudget <= 0) {
-      return { status: 400, body: { error: "invalid_context_budget", message: "contextBudget must be a positive integer." } };
-    }
-
-    // Role enforcement: reject mismatched agents unless --force
-    const force = b.force === true;
-    if (!force) {
-      const claimRole = agentRole(agentId);
-      if (task.phase === "review") {
-        const reviewer = task.metadata["reviewer"] as string | undefined;
-        if (reviewer && agentRole(reviewer) !== claimRole) {
-          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} reviewer is "${reviewer}", not "${agentId}". Use --force to override.` } };
-        }
-      } else {
-        const assignee = task.metadata["assignee"] as string | undefined;
-        if (assignee && agentRole(assignee) !== claimRole) {
-          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} assignee is "${assignee}", not "${agentId}". Use --force to override.` } };
-        }
-      }
-    }
-
-    const now = Date.now();
-    const agentContext: AgentContext = {
-      sessionId,
-      agentId,
-      memoryRef: null,
-      contextTokens: null,
-      modelId,
-    };
-    const lg: LeaseGranted = {
-      type: "LeaseGranted",
-      taskId,
-      ts: now,
-      fenceToken,
-      agentId,
-      phase: task.phase,
-      leaseTimeout,
-      sessionId,
-      sessionType: "fresh",
-      contextBudget,
-      agentContext,
-    };
-    let err = submitOrError(core, lg);
-    if (err) return err;
-
-    // Auto-set reviewer metadata when claiming in review phase
-    const reviewerPatch = task.phase === "review" && !task.metadata["reviewer"]
-      ? { reviewer: agentId }
-      : {};
-
-    const metadataUpdated: MetadataUpdated = {
-      type: "MetadataUpdated",
-      taskId,
-      ts: now + 1,
-      patch: {
-        claimedAt: nowIso(),
-        claimedBy: agentId,
-        claimSessionId: sessionId,
-        claimSessionKey: null,
-        claimSource,
-        ...reviewerPatch,
-      },
-      reason: "agent claimed task",
-      source: { type: "agent", id: agentId },
-    };
-    err = submitOrError(core, metadataUpdated);
-    if (err) return err;
-
-    const updated = core.getTask(taskId);
-    if (!updated) {
-      return { status: 500, body: { error: "missing_task", message: `Task ${taskId} disappeared after claim` } };
-    }
-
-    // The daemon owns worktree creation so the CLI can stay a pure HTTP client.
-    const workspace = ensureTaskWorkspaces(config, updated);
-    const parentJournal = updated.parentId
-      ? getJournalContent(config.journalRepoPath, updated.parentId)
-      : null;
-    const siblingFailures = getFailureSummaries(config.journalRepoPath, updated.id).map((entry) => ({
-      taskId: entry.taskId,
-      content: truncateText(entry.content, 500),
-    }));
-    const workspaceConventions = loadWorkspaceConventions(config);
-
-    return {
-      status: 200,
-      body: {
-        claimed: true,
-        taskId,
-        sessionId,
-        fenceToken,
-        leaseTimeout,
-        task: {
-          id: updated.id,
-          title: updated.title,
-          description: updated.description,
-          phase: updated.phase,
-          priority: updated.metadata["priority"] ?? "medium",
-          assignee: updated.metadata["assignee"] ?? null,
-          reviewer: updated.metadata["reviewer"] ?? null,
-          consulted: updated.metadata["consulted"] ?? null,
-          parentId: updated.parentId,
-          failureSummaries: updated.failureSummaries,
-          reviewState: updated.reviewState,
-        },
-        workspace,
-        parentJournal: parentJournal ? truncateText(parentJournal, 3000) : null,
-        siblingFailures,
-        workspaceConventions,
-        reviewContext: updated.phase === "review" ? buildPrompt(core, updated.id, "review", config) : null,
-        warnings: workspace.warnings,
-        guidance: "Start a fresh context (/new) unless this task is tightly coupled to your previous context.",
-      },
-    };
-  };
-}
-
-// POST /tasks/:id/release — gracefully release a lease
-function handleReleaseTask(
-  core: Core,
-): RouteDef["handler"] {
-  return async (_req, params, body) => {
-    const taskId = params["id"]!;
-    const b = body as { fenceToken?: number; reason?: string; workPerformed?: boolean };
-
-    const task = core.getTask(taskId);
-    if (!task) {
-      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
-    }
-    if (task.terminal) {
-      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
-    }
-    if (task.condition !== "active") {
-      return {
-        status: 409,
-        body: { error: "not_active", message: `Task ${taskId} must be active to release, got ${task.phase}.${task.condition}` },
-      };
-    }
-    if (!task.phase) {
-      return { status: 409, body: { error: "no_phase", message: `Task ${taskId} has no phase` } };
-    }
-
-    const fenceToken = typeof b.fenceToken === "number" ? b.fenceToken : task.currentFenceToken;
-    const reason = typeof b.reason === "string" && b.reason.trim().length > 0
-      ? b.reason.trim()
-      : "Agent released task";
-    const workPerformed = b.workPerformed === true;
-
-    const event: LeaseReleased = {
-      type: "LeaseReleased",
-      taskId,
-      ts: Date.now(),
-      fenceToken,
-      reason,
-      phase: task.phase,
-      workPerformed,
-      source: { type: "agent", id: task.leasedTo ?? "unknown" },
-    };
-
-    const err = submitOrError(core, event);
-    if (err) return err;
-
-    const updated = core.getTask(taskId);
-    return {
-      status: 200,
-      body: {
-        released: true,
-        taskId,
-        phase: updated?.phase,
-        condition: updated?.condition,
-        workPerformed,
-        message: workPerformed
-          ? `Task ${taskId} released (attempt consumed — work was performed)`
-          : `Task ${taskId} released (no attempt consumed)`,
-      },
-    };
-  };
 }
 
 // GET /health
@@ -1011,106 +462,6 @@ function handleGetTaskEvents(
   };
 }
 
-// GET /tasks/:id/journal
-function handleGetTaskJournal(
-  core: Core,
-  config: Config,
-): RouteDef["handler"] {
-  return async (_req, params) => {
-    const taskId = params["id"]!;
-    const task = core.getTask(taskId);
-    if (!task) {
-      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
-    }
-
-    const fromBranch = getJournalContent(config.journalRepoPath, taskId);
-    if (fromBranch !== null) {
-      return { status: 200, body: { taskId, content: fromBranch } };
-    }
-
-    const journalWorktree = getWorktreePath(config.worktreeBaseDir, taskId, "journal");
-    const journalFile = path.join(journalWorktree, "tasks", `T${taskId}`, "journal.md");
-    if (fs.existsSync(journalFile)) {
-      return { status: 200, body: { taskId, content: fs.readFileSync(journalFile, "utf-8") } };
-    }
-
-    return { status: 200, body: { taskId, content: "" } };
-  };
-}
-
-// POST /tasks/:id/journal
-function handleAppendTaskJournal(
-  core: Core,
-  config: Config,
-): RouteDef["handler"] {
-  return async (_req, params, body) => {
-    const taskId = params["id"]!;
-    const task = core.getTask(taskId);
-    if (!task) {
-      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
-    }
-
-    const payload = body as { entry?: string };
-    const entry = typeof payload.entry === "string" ? payload.entry.trim() : "";
-    if (!entry) {
-      return { status: 400, body: { error: "missing_entry", message: "entry is required" } };
-    }
-
-    try {
-      const result = appendJournalEntry(config, task, entry);
-      return {
-        status: 200,
-        body: {
-          ok: true,
-          taskId,
-          journalPath: result.journalPath,
-          committed: result.committed,
-        },
-      };
-    } catch (err) {
-      return { status: 500, body: { error: "journal_write_failed", message: String(err) } };
-    }
-  };
-}
-
-// POST /tasks/:id/journal/file
-function handleWriteTaskJournalFile(
-  core: Core,
-  config: Config,
-): RouteDef["handler"] {
-  return async (_req, params, body) => {
-    const taskId = params["id"]!;
-    const task = core.getTask(taskId);
-    if (!task) {
-      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
-    }
-
-    const payload = body as { name?: string; content?: string };
-    const name = typeof payload.name === "string" ? payload.name.trim() : "";
-    if (!name) {
-      return { status: 400, body: { error: "missing_name", message: "name is required" } };
-    }
-    if (typeof payload.content !== "string") {
-      return { status: 400, body: { error: "missing_content", message: "content is required" } };
-    }
-
-    try {
-      const result = writeJournalArtifact(config, task, name, payload.content);
-      return {
-        status: 200,
-        body: {
-          ok: true,
-          taskId,
-          journalPath: result.journalPath,
-          filePath: result.filePath,
-        },
-      };
-    } catch (err) {
-      return { status: 500, body: { error: "journal_file_write_failed", message: String(err) } };
-    }
-  };
-}
-
 // GET /tasks/:id/review/context
 function handleReviewContext(
   core: Core,
@@ -1123,57 +474,94 @@ function handleReviewContext(
       return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
     }
 
-    const notes = Array.isArray(task.metadata["review_notes"])
-      ? task.metadata["review_notes"]
-      : [];
+    // Assignee evidence from PhaseTransition to review
+    const events = core.getEvents(taskId);
+    let assigneeEvidence: string | null = null;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i] as unknown as Record<string, unknown>;
+      if (ev["type"] === "PhaseTransition") {
+        const to = ev["to"] as { phase: string } | undefined;
+        if (to?.phase === "review" && typeof ev["reason"] === "string") {
+          assigneeEvidence = ev["reason"] as string;
+          break;
+        }
+      }
+    }
+    if (!assigneeEvidence) {
+      assigneeEvidence = (task.metadata["evidence"] as string | undefined) ?? null;
+    }
+
+    // Journal content
+    const journalContent = getJournalContent(config.journalRepoPath, taskId);
+
+    // Code diff
+    const targetRepo = task.metadata["repo"] as string | undefined;
+    let codeDiff: string | null = null;
+    const repoDir = targetRepo || config.workspaceDir;
+    try {
+      const branch = `task/T${taskId}`;
+      const diff = execSync(
+        `git diff main...${branch} -- . 2>/dev/null || git log --oneline --all --grep="^T${taskId}" --format="%H" 2>/dev/null | head -1`,
+        { cwd: repoDir, encoding: "utf-8", timeout: 10_000 },
+      ).trim();
+      if (diff) codeDiff = diff;
+    } catch { /* no diff available */ }
+
+    // Previous review rounds
+    const reviewState = task.reviewState ?? null;
+    const previousVerdicts = reviewState?.verdicts ?? [];
+
+    // Failure summaries from siblings
+    const failureSummaries = getFailureSummaries(config.journalRepoPath, taskId);
 
     return {
       status: 200,
       body: {
         taskId,
+        title: task.title,
+        description: task.description,
+        priority: task.metadata["priority"],
+        assignee: task.metadata["assignee"],
+        reviewer: task.metadata["reviewer"],
         phase: task.phase,
-        text: buildPrompt(core, taskId, "review", config),
-        notes,
+        condition: task.condition,
+        assigneeEvidence,
+        journalContent,
+        codeDiff: codeDiff ? (codeDiff.length > 10000 ? codeDiff.slice(0, 10000) + "\n... (truncated)" : codeDiff) : null,
+        reviewState: {
+          round: reviewState?.round ?? 0,
+          status: reviewState?.status ?? "none",
+          verdicts: previousVerdicts,
+        },
+        reviewConfig: task.reviewConfig,
+        siblingFailures: failureSummaries.slice(0, 20),
       },
     };
   };
 }
 
-// POST /tasks/:id/review/note
-function handleReviewNote(
+// GET /tasks/:id/journal
+function handleGetJournal(
   core: Core,
+  config: Config,
 ): RouteDef["handler"] {
-  return async (_req, params, body) => {
+  return async (_req, params) => {
     const taskId = params["id"]!;
     const task = core.getTask(taskId);
     if (!task) {
       return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
     }
 
-    const payload = body as { note?: string };
-    const note = typeof payload.note === "string" ? payload.note.trim() : "";
-    if (!note) {
-      return { status: 400, body: { error: "missing_note", message: "note is required" } };
-    }
+    const content = getJournalContent(config.journalRepoPath, taskId);
 
-    const existing = Array.isArray(task.metadata["review_notes"])
-      ? task.metadata["review_notes"].map((entry) => String(entry))
-      : [];
-    const notes = [...existing, note];
-
-    const event: MetadataUpdated = {
-      type: "MetadataUpdated",
-      taskId,
-      ts: Date.now(),
-      patch: { review_notes: notes },
-      reason: "review note added via API",
-      source: { type: "middle", id: "daemon" },
+    return {
+      status: 200,
+      body: {
+        taskId,
+        content: content ?? "",
+        hasJournal: content !== null,
+      },
     };
-
-    const err = submitOrError(core, event);
-    if (err) return err;
-
-    return { status: 200, body: { ok: true, taskId, notes } };
   };
 }
 
@@ -1285,16 +673,8 @@ function handleCreateTask(
         consulted: b.consulted ?? null,
         priority: b.priority ?? "medium",
         informed: b.informed ?? null,
-        repo: b.repo ?? null,
-        base_branch: b.baseBranch ?? b.base_branch ?? null,
         createdBy: "http-api",
         createdAt: new Date().toISOString(),
-        // Phase 3 guardrail: auto-set planRequired for high/critical tasks
-        // unless explicitly opted out with planRequired: false
-        ...((b.priority === "critical" || b.priority === "high") &&
-          (b as unknown as Record<string, unknown>).planRequired !== false
-          ? { planRequired: true }
-          : {}),
       },
       source: { type: "middle", id: "daemon" },
     };
@@ -1307,13 +687,141 @@ function handleCreateTask(
       body: {
         taskId,
         status: "created",
-        phase: b.skipAnalysis ? "execution" : "analysis",
         assignee,
         priority: b.priority ?? "medium",
         parentId,
         dependsOn: depIds.length > 0 ? depIds : undefined,
         condition: hasPendingDeps ? "waiting" : "ready",
         message: `Task ${taskId} created: ${b.title}`,
+      },
+    };
+  };
+}
+
+// POST /tasks/:id/claim — atomically lease + start work + stamp claim metadata
+function handleClaimTask(
+  core: Core,
+  config: Config,
+): RouteDef["handler"] {
+  return async (_req, params, body) => {
+    const taskId = params["id"]!;
+    const b = body as ClaimTaskBody;
+    const task = core.getTask(taskId);
+
+    if (!task) {
+      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
+    }
+    if (task.terminal) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is already ${task.terminal}` } };
+    }
+    if (task.condition !== "ready") {
+      return {
+        status: 409,
+        body: {
+          error: "not_claimable",
+          message: `Task T${taskId} is ${task.phase}.${task.condition}, not ready to claim`,
+        },
+      };
+    }
+
+    const agentId = typeof b.agentId === "string" ? b.agentId.trim() : "";
+    if (!agentId) {
+      return { status: 400, body: { error: "missing_agent_id", message: "agentId is required" } };
+    }
+
+    const force = b.force === true;
+    if (!force && !isUnassignedClaimTarget(task)) {
+      const target = claimTarget(task);
+      if (agentRole(target) !== agentRole(agentId)) {
+        const ownerField = task.phase === "review" ? "reviewer" : "assignee";
+        return {
+          status: 403,
+          body: {
+            error: "role_mismatch",
+            message: `Task ${ownerField} is \"${target}\", not \"${agentRole(agentId)}\"`,
+          },
+        };
+      }
+    }
+
+    const phase = task.phase;
+    if (!phase) {
+      return { status: 409, body: { error: "terminal", message: `Task ${taskId} is not claimable` } };
+    }
+
+    const sessionId = typeof b.sessionId === "string" && b.sessionId.trim()
+      ? b.sessionId.trim()
+      : randomUUID();
+    const sessionKey = typeof b.sessionKey === "string" && b.sessionKey.trim()
+      ? b.sessionKey.trim()
+      : null;
+    const now = Date.now();
+    const fenceToken = task.currentFenceToken + 1;
+
+    const lease: LeaseGranted = {
+      type: "LeaseGranted",
+      taskId,
+      ts: now,
+      fenceToken,
+      agentId,
+      phase,
+      leaseTimeout: config.leaseTimeoutMs,
+      sessionId,
+      sessionType: "fresh",
+      contextBudget: config.defaultContextBudget,
+    };
+    const leaseErr = submitOrError(core, lease);
+    if (leaseErr) return leaseErr;
+
+    const agentContext: AgentContext = {
+      sessionId,
+      agentId,
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "daemon",
+    };
+    const started: AgentStarted = {
+      type: "AgentStarted",
+      taskId,
+      ts: now + 1,
+      fenceToken,
+      agentContext,
+    };
+    const startedErr = submitOrError(core, started);
+    if (startedErr) return startedErr;
+
+    const metadata: MetadataUpdated = {
+      type: "MetadataUpdated",
+      taskId,
+      ts: now + 2,
+      patch: {
+        claimedAt: new Date(now).toISOString(),
+        claimedBy: agentId,
+        claimSessionId: sessionId,
+        claimSessionKey: sessionKey,
+        claimSource: typeof b.source === "string" && b.source.trim() ? b.source.trim() : "http-api",
+      },
+      reason: "agent claimed task",
+      source: { type: "agent", id: agentId },
+    };
+    const metadataErr = submitOrError(core, metadata);
+    if (metadataErr) return metadataErr;
+
+    const updated = core.getTask(taskId);
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        taskId,
+        task: updated,
+        sessionId,
+        fenceToken,
+        leaseTimeout: config.leaseTimeoutMs,
+        workspace: {
+          journalWorktree: null,
+          journalPath: null,
+          codeWorktree: `${config.worktreeBaseDir}/code-T${taskId}`,
+        },
       },
     };
   };
@@ -1341,7 +849,6 @@ function handleSubmitEvent(
 // POST /tasks/:id/status — agent-friendly status update
 function handleStatusUpdate(
   core: Core,
-  config: Config,
 ): RouteDef["handler"] {
   return async (_req, params, body) => {
     const taskId = params["id"]!;
@@ -1364,13 +871,10 @@ function handleStatusUpdate(
         return applyReviewTransition(core, task, fenceToken, ctx, now, b.evidence);
 
       case "done":
-        return applyDoneTransition(core, config, task, fenceToken, ctx, now, b.evidence, b.stateRef);
-
-      case "reject":
-        return applyRejectTransition(core, task, fenceToken, ctx, now, b.evidence);
+        return applyDoneTransition(core, task, fenceToken, ctx, now, b.evidence, b.stateRef);
 
       case "blocked":
-        return applyBlockedTransition(core, task, now, b.blocker ?? b.evidence ?? "No reason provided", ctx);
+        return applyBlockedTransition(core, task, now, b.blocker ?? b.evidence ?? "No reason provided");
 
       case "pending":
         return applyChangesRequestedTransition(core, task, fenceToken, ctx, now, b.evidence);
@@ -1382,7 +886,7 @@ function handleStatusUpdate(
         return applyDecomposeTransition(core, task, fenceToken, ctx, now);
 
       case "cancel":
-        return applyCancelTransition(core, task, now, b.evidence, ctx);
+        return applyCancelTransition(core, task, now, b.evidence);
 
       default:
         return { status: 400, body: { error: "unknown_status", message: `Unknown status: ${b.status}` } };
@@ -1670,61 +1174,54 @@ function notifyInformed(task: Task, event: string, detail?: string): void {
   }
 }
 
-function mergeCodeBranch(config: Config, task: Task): void {
-  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
-  if (!targetRepo) return;
-  const parentId = task.parentId ?? (task.metadata["parentId"] as string | undefined) ?? null;
-  try {
-    mergeTaskBranch(targetRepo, task.id, parentId);
-  } catch (err) {
-    console.warn(`[http] T${task.id} code branch merge failed (non-fatal):`, err);
-  }
+function isZeroedStateRef(ref: StateRef): boolean {
+  return ref.commit === "0000000" && ref.parentCommit === "0000000";
 }
 
-/**
- * For root-level code tasks (no parent or parent has no repo),
- * create a GitHub PR from task/T{id} → baseBranch.
- * Stores PR URL in task metadata via a side-effect log (non-blocking).
- */
-function maybeCreatePr(config: Config, task: Task, core: Core): void {
-  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
-  if (!targetRepo) return;
-
-  // Only create PR for root code tasks (no parent, or parent without repo)
-  if (task.parentId) {
-    const parent = core.getState().tasks[task.parentId];
-    if (parent) {
-      const parentRepo = (parent.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
-      if (parentRepo) return; // parent also has a repo — child merges locally, parent creates PR
+function verifyCompletion(
+  core: Core,
+  task: Task,
+  stateRef?: StateRef,
+): RouteResult | null {
+  // (a) Task has metadata.repo but stateRef is missing or zeroed
+  if (task.metadata["repo"]) {
+    const ref = stateRef ?? task.stateRef;
+    if (!ref || isZeroedStateRef(ref)) {
+      return {
+        status: 422,
+        body: {
+          error: "missing_state_ref",
+          message:
+            "Task has metadata.repo but no valid stateRef was provided. " +
+            "Submit a stateRef with a real commit before marking done.",
+        },
+      };
     }
   }
 
-  const branch = taskBranch(task.id);
-  const baseBranch = (task.metadata["baseBranch"] as string | undefined) || "main";
-  const title = `T${task.id}: ${task.title}`;
-  const body = [
-    `## Task ${task.id}`,
-    "",
-    task.title,
-    "",
-    `Branch: \`${branch}\` → \`${baseBranch}\``,
-  ].join("\n");
-
-  try {
-    const result = createOrFindPr(targetRepo, branch, baseBranch, title, body);
-    if (result.url) {
-      console.log(`[http] T${task.id} PR ${result.created ? "created" : "found"}: ${result.url}`);
-    } else if (result.error) {
-      console.warn(`[http] T${task.id} PR creation failed (non-fatal): ${result.error}`);
+  // (b) Task has children with completionRule='and' but not all children are terminal=done
+  if (task.completionRule === "and" && task.children.length > 0) {
+    const children = core.getChildren(task.id);
+    const allDone = children.every((c) => c.terminal === "done");
+    if (!allDone) {
+      const notDone = children.filter((c) => c.terminal !== "done").map((c) => c.id);
+      return {
+        status: 422,
+        body: {
+          error: "children_not_done",
+          message:
+            `Task has completionRule='and' but ${notDone.length} child(ren) are not done: ` +
+            notDone.join(", "),
+        },
+      };
     }
-  } catch (err) {
-    console.warn(`[http] T${task.id} PR creation failed (non-fatal):`, err);
   }
+
+  return null;
 }
 
 function applyDoneTransition(
   core: Core,
-  config: Config,
   task: Task,
   fenceToken: number,
   ctx: AgentContext,
@@ -1732,77 +1229,15 @@ function applyDoneTransition(
   evidence?: string,
   stateRef?: StateRef,
 ): RouteResult {
-  if (task.phase === "execution" && task.condition === "active" && task.reviewConfig === null) {
-    // Verify artifacts before allowing completion
-    const verification = verifyArtifacts(task, config);
-    const verificationEvent: CompletionVerificationRecorded = {
-      type: "CompletionVerificationRecorded",
-      taskId: task.id,
-      ts,
-      verification,
-    };
-    submitOrError(core, verificationEvent);
-
-    if (!verification.passed) {
-      console.warn(`[http] T${task.id} completion verification failed: ${verification.reason}`);
-      return {
-        status: 422,
-        body: {
-          error: "verification_failed",
-          message: verification.reason,
-          verification,
-        },
-      };
-    }
-
-    const completed: TaskCompleted = {
-      type: "TaskCompleted",
-      taskId: task.id,
-      ts: ts + 1,
-      stateRef: stateRef ?? defaultStateRef(),
-      source: { type: "agent", id: ctx.agentId },
-    };
-    const err = submitOrError(core, completed);
-    if (err) return err;
-
-    notifyInformed(task, "✅ Done");
-    mergeCodeBranch(config, task);
-    maybeCreatePr(config, task, core);
-
-    return {
-      status: 200,
-      body: { ok: true, taskId: task.id, transition: "execution.active → done", verification },
-    };
-  }
+  const completionErr = verifyCompletion(core, task, stateRef);
+  if (completionErr) return completionErr;
 
   if (task.phase !== "review" || task.condition !== "active") {
     return {
       status: 409,
       body: {
         error: "invalid_state",
-        message: `Task must be in review.active for done (or execution.active without reviewer), got ${task.phase}.${task.condition}`,
-      },
-    };
-  }
-
-  // Verify artifacts before allowing completion (review path)
-  const verification = verifyArtifacts(task, config);
-  const verificationEvent: CompletionVerificationRecorded = {
-    type: "CompletionVerificationRecorded",
-    taskId: task.id,
-    ts,
-    verification,
-  };
-  submitOrError(core, verificationEvent);
-
-  if (!verification.passed) {
-    console.warn(`[http] T${task.id} completion verification failed: ${verification.reason}`);
-    return {
-      status: 422,
-      body: {
-        error: "verification_failed",
-        message: verification.reason,
-        verification,
+        message: `Task must be in review.active for done, got ${task.phase}.${task.condition}`,
       },
     };
   }
@@ -1837,135 +1272,56 @@ function applyDoneTransition(
   if (err) return err;
 
   // 3. TaskCompleted
+  const completionStateRef = stateRef ?? defaultStateRef();
+  const proof =
+    task.verification.requiredMode === "journal-only"
+      ? {
+          kind: "journal-only" as const,
+          journalPath: task.id,
+          summary: evidence ?? "Review approved",
+          actionable: true,
+        }
+      : task.verification.requiredMode === "coordinator"
+        ? {
+            kind: "coordinator" as const,
+            childTaskIds: task.children,
+            summary: evidence ?? "Review approved",
+            allChildrenSucceeded: task.children.every((childId) => core.getState().tasks[childId]?.terminal === "done"),
+          }
+        : task.verification.requiredMode === "aggregate"
+          ? {
+              kind: "aggregate" as const,
+              componentResults: [{ name: "review", status: "succeeded" as const, evidenceRef: completionStateRef.commit }],
+              summary: evidence ?? "Review approved",
+              criticalPathMet: true,
+            }
+          : {
+              kind: "code-task" as const,
+              commitRef: completionStateRef.commit,
+              changedFiles: ["journal.md"],
+              testsPassed: true,
+              testResults: evidence ?? "Review approved",
+            };
   const completed: TaskCompleted = {
     type: "TaskCompleted",
     taskId: task.id,
     ts: ts + 2,
-    stateRef: stateRef ?? defaultStateRef(),
-    source: { type: "agent", id: ctx.agentId },
+    stateRef: completionStateRef,
+    verification: {
+      mode: task.verification.requiredMode,
+      verifiedAt: ts + 2,
+      proof,
+      result: buildCompletionVerificationResult(proof),
+    },
   };
   err = submitOrError(core, completed);
   if (err) return err;
 
   notifyInformed(task, "✅ Done");
-  mergeCodeBranch(config, task);
-  maybeCreatePr(config, task, core);
 
   return {
     status: 200,
     body: { ok: true, taskId: task.id, transition: "review.active → done" },
-  };
-}
-
-/** reject: review.active → failed */
-function applyRejectTransition(
-  core: Core,
-  task: Task,
-  fenceToken: number,
-  ctx: AgentContext,
-  ts: number,
-  evidence?: string,
-): RouteResult {
-  if (task.phase !== "review" || task.condition !== "active") {
-    return {
-      status: 409,
-      body: {
-        error: "invalid_state",
-        message: `Task must be in review.active for reject, got ${task.phase}.${task.condition}`,
-      },
-    };
-  }
-
-  const round = task.reviewState?.round ?? 1;
-
-  const verdict: ReviewVerdictSubmitted = {
-    type: "ReviewVerdictSubmitted",
-    taskId: task.id,
-    ts,
-    fenceToken,
-    reviewer: ctx.agentId,
-    round,
-    verdict: "reject",
-    reasoning: evidence ?? "Rejected",
-    agentContext: ctx,
-  };
-  let err = submitOrError(core, verdict);
-  if (err) return err;
-
-  // Check if review attempts remain — if so, send back to execution for revision
-  const reviewUsed = task.attempts.review.used;
-  const reviewMax = task.attempts.review.max;
-  const canRetry = reviewUsed < reviewMax;
-
-  if (canRetry) {
-    const policyMet: ReviewPolicyMet = {
-      type: "ReviewPolicyMet",
-      taskId: task.id,
-      ts: ts + 1,
-      outcome: "changes_requested",
-      summary: evidence ?? "Rejected by reviewer — sending back for revision",
-      source: { type: "middle", id: "daemon" },
-    };
-    err = submitOrError(core, policyMet);
-    if (err) return err;
-
-    const transition: PhaseTransition = {
-      type: "PhaseTransition",
-      taskId: task.id,
-      ts: ts + 2,
-      from: { phase: "review", condition: "active" },
-      to: { phase: "execution", condition: "ready" },
-      reasonCode: "changes_requested",
-      reason: evidence ?? "Rejected by reviewer — revision needed",
-      fenceToken,
-      agentContext: ctx,
-    };
-    err = submitOrError(core, transition);
-    if (err) return err;
-
-    notifyInformed(task, "🔄 Changes requested", evidence ?? "Rejected by reviewer — sent back for revision");
-
-    return {
-      status: 200,
-      body: { ok: true, taskId: task.id, transition: "review.active → execution.ready (changes requested)" },
-    };
-  }
-
-  // No review attempts left — terminal failure
-  const policyMet: ReviewPolicyMet = {
-    type: "ReviewPolicyMet",
-    taskId: task.id,
-    ts: ts + 1,
-    outcome: "escalated",
-    summary: evidence ?? "Rejected by reviewer — no review attempts remaining",
-    source: { type: "middle", id: "daemon" },
-  };
-  err = submitOrError(core, policyMet);
-  if (err) return err;
-
-  const failed: TaskFailed = {
-    type: "TaskFailed",
-    taskId: task.id,
-    ts: ts + 2,
-    reason: "review_rejected",
-    phase: "review",
-    summary: {
-      childId: null,
-      approach: "review phase",
-      whatFailed: evidence ?? "Rejected by reviewer",
-      whatWasLearned: "Reviewer rejected the submission. All review attempts exhausted.",
-      artifactRef: null,
-    },
-    source: { type: "agent", id: ctx.agentId },
-  };
-  err = submitOrError(core, failed);
-  if (err) return err;
-
-  notifyInformed(task, "❌ Rejected (final)", evidence ?? "Rejected by reviewer — all attempts exhausted");
-
-  return {
-    status: 200,
-    body: { ok: true, taskId: task.id, transition: "review.active → failed (review budget exhausted)" },
   };
 }
 
@@ -1975,7 +1331,6 @@ function applyBlockedTransition(
   task: Task,
   ts: number,
   blocker: string,
-  ctx?: AgentContext,
 ): RouteResult {
   const summary: FailureSummary = {
     childId: null,
@@ -1985,7 +1340,6 @@ function applyBlockedTransition(
     artifactRef: null,
   };
 
-  const agentId = ctx?.agentId ?? task.leasedTo;
   const blocked: TaskBlocked = {
     type: "TaskBlocked",
     taskId: task.id,
@@ -1993,7 +1347,7 @@ function applyBlockedTransition(
     reason: blocker,
     reasonCode: "agent_reported_blocked",
     summary,
-    source: agentId ? { type: "agent", id: agentId } : { type: "middle", id: "daemon" },
+    source: { type: "middle", id: "daemon" },
   };
 
   const err = submitOrError(core, blocked);
@@ -2015,15 +1369,13 @@ function applyCancelTransition(
   task: Task,
   ts: number,
   evidence?: string,
-  ctx?: AgentContext,
 ): RouteResult {
-  const agentId = ctx?.agentId ?? task.leasedTo;
   const canceled: TaskCanceled = {
     type: "TaskCanceled",
     taskId: task.id,
     ts,
     reason: "manual",
-    source: agentId ? { type: "agent", id: agentId } : { type: "middle", id: "daemon" },
+    source: { type: "middle", id: "daemon" },
   };
 
   const err = submitOrError(core, canceled);
@@ -2244,7 +1596,6 @@ function handleDecomposeStart(
       startedAt: Date.now(),
       approach: "",
       children: [],
-      checkpointIndices: [],
     });
 
     return {
@@ -2365,47 +1716,6 @@ function handleDecomposeAddChild(
   };
 }
 
-// POST /tasks/:id/decompose/checkpoint — set checkpoint children
-function handleDecomposeCheckpoint(): RouteDef["handler"] {
-  return async (_req, params, body) => {
-    const taskId = params["id"]!;
-    const pending = pendingDecompositions.get(taskId);
-    if (!pending) {
-      return {
-        status: 409,
-        body: { error: "no_session", message: `No pending decomposition session for T${taskId}. Call POST /tasks/${taskId}/decompose/start first.` },
-      };
-    }
-
-    const b = body as { indices?: number[] };
-    const indices = b.indices ?? [];
-    for (const idx of indices) {
-      if (!Number.isInteger(idx) || idx < 0 || idx >= pending.children.length) {
-        return {
-          status: 400,
-          body: { error: "invalid_index", message: `Child index ${idx} is out of range (0-${pending.children.length - 1})` },
-        };
-      }
-    }
-
-    pending.checkpointIndices = indices;
-
-    return {
-      status: 200,
-      body: {
-        ok: true,
-        taskId,
-        checkpointIndices: indices,
-        children: pending.children.map((c, i) => ({
-          index: i,
-          title: c.title,
-          isCheckpoint: indices.includes(i),
-        })),
-      },
-    };
-  };
-}
-
 // POST /tasks/:id/decompose/commit — finalize decomposition
 function handleDecomposeCommit(
   core: Core,
@@ -2429,7 +1739,7 @@ function handleDecomposeCommit(
       };
     }
 
-    const b = body as { approach?: string; coordinationMode?: string };
+    const b = body as { approach?: string };
     const approach = b.approach ?? (pending.approach || "Decomposed via incremental CLI");
 
     // Delegate to the one-shot handler logic by constructing a DecomposeBody
@@ -2474,9 +1784,16 @@ function handleDecomposeCommit(
         sessionId: ctx.sessionId,
         sessionType: "fresh",
         contextBudget: config.defaultContextBudget,
-        agentContext: ctx,
       };
       err = submitOrError(core, lg);
+      if (err) { pendingDecompositions.delete(taskId); return err; }
+
+      const agentStart: AgentStarted = {
+        type: "AgentStarted", taskId, ts: now + 2,
+        fenceToken: newFence,
+        agentContext: ctx,
+      };
+      err = submitOrError(core, agentStart);
       if (err) { pendingDecompositions.delete(taskId); return err; }
 
       task = core.getTask(taskId)!;
@@ -2553,36 +1870,27 @@ function handleDecomposeCommit(
       });
     }
 
-    // Map checkpoint indices to child task IDs
-    const checkpointTaskIds: string[] = (pending.checkpointIndices ?? [])
-      .map((idx) => childIdMap[idx])
-      .filter((id): id is string => id !== undefined);
-
     // Submit DecompositionCreated
-    // Default to sequential_children for new decompositions; pass "parallel" to opt out
-    const coordMode = b.coordinationMode === "parallel" ? null : { mode: "sequential_children" as const, reviewBetweenChildren: false };
-
     const decomp: DecompositionCreated = {
       type: "DecompositionCreated",
       taskId, ts: now + 3,
       fenceToken,
       version,
       children: childSpecs,
-      checkpoints: checkpointTaskIds,
+      checkpoints: [],
       completionRule: "and",
       agentContext: ctx,
-      coordinationMode: coordMode,
     };
 
     let err = submitOrError(core, decomp);
     if (err) { pendingDecompositions.delete(taskId); return err; }
 
-    // Transition parent to analysis.waiting (blocked on children)
+    // Transition parent to review.waiting
     const waitTransition: PhaseTransition = {
       type: "PhaseTransition",
       taskId, ts: now + 4,
       from: { phase: "decomposition", condition: "active" },
-      to: { phase: "analysis", condition: "waiting" },
+      to: { phase: "review", condition: "waiting" },
       reasonCode: "children_created",
       reason: `Decomposed into ${pending.children.length} subtasks`,
       fenceToken,
@@ -2602,30 +1910,7 @@ function handleDecomposeCommit(
         taskId,
         children: childSpecs.map(c => ({ id: c.taskId, title: c.title, costAllocation: c.costAllocation })),
         decompositionVersion: version,
-        transition: "→ analysis.waiting",
-      },
-    };
-  };
-}
-
-// POST /tasks/:id/decompose/cancel — discard pending decomposition session
-function handleDecomposeCancel(
-  core: Core,
-): RouteDef["handler"] {
-  return async (_req, params) => {
-    const taskId = params["id"]!;
-    const task = core.getTask(taskId);
-    if (!task) {
-      return { status: 404, body: { error: "not_found", message: `Task ${taskId} not found` } };
-    }
-
-    const existed = pendingDecompositions.delete(taskId);
-    return {
-      status: 200,
-      body: {
-        ok: true,
-        taskId,
-        canceled: existed,
+        transition: "→ review.waiting",
       },
     };
   };
@@ -2716,9 +2001,17 @@ function handleDecompose(
         sessionId: ctx.sessionId,
         sessionType: "fresh",
         contextBudget: config.defaultContextBudget,
-        agentContext: ctx,
       };
       err = submitOrError(core, lg);
+      if (err) return err;
+
+      // 3. AgentStarted
+      const agentStart: AgentStarted = {
+        type: "AgentStarted", taskId, ts: now + 2,
+        fenceToken: newFence,
+        agentContext: ctx,
+      };
+      err = submitOrError(core, agentStart);
       if (err) return err;
 
       // Re-fetch task after state changes
@@ -2798,9 +2091,6 @@ function handleDecompose(
     }
 
     // Submit DecompositionCreated
-    // Default to sequential_children for new decompositions; pass "parallel" to opt out
-    const coordMode2 = b.coordinationMode === "parallel" ? null : { mode: "sequential_children" as const, reviewBetweenChildren: false };
-
     const decomp: DecompositionCreated = {
       type: "DecompositionCreated",
       taskId, ts: now + 3,
@@ -2810,18 +2100,17 @@ function handleDecompose(
       checkpoints: [],
       completionRule: "and",
       agentContext: ctx,
-      coordinationMode: coordMode2,
     };
 
     let err = submitOrError(core, decomp);
     if (err) return err;
 
-    // Transition parent to analysis.waiting (blocked on children)
+    // Transition parent to review.waiting (waits for children to complete)
     const waitTransition: PhaseTransition = {
       type: "PhaseTransition",
       taskId, ts: now + 4,
       from: { phase: "decomposition", condition: "active" },
-      to: { phase: "analysis", condition: "waiting" },
+      to: { phase: "review", condition: "waiting" },
       reasonCode: "children_created",
       reason: `Decomposed into ${b.children.length} subtasks`,
       fenceToken,
@@ -2838,7 +2127,7 @@ function handleDecompose(
         taskId,
         children: childSpecs.map(c => ({ id: c.taskId, title: c.title, costAllocation: c.costAllocation })),
         decompositionVersion: version,
-        transition: "→ analysis.waiting",
+        transition: "→ review.waiting",
       },
     };
   };
@@ -2899,7 +2188,7 @@ function collectAttentionTasks(core: Core): {
     .filter(
       (t) =>
         !t.terminal &&
-        t.condition === "active" &&
+        (t.condition === "leased" || t.condition === "active") &&
         t.leaseExpiresAt !== null &&
         t.leaseExpiresAt <= now,
     )

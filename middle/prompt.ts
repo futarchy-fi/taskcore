@@ -143,9 +143,8 @@ function buildWorkPrompt(core: Core, task: Task, config: Config, overrides?: Pro
   const journalBase = overrides?.journalWorktreePath
     ?? getWorktreePath(config.worktreeBaseDir, task.id, "journal");
   const journalPath = `${journalBase}/tasks/T${task.id}/`;
-  const hasRepo = !!(task.metadata["repo"] || config.defaultCodeRepo);
   const codeWorktree = overrides?.codeWorktreePath
-    ?? (hasRepo
+    ?? (task.metadata["repo"]
       ? getWorktreePath(config.worktreeBaseDir, task.id, "code")
       : null);
 
@@ -159,32 +158,6 @@ function buildWorkPrompt(core: Core, task: Task, config: Config, overrides?: Pro
   }
   sections.push("- Colony files (AGENTS.md, etc.) are read-only shared resources.");
   sections.push("");
-
-  // Phase 3 guardrail: inject plan doc content if planDoc metadata is set
-  const planDocPath = task.metadata["planDoc"] as string | undefined;
-  if (planDocPath) {
-    try {
-      const resolvedPath = path.isAbsolute(planDocPath)
-        ? planDocPath
-        : path.join(config.workspaceDir, planDocPath);
-      const planContent = fs.readFileSync(resolvedPath, "utf-8");
-      sections.push("## Implementation Plan");
-      sections.push("");
-      const maxPlanLen = 4000;
-      if (planContent.length > maxPlanLen) {
-        sections.push(planContent.slice(0, maxPlanLen));
-        sections.push(`\n... (truncated, ${planContent.length - maxPlanLen} chars omitted)`);
-      } else {
-        sections.push(planContent);
-      }
-      sections.push("");
-    } catch {
-      sections.push("## Implementation Plan");
-      sections.push("");
-      sections.push(`⚠️ Plan document not found: \`${planDocPath}\`. The task requires a plan but the file is missing.`);
-      sections.push("");
-    }
-  }
 
   // Phase-specific instructions
   if (task.phase === "analysis") {
@@ -257,7 +230,7 @@ function buildReviewPrompt(core: Core, task: Task, config: Config): string {
   }
 
   // Code changes — prefer worktree branch diff, fall back to colony diff
-  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
+  const targetRepo = task.metadata["repo"] as string | undefined;
   const diff = targetRepo
     ? getTaskDiff(task, targetRepo)
     : getTaskDiff(task, config.workspaceDir);

@@ -39,7 +39,7 @@ export interface Registry {
   validReviewers: ReadonlySet<string>;
   /** All valid IDs for the consulted field */
   validConsulted: ReadonlySet<string>;
-  /** Human member IDs (dispatcher should skip auto-dispatch for these) */
+  /** Human member IDs */
   memberIds: ReadonlySet<string>;
 }
 
@@ -92,32 +92,13 @@ export function loadRegistry(registryPath: string): Registry {
 }
 
 // ---------------------------------------------------------------------------
-// Hierarchical agent identity
-// ---------------------------------------------------------------------------
-
-/**
- * Extract the role (agent class) from a possibly-instanced agent ID.
- * "claude.3" → "claude", "coder" → "coder"
- */
-export function agentRole(agentId: string): string {
-  const dot = agentId.indexOf(".");
-  return dot >= 0 ? agentId.slice(0, dot) : agentId;
-}
-
-function matchesSet(set: ReadonlySet<string>, id: string): boolean {
-  if (set.has(id)) return true;
-  const role = agentRole(id);
-  return role !== id && set.has(role);
-}
-
-// ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
 
 export function validateAssignee(registry: Registry, value: unknown): string | null {
   if (value === null || value === undefined) return null;
   const id = String(value);
-  if (!matchesSet(registry.validAssignees, id)) {
+  if (!registry.validAssignees.has(id)) {
     return `Unknown assignee "${id}". Valid: ${[...registry.validAssignees].join(", ")}`;
   }
   return null;
@@ -126,7 +107,7 @@ export function validateAssignee(registry: Registry, value: unknown): string | n
 export function validateReviewer(registry: Registry, value: unknown): string | null {
   if (value === null || value === undefined) return null;
   const id = String(value);
-  if (!matchesSet(registry.validReviewers, id)) {
+  if (!registry.validReviewers.has(id)) {
     return `Unknown reviewer "${id}". Valid: ${[...registry.validReviewers].join(", ")}`;
   }
   return null;
@@ -135,7 +116,7 @@ export function validateReviewer(registry: Registry, value: unknown): string | n
 export function validateConsulted(registry: Registry, value: unknown): string | null {
   if (value === null || value === undefined) return null;
   const id = String(value);
-  if (!matchesSet(registry.validConsulted, id)) {
+  if (!registry.validConsulted.has(id)) {
     return `Unknown consulted "${id}". Valid: ${[...registry.validConsulted].join(", ")}`;
   }
   return null;

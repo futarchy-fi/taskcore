@@ -2,17 +2,19 @@ import {
   computeCostRemaining,
   type BackoffExpired,
   type CheckpointTriggered,
-  type ChildActivated,
   type ChildCostRecovered,
   type DependencySatisfied,
   type Event,
   type LeaseExpired,
   type PhaseTransition,
+  type RetryScheduled,
   type SystemState,
   type Task,
   type TaskExhausted,
 } from "./types.js";
 
+const AGENT_EXIT_FOLLOWUP_TIMEOUT = 60_000;
+const AGENT_EXIT_RETRY_BACKOFF = 1_000;
 
 function backoffDue(task: Task, now: number): boolean {
   return task.condition === "retryWait" && task.retryAfter !== null && task.retryAfter <= now;
@@ -105,9 +107,26 @@ export class CoreClock {
 
       if (
         task.condition === "active" &&
-        task.leaseExpiresAt !== null &&
-        task.leaseExpiresAt <= now
+        task.leasedTo !== null &&
+        task.leaseExpiresAt === null &&
+        task.lastAgentExitAt !== null &&
+        now - task.lastAgentExitAt > AGENT_EXIT_FOLLOWUP_TIMEOUT
       ) {
+        const retryScheduled: RetryScheduled = {
+          type: "RetryScheduled",
+          taskId: task.id,
+          ts: now,
+          fenceToken: task.currentFenceToken,
+          reason: "agent_exit_followup_timeout",
+          retryAfter: now + AGENT_EXIT_RETRY_BACKOFF,
+          phase: task.phase,
+          attemptNumber: Math.max(1, task.attempts[task.phase].used),
+        };
+        due.push(retryScheduled);
+        continue;
+      }
+
+      if (task.condition === "leased" && task.leaseExpiresAt !== null && task.leaseExpiresAt <= now) {
         const leaseExpired: LeaseExpired = {
           type: "LeaseExpired",
           taskId: task.id,
@@ -151,86 +170,8 @@ export class CoreClock {
         due.push(dependencySatisfied);
       }
 
-      // Sequential child activation: when active child completes, activate next child
-      let emittedChildActivation = false;
-      if (
-        task.coordination &&
-        task.coordination.mode === "sequential_children" &&
-        task.phase === "analysis" &&
-        task.condition === "waiting" &&
-        task.coordination.activeChildId
-      ) {
-        const coord = task.coordination;
-        const activeChildId = coord.activeChildId!;
-        const activeChild = state.tasks[activeChildId];
-        if (activeChild && activeChild.terminal !== null) {
-          if (activeChild.terminal === "done" && !coord.reviewBetweenChildren) {
-            // Activate next child if there is one
-            if (coord.nextChildIndex < coord.childOrder.length) {
-              const nextChildId = coord.childOrder[coord.nextChildIndex]!;
-              const nextChild = state.tasks[nextChildId];
-              if (nextChild && nextChild.terminal === null && nextChild.condition === "waiting") {
-                const childActivated: ChildActivated = {
-                  type: "ChildActivated",
-                  taskId: nextChildId,
-                  ts: now,
-                  parentId: task.id,
-                  index: coord.nextChildIndex,
-                  source: { type: "core", id: this.sourceId },
-                };
-                due.push(childActivated);
-                emittedChildActivation = true;
-              }
-            }
-            // If no more children, fall through to existing childrenCompleteReady check
-          } else if (activeChild.terminal !== "done") {
-            // Active child failed/blocked/canceled → wake parent for mediation
-            const wakeParent: PhaseTransition = {
-              type: "PhaseTransition",
-              taskId: task.id,
-              ts: now,
-              from: { phase: "analysis", condition: "waiting" },
-              to: { phase: "analysis", condition: "ready" },
-              reasonCode: "children_all_failed",
-              reason: `Sequential child ${activeChildId} reached terminal state: ${activeChild.terminal}`,
-              fenceToken: task.currentFenceToken,
-              agentContext: {
-                sessionId: "core",
-                agentId: "core",
-                memoryRef: null,
-                contextTokens: null,
-                modelId: "core",
-              },
-            };
-            due.push(wakeParent);
-            emittedChildActivation = true;
-          } else if (activeChild.terminal === "done" && coord.reviewBetweenChildren) {
-            // Parent mediation: wake parent for review instead of auto-activating next child
-            const wakeForReview: PhaseTransition = {
-              type: "PhaseTransition",
-              taskId: task.id,
-              ts: now,
-              from: { phase: "analysis", condition: "waiting" },
-              to: { phase: "analysis", condition: "ready" },
-              reasonCode: "child_review_due",
-              reason: `Sequential child ${activeChildId} completed; parent review required`,
-              fenceToken: task.currentFenceToken,
-              agentContext: {
-                sessionId: "core",
-                agentId: "core",
-                memoryRef: null,
-                contextTokens: null,
-                modelId: "core",
-              },
-            };
-            due.push(wakeForReview);
-            emittedChildActivation = true;
-          }
-        }
-      }
-
       let emittedCheckpoint = false;
-      if ((task.phase === "review" || task.phase === "analysis") && task.condition === "waiting" && task.checkpoints.length > 0) {
+      if (task.phase === "review" && task.condition === "waiting" && task.checkpoints.length > 0) {
         const alreadyTriggered = new Set(task.triggeredCheckpoints);
         for (const childId of task.checkpoints) {
           if (alreadyTriggered.has(childId)) {
@@ -254,26 +195,42 @@ export class CoreClock {
       }
 
       const completion = childrenCompleteReady(state, task);
-      if (!emittedCheckpoint && !emittedChildActivation && task.phase === "analysis" && task.condition === "waiting" && completion.allTerminal) {
-        const childrenTransition: PhaseTransition = {
-          type: "PhaseTransition",
-          taskId: task.id,
-          ts: now,
-          from: { phase: "analysis", condition: "waiting" },
-          to: { phase: "analysis", condition: "ready" },
-          reasonCode: completion.anyDone ? "children_complete" : "children_all_failed",
-          reason: completion.anyDone
-            ? "All children reached terminal state"
-            : "All children reached terminal state with no successful child",
-          fenceToken: task.currentFenceToken,
-          agentContext: {
-            sessionId: "core",
-            agentId: "core",
-            memoryRef: null,
-            contextTokens: null,
-            modelId: "core",
-          },
-        };
+      if (!emittedCheckpoint && task.phase === "review" && task.condition === "waiting" && completion.allTerminal) {
+        const childrenTransition: PhaseTransition = completion.anyDone
+          ? {
+              type: "PhaseTransition",
+              taskId: task.id,
+              ts: now,
+              from: { phase: "review", condition: "waiting" },
+              to: { phase: "review", condition: "ready" },
+              reasonCode: "children_complete",
+              reason: "All children reached terminal state",
+              fenceToken: task.currentFenceToken,
+              agentContext: {
+                sessionId: "core",
+                agentId: "core",
+                memoryRef: null,
+                contextTokens: null,
+                modelId: "core",
+              },
+            }
+          : {
+              type: "PhaseTransition",
+              taskId: task.id,
+              ts: now,
+              from: { phase: "review", condition: "waiting" },
+              to: { phase: "analysis", condition: "ready" },
+              reasonCode: "children_all_failed",
+              reason: "All children reached terminal state with no successful child",
+              fenceToken: task.currentFenceToken,
+              agentContext: {
+                sessionId: "core",
+                agentId: "core",
+                memoryRef: null,
+                contextTokens: null,
+                modelId: "core",
+              },
+            };
         due.push(childrenTransition);
       }
     }

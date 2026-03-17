@@ -25,20 +25,32 @@ export interface Config {
   agentRegistry: string;
   /** Workspace root directory */
   workspaceDir: string;
+  /** Legacy embedded-executor capacity (kept for runtime compat only) */
+  maxConcurrent: number;
   /** Core tick interval (auto-events) */
   tickIntervalMs: number;
+  /** Legacy embedded-executor interval (no longer used) */
+  dispatchIntervalMs: number;
   /** Default agent lease timeout */
   leaseTimeoutMs: number;
   /** Lock file path */
   lockFile: string;
   /** Dashboard runtime JSON (executor_runtime.json compat) */
   runtimeFile: string;
+  /** Legacy embedded-executor lifecycle JSONL (compat only) */
+  lifecycleFile: string;
+  /** Legacy embedded-executor command (no longer used) */
+  agentCommand: string;
+  /** Legacy embedded-executor notification target (no longer used) */
+  telegramTarget: string;
   /** Default cost budget for new tasks */
   defaultCostBudget: number;
   /** Default context budget (passed to agent on lease) */
   defaultContextBudget: number;
   /** Default attempt budgets */
   defaultAttemptBudgets: AttemptBudgetMaxInput;
+  /** Legacy embedded-executor timeout (no longer used) */
+  agentTimeoutMs: number;
   /** Disallowed agent (rerouting) */
   disallowedAgent: string;
   /** Fallback agent for rerouting */
@@ -47,8 +59,6 @@ export interface Config {
   journalRepoPath: string;
   /** Base directory for git worktrees (journal + code) */
   worktreeBaseDir: string;
-  /** Default code repo path — used when task.metadata.repo is not set */
-  defaultCodeRepo: string;
 }
 
 export function loadConfig(): Config {
@@ -69,7 +79,9 @@ export function loadConfig(): Config {
       `${workspaceDir}/agents/registry.json`,
     ),
     workspaceDir,
+    maxConcurrent: envInt("MAX_CONCURRENT", 1),
     tickIntervalMs: envInt("TICK_INTERVAL_MS", 2_000),
+    dispatchIntervalMs: envInt("DISPATCH_INTERVAL_MS", 10_000),
     leaseTimeoutMs: envInt("LEASE_TIMEOUT_MS", 600_000),
     lockFile: envStr(
       "ORCHESTRATOR_LOCK",
@@ -79,9 +91,16 @@ export function loadConfig(): Config {
       "RUNTIME_FILE",
       `${workspaceDir}/data/task-dashboard/executor_runtime.json`,
     ),
+    lifecycleFile: envStr(
+      "LIFECYCLE_FILE",
+      `${workspaceDir}/data/task-dashboard/task_run_lifecycle.jsonl`,
+    ),
+    agentCommand: envStr("AGENT_COMMAND", "openclaw"),
+    telegramTarget: envStr("TELEGRAM_TARGET", ""),
     defaultCostBudget: envInt("DEFAULT_COST_BUDGET", 100),
     defaultContextBudget: envInt("DEFAULT_CONTEXT_BUDGET", 200),
     defaultAttemptBudgets: DEFAULT_ATTEMPT_BUDGETS,
+    agentTimeoutMs: envInt("AGENT_TIMEOUT_MS", 600_000),
     disallowedAgent: envStr("DISALLOWED_ROUTED_AGENT", "hermes"),
     disallowedAgentFallback: envStr("DISALLOWED_AGENT_FALLBACK", "overseer"),
     journalRepoPath: envStr(
@@ -89,6 +108,5 @@ export function loadConfig(): Config {
       `${process.env["HOME"]}/.openclaw/journal`,
     ),
     worktreeBaseDir: envStr("WORKTREE_BASE_DIR", "/tmp/taskcore-worktrees"),
-    defaultCodeRepo: envStr("DEFAULT_CODE_REPO", ""),
   };
 }

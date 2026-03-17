@@ -6,7 +6,6 @@ import {
   type Event,
   type EventType,
   type FailureSummary,
-  isSiblingTurnWait,
   type Phase,
   type PhaseTransitionReason,
   type SystemState,
@@ -19,7 +18,6 @@ const CORE_ONLY_EVENTS = new Set<EventType>([
   "LeaseExpired",
   "BackoffExpired",
   "DependencySatisfied",
-  "ChildActivated",
   "ChildCostRecovered",
   "CheckpointTriggered",
   "TaskExhausted",
@@ -37,11 +35,9 @@ const PHASE_TRANSITION_TABLE = new Set<string>([
   transitionKey("review", "active", "analysis", "ready", "wrong_approach"),
   transitionKey("review", "active", "analysis", "ready", "needs_redecomp"),
   transitionKey("review", "active", "decomposition", "ready", "add_children"),
-  transitionKey("analysis", "active", "review", "ready", "work_complete"),
-  transitionKey("decomposition", "active", "analysis", "waiting", "children_created"),
-  transitionKey("analysis", "waiting", "analysis", "ready", "children_complete"),
-  transitionKey("analysis", "waiting", "analysis", "ready", "children_all_failed"),
-  transitionKey("analysis", "waiting", "analysis", "ready", "child_review_due"),
+  transitionKey("decomposition", "active", "review", "waiting", "children_created"),
+  transitionKey("review", "waiting", "review", "ready", "children_complete"),
+  transitionKey("review", "waiting", "analysis", "ready", "children_all_failed"),
 ]);
 
 function transitionKey(
@@ -73,6 +69,10 @@ function isPositiveInt(value: number): boolean {
   return Number.isInteger(value) && value > 0;
 }
 
+function isNonNegativeInt(value: number): boolean {
+  return Number.isInteger(value) && value >= 0;
+}
+
 function nonEmptyText(value: string): boolean {
   return value.trim().length > 0;
 }
@@ -87,6 +87,148 @@ function validFailureSummary(summary: FailureSummary | undefined): boolean {
     nonEmptyText(summary.whatFailed) &&
     nonEmptyText(summary.whatWasLearned)
   );
+}
+
+function validateCompletionVerification(
+  event: Extract<Event, { type: "TaskCompleted" }>,
+  task: Task,
+): ValidationError | null {
+  const verification = event.verification;
+  if (!verification) {
+    return mkError(event, "missing_verification", "TaskCompleted requires verification.");
+  }
+
+  if (verification.mode !== task.verification.requiredMode) {
+    return mkError(
+      event,
+      "verification_mode_mismatch",
+      "TaskCompleted verification mode must match the task's required completion mode.",
+      { requiredMode: task.verification.requiredMode, actualMode: verification.mode },
+    );
+  }
+
+  if (!isPositiveInt(verification.verifiedAt) || verification.verifiedAt > event.ts) {
+    return mkError(
+      event,
+      "invalid_verification_timestamp",
+      "TaskCompleted verification must include a valid verifiedAt timestamp no later than the event timestamp.",
+    );
+  }
+
+  if (verification.verifiedBy !== undefined && !nonEmptyText(verification.verifiedBy)) {
+    return mkError(event, "invalid_verifier", "TaskCompleted verification verifiedBy must be non-empty when provided.");
+  }
+
+  const proof = verification.proof;
+  const result = verification.result;
+  switch (verification.mode) {
+    case "code-task": {
+      if (proof.kind !== "code-task") {
+        return mkError(event, "invalid_completion_proof", "code-task verification requires code-task proof.");
+      }
+      if (result.kind !== "code-task" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "code-task verification requires verified code-task result.");
+      }
+      if (!nonEmptyText(proof.commitRef)) {
+        return mkError(event, "invalid_completion_proof", "code-task proof requires commitRef.");
+      }
+      if (proof.changedFiles.length === 0 || proof.changedFiles.some((file) => !nonEmptyText(file))) {
+        return mkError(event, "invalid_completion_proof", "code-task proof requires non-empty changedFiles.");
+      }
+      if (!nonEmptyText(result.verifiedCommitRef) || result.verifiedCommitRef !== proof.commitRef) {
+        return mkError(event, "invalid_completion_result", "code-task result must reference the verified commitRef.");
+      }
+      if (!isPositiveInt(result.changedFileCount) || result.changedFileCount !== proof.changedFiles.length) {
+        return mkError(event, "invalid_completion_result", "code-task result changedFileCount must match proof.changedFiles.");
+      }
+      if (result.testsPassed !== proof.testsPassed) {
+        return mkError(event, "invalid_completion_result", "code-task result testsPassed must match the proof.");
+      }
+      return null;
+    }
+
+    case "journal-only": {
+      if (proof.kind !== "journal-only") {
+        return mkError(event, "invalid_completion_proof", "journal-only verification requires journal-only proof.");
+      }
+      if (result.kind !== "journal-only" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "journal-only verification requires verified journal-only result.");
+      }
+      if (!nonEmptyText(proof.journalPath) || !nonEmptyText(proof.summary)) {
+        return mkError(event, "invalid_completion_proof", "journal-only proof requires journalPath and summary.");
+      }
+      if (!nonEmptyText(result.recordedJournalPath) || result.recordedJournalPath !== proof.journalPath) {
+        return mkError(event, "invalid_completion_result", "journal-only result must record the verified journalPath.");
+      }
+      if (result.actionable !== proof.actionable) {
+        return mkError(event, "invalid_completion_result", "journal-only result actionable must match the proof.");
+      }
+      return null;
+    }
+
+    case "coordinator": {
+      if (proof.kind !== "coordinator") {
+        return mkError(event, "invalid_completion_proof", "coordinator verification requires coordinator proof.");
+      }
+      if (result.kind !== "coordinator" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "coordinator verification requires verified coordinator result.");
+      }
+      if (proof.childTaskIds.length === 0 || proof.childTaskIds.some((id) => !nonEmptyText(id)) || !nonEmptyText(proof.summary)) {
+        return mkError(event, "invalid_completion_proof", "coordinator proof requires childTaskIds and summary.");
+      }
+      if (!isPositiveInt(result.childTaskCount) || result.childTaskCount !== proof.childTaskIds.length) {
+        return mkError(event, "invalid_completion_result", "coordinator result childTaskCount must match proof.childTaskIds.");
+      }
+      if (!isNonNegativeInt(result.successfulChildCount) || result.successfulChildCount > result.childTaskCount) {
+        return mkError(event, "invalid_completion_result", "coordinator result successfulChildCount must be within childTaskCount.");
+      }
+      if (result.allChildrenSucceeded !== proof.allChildrenSucceeded) {
+        return mkError(event, "invalid_completion_result", "coordinator result allChildrenSucceeded must match the proof.");
+      }
+      if (result.allChildrenSucceeded && result.successfulChildCount !== result.childTaskCount) {
+        return mkError(event, "invalid_completion_result", "coordinator result must count all children as successful when allChildrenSucceeded is true.");
+      }
+      return null;
+    }
+
+    case "aggregate": {
+      if (proof.kind !== "aggregate") {
+        return mkError(event, "invalid_completion_proof", "aggregate verification requires aggregate proof.");
+      }
+      if (result.kind !== "aggregate" || result.status !== "verified") {
+        return mkError(event, "invalid_completion_result", "aggregate verification requires verified aggregate result.");
+      }
+      if (proof.componentResults.length === 0 || !nonEmptyText(proof.summary)) {
+        return mkError(event, "invalid_completion_proof", "aggregate proof requires componentResults and summary.");
+      }
+      for (const component of proof.componentResults) {
+        if (!nonEmptyText(component.name)) {
+          return mkError(event, "invalid_completion_proof", "aggregate proof component names must be non-empty.");
+        }
+      }
+
+      const succeededCount = proof.componentResults.filter((component) => component.status === "succeeded").length;
+      const failedCount = proof.componentResults.filter((component) => component.status === "failed").length;
+      const skippedCount = proof.componentResults.filter((component) => component.status === "skipped").length;
+
+      if (!isPositiveInt(result.componentCount) || result.componentCount !== proof.componentResults.length) {
+        return mkError(event, "invalid_completion_result", "aggregate result componentCount must match proof.componentResults.");
+      }
+      if (!isNonNegativeInt(result.succeededCount) || result.succeededCount !== succeededCount) {
+        return mkError(event, "invalid_completion_result", "aggregate result succeededCount must match the proof.");
+      }
+      if (!isNonNegativeInt(result.failedCount) || result.failedCount !== failedCount) {
+        return mkError(event, "invalid_completion_result", "aggregate result failedCount must match the proof.");
+      }
+      if (!isNonNegativeInt(result.skippedCount) || result.skippedCount !== skippedCount) {
+        return mkError(event, "invalid_completion_result", "aggregate result skippedCount must match the proof.");
+      }
+      if (result.criticalPathMet !== proof.criticalPathMet) {
+        return mkError(event, "invalid_completion_result", "aggregate result criticalPathMet must match the proof.");
+      }
+      return null;
+    }
+  }
 }
 
 function duplicateIds(ids: string[]): string[] {
@@ -435,14 +577,6 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     return validateTaskReparented(state, event, task);
   }
 
-  // CompletionVerificationRecorded — only on non-terminal tasks
-  if (event.type === "CompletionVerificationRecorded") {
-    if (task.terminal !== null) {
-      return mkError(event, "terminal_task", "CompletionVerificationRecorded not allowed on terminal tasks.");
-    }
-    return null;
-  }
-
   // MetadataUpdated bypasses terminal check — metadata is informational
   if (event.type === "MetadataUpdated") {
     return validateMetadataUpdated(event);
@@ -510,8 +644,8 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "LeaseExpired": {
-      if (task.condition !== "active") {
-        return mkError(event, "invalid_condition", "LeaseExpired requires active condition.");
+      if (task.condition !== "leased") {
+        return mkError(event, "invalid_condition", "LeaseExpired requires leased condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "LeaseExpired fence token mismatch.");
@@ -519,37 +653,16 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       return null;
     }
 
-    case "LeaseReleased": {
-      if (task.condition !== "active") {
-        return mkError(event, "invalid_condition", "LeaseReleased requires active condition.");
-      }
-      if (event.fenceToken !== task.currentFenceToken) {
-        return mkError(event, "stale_fence_token", "LeaseReleased fence token mismatch.");
-      }
-      if (event.phase !== task.phase) {
-        return mkError(event, "phase_mismatch", "LeaseReleased.phase must match current task phase.");
-      }
-      if (!nonEmptyText(event.reason)) {
-        return mkError(event, "missing_release_reason", "LeaseReleased.reason must be non-empty.");
-      }
-      return null;
-    }
-
-    case "LeaseExtended": {
-      if (task.condition !== "active") {
-        return mkError(event, "invalid_condition", "LeaseExtended requires active condition.");
-      }
-      if (event.fenceToken !== task.currentFenceToken) {
-        return mkError(event, "stale_fence_token", "LeaseExtended fence token mismatch.");
-      }
-      if (!isPositiveInt(event.leaseTimeout)) {
-        return mkError(event, "invalid_lease_timeout", "LeaseExtended.leaseTimeout must be a positive integer duration.");
-      }
-      return null;
-    }
-
     case "AgentStarted": {
-      // Legacy no-op: always accept for backward compatibility with old event journals.
+      if (task.condition !== "leased") {
+        return mkError(event, "invalid_condition", "AgentStarted requires leased condition.");
+      }
+      if (event.fenceToken !== task.currentFenceToken) {
+        return mkError(event, "stale_fence_token", "AgentStarted fence token mismatch.");
+      }
+      if (task.leasedTo !== null && task.leasedTo !== event.agentContext.agentId) {
+        return mkError(event, "agent_mismatch", "AgentStarted agentContext.agentId must match leased agent.");
+      }
       return null;
     }
 
@@ -562,19 +675,6 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       }
       if (event.reportedCost < 0) {
         return mkError(event, "invalid_cost", "AgentExited.reportedCost must be >= 0.");
-      }
-      return null;
-    }
-
-    case "CostReported": {
-      if (task.condition !== "active") {
-        return mkError(event, "invalid_condition", "CostReported requires active condition.");
-      }
-      if (event.fenceToken !== task.currentFenceToken) {
-        return mkError(event, "stale_fence_token", "CostReported fence token mismatch.");
-      }
-      if (event.reportedCost < 0) {
-        return mkError(event, "invalid_cost", "CostReported.reportedCost must be >= 0.");
       }
       return null;
     }
@@ -620,8 +720,8 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
     }
 
     case "RetryScheduled": {
-      if (task.condition !== "active") {
-        return mkError(event, "invalid_condition", "RetryScheduled requires active condition.");
+      if (task.condition !== "active" && task.condition !== "leased") {
+        return mkError(event, "invalid_condition", "RetryScheduled requires active or leased condition.");
       }
       if (event.fenceToken !== task.currentFenceToken) {
         return mkError(event, "stale_fence_token", "RetryScheduled fence token mismatch.");
@@ -774,7 +874,7 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       } else if (task.phase !== "execution" && task.phase !== "review") {
         return mkError(event, "invalid_phase", "TaskCompleted without review requires execution or review phase.");
       }
-      return null;
+      return validateCompletionVerification(event, task);
     }
 
     case "TaskFailed": {
@@ -824,61 +924,6 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
 
     case "TaskCanceled":
       return null;
-
-    case "ChildActivated": {
-      // Child must be waiting with sibling_turn wait state
-      if (task.condition !== "waiting") {
-        return mkError(event, "invalid_condition", "ChildActivated requires child in waiting condition.");
-      }
-      if (!task.waitState || !isSiblingTurnWait(task.waitState)) {
-        return mkError(event, "invalid_wait_state", "ChildActivated requires child with sibling_turn wait state.");
-      }
-      // Parent must exist and have sequential coordination
-      const parent = state.tasks[event.parentId];
-      if (!parent) {
-        return mkError(event, "parent_missing", `Parent task ${event.parentId} does not exist.`);
-      }
-      if (!parent.coordination || parent.coordination.mode !== "sequential_children") {
-        return mkError(event, "no_sequential_coordination", "Parent must have sequential_children coordination.");
-      }
-      // Index must be valid
-      if (event.index < 0 || event.index >= parent.coordination.childOrder.length) {
-        return mkError(event, "invalid_index", "ChildActivated index out of bounds.");
-      }
-      // The child at this index must match taskId
-      if (parent.coordination.childOrder[event.index] !== event.taskId) {
-        return mkError(event, "index_mismatch", "ChildActivated index does not match taskId in coordination order.");
-      }
-      return null;
-    }
-
-    case "ChildReviewDecisionSubmitted": {
-      // Parent must be analysis.active (agent is reviewing)
-      if (task.phase !== "analysis" || task.condition !== "active") {
-        return mkError(event, "invalid_state", "ChildReviewDecisionSubmitted requires parent in analysis.active.");
-      }
-      // Fence token must match
-      if (event.fenceToken !== task.currentFenceToken) {
-        return mkError(event, "stale_fence_token", "ChildReviewDecisionSubmitted fence token mismatch.");
-      }
-      // Parent must have sequential coordination
-      if (!task.coordination || task.coordination.mode !== "sequential_children") {
-        return mkError(event, "no_sequential_coordination", "Parent must have sequential_children coordination.");
-      }
-      // Referenced child must exist and be terminal
-      const reviewedChild = state.tasks[event.childId];
-      if (!reviewedChild) {
-        return mkError(event, "child_missing", `Child task ${event.childId} does not exist.`);
-      }
-      if (reviewedChild.terminal === null) {
-        return mkError(event, "child_not_terminal", "Referenced child must be in terminal state.");
-      }
-      // Notes must be non-empty
-      if (!nonEmptyText(event.notes)) {
-        return mkError(event, "invalid_notes", "ChildReviewDecisionSubmitted.notes must be non-empty.");
-      }
-      return null;
-    }
 
     default: {
       const neverEvent: never = event;

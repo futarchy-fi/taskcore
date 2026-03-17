@@ -62,11 +62,10 @@ function releaseLock(lockPath: string): void {
 // ---------------------------------------------------------------------------
 
 /**
- * On daemon restart, the in-memory activeRuns map is lost. Tasks that were
- * "active" when the previous daemon died will stay active forever because
- * AgentExited was never submitted (so lastAgentExitAt is null and the clock
- * reaper can't fire). This function detects those orphans and moves them to
- * retryWait so they can be re-dispatched.
+ * On daemon restart, any externally claimed task may be left in an active or
+ * leased state if the claiming session disappeared without reporting exit.
+ * This function moves those orphans to retryWait so they can become claimable
+ * again after the normal retry timer.
  */
 function reconcileOrphanedTasks(core: OrchestrationCore): void {
   const state = core.getState();
@@ -75,7 +74,7 @@ function reconcileOrphanedTasks(core: OrchestrationCore): void {
 
   for (const task of Object.values(state.tasks)) {
     if (task.terminal !== null) continue;
-    if (task.condition !== "active") continue;
+    if (task.condition !== "active" && task.condition !== "leased") continue;
     if (task.phase === null) continue;
 
     const event: RetryScheduled = {
@@ -115,7 +114,6 @@ async function main(): Promise<void> {
   console.log(`[daemon]   eventLogDir=${config.eventLogDir}`);
   console.log(`[daemon]   workspace=${config.workspaceDir}`);
 
-
   // Ensure data directories exist
   const dbDir = path.dirname(config.dbPath);
   if (!fs.existsSync(dbDir)) {
@@ -152,9 +150,7 @@ async function main(): Promise<void> {
 
   // Cleanup stale worktrees from previous crashes
   try {
-    const reposToClean = [config.journalRepoPath];
-    if (config.defaultCodeRepo) reposToClean.push(config.defaultCodeRepo);
-    const cleaned = cleanupStaleWorktrees(config.worktreeBaseDir, reposToClean);
+    const cleaned = cleanupStaleWorktrees(config.worktreeBaseDir);
     if (cleaned > 0) {
       console.log(`[daemon] Cleaned up ${cleaned} stale worktree(s)`);
     }
@@ -170,6 +166,26 @@ async function main(): Promise<void> {
       resolve();
     });
   });
+
+  // Reset embedded-executor runtime state on every boot. taskcore no longer
+  // owns agent dispatch, but dashboard consumers still read this file.
+  try {
+    const runtimeDir = path.dirname(config.runtimeFile);
+    if (!fs.existsSync(runtimeDir)) {
+      fs.mkdirSync(runtimeDir, { recursive: true });
+    }
+    fs.writeFileSync(
+      config.runtimeFile,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        activeRuns: [],
+        maxConcurrent: 0,
+      }, null, 2) + "\n",
+    );
+  } catch (err) {
+    console.error("[daemon] Runtime file init failed (non-fatal):", err);
+  }
 
   // Tick loop — auto-events (lease expiry, backoff, cost recovery, etc.)
   const tickInterval = setInterval(() => {
@@ -235,9 +251,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
 
-  console.log("[daemon] Ready. Tick every %dms, agents claim tasks via CLI",
-    config.tickIntervalMs,
-  );
+  console.log("[daemon] Ready. Tick every %dms", config.tickIntervalMs);
 }
 
 main().catch((err) => {

@@ -124,11 +124,11 @@ export function mergeTaskBranch(
   git(repoPath, ["checkout", target]);
 
   try {
-    git(repoPath, ["merge", "--ff", branch, "-m", `Merge T${taskId}`]);
+    git(repoPath, ["merge", "--ff", branch, "-m", `Merge T${taskId} journal`]);
   } catch {
     // If ff fails, allow non-ff merge
     try {
-      git(repoPath, ["merge", "--no-ff", branch, "-m", `Merge T${taskId}`]);
+      git(repoPath, ["merge", "--no-ff", branch, "-m", `Merge T${taskId} journal`]);
     } catch {
       // Conflict — abort and leave branch unmerged
       try { git(repoPath, ["merge", "--abort"]); } catch { /* already clean */ }

@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import { OrchestrationCore } from "../core/index.js";
 import { checkInvariants } from "../core/invariants.js";
 import {
+  buildCompletionVerificationResult,
   DEFAULT_ATTEMPT_BUDGETS,
   type AgentContext,
   type Event,
@@ -217,6 +218,12 @@ function autoTransitionToExecution(
       sessionId: "migration",
       sessionType: "fresh",
       contextBudget: 100,
+    },
+    {
+      type: "AgentStarted",
+      taskId,
+      ts: baseTs + 11,
+      fenceToken,
       agentContext: syntheticCtx,
     },
     {
@@ -268,6 +275,12 @@ function leaseAndStart(
       sessionId: "migration",
       sessionType: "fresh",
       contextBudget: 100,
+    },
+    {
+      type: "AgentStarted",
+      taskId,
+      ts: baseTs + 21,
+      fenceToken,
       agentContext: ctx,
     },
   ];
@@ -325,6 +338,12 @@ function approveAndComplete(
       sessionId: "migration",
       sessionType: "fresh",
       contextBudget: 100,
+    },
+    {
+      type: "AgentStarted",
+      taskId,
+      ts: baseTs + 41,
+      fenceToken,
       agentContext: { ...syntheticCtx, agentId: "migrate:reviewer" },
     },
     {
@@ -351,6 +370,24 @@ function approveAndComplete(
       taskId,
       ts: baseTs + 44,
       stateRef: { branch: "main", commit: "migration", parentCommit: "migration" },
+      verification: {
+        mode: "code-task",
+        verifiedAt: baseTs + 44,
+        proof: {
+          kind: "code-task",
+          commitRef: "migration",
+          changedFiles: ["migration"],
+          testsPassed: true,
+          testResults: evidence ?? "Migration completion",
+        },
+        result: buildCompletionVerificationResult({
+          kind: "code-task",
+          commitRef: "migration",
+          changedFiles: ["migration"],
+          testsPassed: true,
+          testResults: evidence ?? "Migration completion",
+        }),
+      },
     },
   ];
 
