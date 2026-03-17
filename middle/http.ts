@@ -745,12 +745,12 @@ function handleClaimTask(
       if (task.phase === "review") {
         const reviewer = task.metadata["reviewer"] as string | undefined;
         if (reviewer && agentRole(reviewer) !== claimRole) {
-          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} reviewer is "${reviewer}", not "${agentId}". Use --force to override.` } };
+          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} is assigned to a different agent for review. Use --force to override.` } };
         }
       } else {
         const assignee = task.metadata["assignee"] as string | undefined;
         if (assignee && agentRole(assignee) !== claimRole) {
-          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} assignee is "${assignee}", not "${agentId}". Use --force to override.` } };
+          return { status: 403, body: { error: "role_mismatch", message: `Task ${taskId} is assigned to a different agent. Use --force to override.` } };
         }
       }
     }
@@ -1722,6 +1722,74 @@ function maybeCreatePr(config: Config, task: Task, core: Core): void {
   }
 }
 
+function isZeroedStateRef(ref: StateRef): boolean {
+  return ref.commit === "0000000" && ref.parentCommit === "0000000";
+}
+
+/**
+ * Pre-flight checks before marking a task done.
+ * Layer 1: Reject if any children are still non-terminal.
+ * Layer 2: If completionRule === "and", all terminal children must be "done".
+ * Layer 3: If metadata.repo is set, require a non-zeroed stateRef.
+ */
+function verifyCompletion(
+  core: Core,
+  task: Task,
+  stateRef?: StateRef,
+): RouteResult | null {
+  // (a) Task has metadata.repo but stateRef is missing or zeroed
+  if (task.metadata["repo"]) {
+    const ref = stateRef ?? task.stateRef;
+    if (!ref || isZeroedStateRef(ref)) {
+      return {
+        status: 422,
+        body: {
+          error: "missing_state_ref",
+          message:
+            "Task has metadata.repo but no valid stateRef was provided. " +
+            "Submit a stateRef with a real commit before marking done.",
+        },
+      };
+    }
+  }
+
+  // (b) Layer 1: Block if any children are still non-terminal
+  if (task.children.length > 0) {
+    const children = core.getChildren(task.id);
+    const pending = children.filter((c) => c.terminal === null);
+    if (pending.length > 0) {
+      return {
+        status: 422,
+        body: {
+          error: "children_pending",
+          message:
+            `Cannot mark done: ${pending.length} child(ren) still pending: ` +
+            pending.map((c) => c.id).join(", ") +
+            ". Cancel or complete them first.",
+        },
+      };
+    }
+
+    // (c) Layer 2: completionRule="and" requires all terminal children to be "done"
+    if (task.completionRule === "and") {
+      const notDone = children.filter((c) => c.terminal !== "done");
+      if (notDone.length > 0) {
+        return {
+          status: 422,
+          body: {
+            error: "children_not_done",
+            message:
+              `Task has completionRule='and' but ${notDone.length} child(ren) are not done: ` +
+              notDone.map((c) => c.id).join(", "),
+          },
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 function applyDoneTransition(
   core: Core,
   config: Config,
@@ -1732,6 +1800,10 @@ function applyDoneTransition(
   evidence?: string,
   stateRef?: StateRef,
 ): RouteResult {
+  // Pre-flight completion checks (children guard, stateRef guard)
+  const completionErr = verifyCompletion(core, task, stateRef);
+  if (completionErr) return completionErr;
+
   if (task.phase === "execution" && task.condition === "active" && task.reviewConfig === null) {
     // Verify artifacts before allowing completion
     const verification = verifyArtifacts(task, config);
@@ -2535,10 +2607,17 @@ function handleDecomposeCommit(
         }
       }
 
-      const parentPriority = (task.metadata["priority"] as string | undefined) ?? "medium";
-      const metadata: Record<string, unknown> = {};
+      // Inherit all parent metadata, then override with child-specific values
+      const metadata: Record<string, unknown> = { ...task.metadata };
+      // Remove parent-specific bookkeeping that shouldn't propagate
+      delete metadata["createdBy"]; delete metadata["createdAt"];
+      delete metadata["claimedAt"]; delete metadata["claimedBy"];
+      delete metadata["claimSessionId"]; delete metadata["claimSource"];
+      delete metadata["last_update"]; delete metadata["last_update_at"];
+      // Apply child overrides
       if (child.assignee) metadata["assignee"] = child.assignee;
       if (child.reviewer) metadata["reviewer"] = child.reviewer;
+      const parentPriority = (task.metadata["priority"] as string | undefined) ?? "medium";
       const childPriority = ("priority" in child ? (child as { priority?: string }).priority : undefined) ?? "medium";
       metadata["priority"] = maxPriority(parentPriority, childPriority);
 
@@ -2779,10 +2858,17 @@ function handleDecompose(
         }
       }
 
-      const parentPriority = (task.metadata["priority"] as string | undefined) ?? "medium";
-      const metadata: Record<string, unknown> = {};
+      // Inherit all parent metadata, then override with child-specific values
+      const metadata: Record<string, unknown> = { ...task.metadata };
+      // Remove parent-specific bookkeeping that shouldn't propagate
+      delete metadata["createdBy"]; delete metadata["createdAt"];
+      delete metadata["claimedAt"]; delete metadata["claimedBy"];
+      delete metadata["claimSessionId"]; delete metadata["claimSource"];
+      delete metadata["last_update"]; delete metadata["last_update_at"];
+      // Apply child overrides
       if (child.assignee) metadata["assignee"] = child.assignee;
       if (child.reviewer) metadata["reviewer"] = child.reviewer;
+      const parentPriority = (task.metadata["priority"] as string | undefined) ?? "medium";
       const childPriority = ("priority" in child ? (child as { priority?: string }).priority : undefined) ?? "medium";
       metadata["priority"] = maxPriority(parentPriority, childPriority);
 

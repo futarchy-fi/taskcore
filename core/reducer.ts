@@ -262,10 +262,11 @@ function applyTaskCreated(state: SystemState, event: Extract<Event, { type: "Tas
 }
 
 function applyLeaseGranted(state: SystemState, event: Extract<Event, { type: "LeaseGranted" }>, task: Task): void {
+  const ts = event.ts ?? Date.now();
   const t = deepCloneTask(task);
   t.currentFenceToken = event.fenceToken;
   t.leasedTo = event.agentId;
-  t.leaseExpiresAt = event.ts + event.leaseTimeout;
+  t.leaseExpiresAt = ts + event.leaseTimeout;
   t.phase = event.phase;
   t.condition = "active";
   t.retryAfter = null;
@@ -273,7 +274,7 @@ function applyLeaseGranted(state: SystemState, event: Extract<Event, { type: "Le
   t.currentSessionId = event.agentContext.sessionId;
   t.contextBudget = event.contextBudget;
   t.attempts[event.phase].used += 1;
-  t.updatedAt = event.ts;
+  t.updatedAt = ts;
   state.tasks[t.id] = t;
 }
 
