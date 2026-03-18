@@ -1405,6 +1405,49 @@ test("Scenario S: LeaseExpired auto-emission transitions leased task to retryWai
   assert.equal(state.tasks.T1800?.leasedTo, null);
 });
 
+test("Scenario S2: malformed active task with missing lease is retried by the clock", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("T1801", 1));
+  state = mustReduce(state, lease("T1801", 2, 1, "analysis", "analyst", "a-1801"));
+
+  state.tasks.T1801!.leaseExpiresAt = null;
+
+  const clock = new CoreClock();
+  const due = clock.collectDueEvents(state, 10_000);
+  const retryScheduled = due.find((event) => event.type === "RetryScheduled" && event.taskId === "T1801");
+  assert.ok(retryScheduled);
+  if (!retryScheduled || retryScheduled.type !== "RetryScheduled") {
+    assert.fail("expected RetryScheduled");
+  }
+  assert.equal(retryScheduled.reason, "orphaned_on_restart");
+
+  state = mustReduce(state, retryScheduled);
+  assert.equal(state.tasks.T1801?.condition, "retryWait");
+  assert.equal(state.tasks.T1801?.leasedTo, null);
+  assert.equal(state.tasks.T1801?.leaseExpiresAt, null);
+});
+
+test("Scenario S3: malformed active task with empty agent is retried by the clock", () => {
+  let state = createInitialState();
+  state = mustReduce(state, createTask("T1802", 1));
+  state = mustReduce(state, lease("T1802", 2, 1, "analysis", "analyst", "a-1802"));
+
+  state.tasks.T1802!.leasedTo = "";
+
+  const clock = new CoreClock();
+  const due = clock.collectDueEvents(state, 10_000);
+  const retryScheduled = due.find((event) => event.type === "RetryScheduled" && event.taskId === "T1802");
+  assert.ok(retryScheduled);
+  if (!retryScheduled || retryScheduled.type !== "RetryScheduled") {
+    assert.fail("expected RetryScheduled");
+  }
+  assert.equal(retryScheduled.reason, "orphaned_on_restart");
+
+  state = mustReduce(state, retryScheduled);
+  assert.equal(state.tasks.T1802?.condition, "retryWait");
+  assert.equal(state.tasks.T1802?.leasedTo, null);
+});
+
 test("Scenario T: WaitResolved(block) blocks task and propagates summary to parent", () => {
   let state = createInitialState();
   state = mustReduce(state, createTask("T1900", 1));

@@ -712,11 +712,15 @@ function handleClaimTask(
       return { status: 409, body: { error: "terminal_task", message: `Task ${taskId} is terminal` } };
     }
 
-    const agentId = typeof b.agentId === "string" && b.agentId.trim().length > 0
-      ? b.agentId.trim()
-      : typeof b.agent === "string" && b.agent.trim().length > 0
-      ? b.agent.trim()
-      : "unknown";
+    const requestedAgentId = typeof b.agentId === "string"
+      ? b.agentId
+      : typeof b.agent === "string"
+      ? b.agent
+      : null;
+    if (requestedAgentId !== null && requestedAgentId.trim().length === 0) {
+      return { status: 400, body: { error: "invalid_agent_id", message: "agentId must be non-empty." } };
+    }
+    const agentId = requestedAgentId?.trim() || "unknown";
 
     const fenceToken = task.currentFenceToken + 1;
     const sessionId = crypto.randomUUID();
@@ -971,8 +975,11 @@ function handleListTasks(
       assignee: t.metadata["assignee"] ?? null,
       reviewer: t.metadata["reviewer"] ?? null,
       priority: t.metadata["priority"] ?? "medium",
+      activeAgent: t.leasedTo,
+      leaseExpiresAt: t.leaseExpiresAt,
       createdAt: t.createdAt,
       updatedAt: t.updatedAt,
+      updatedAtMs: t.updatedAt,
     }));
 
     return { status: 200, body: { tasks: summaries } };
@@ -2900,8 +2907,11 @@ function collectAttentionTasks(core: Core): {
       (t) =>
         !t.terminal &&
         t.condition === "active" &&
-        t.leaseExpiresAt !== null &&
-        t.leaseExpiresAt <= now,
+        (
+          t.leaseExpiresAt === null ||
+          (typeof t.leasedTo !== "string" || t.leasedTo.trim().length === 0) ||
+          t.leaseExpiresAt <= now
+        ),
     )
     .map(toSummary);
 
