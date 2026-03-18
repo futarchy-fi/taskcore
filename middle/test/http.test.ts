@@ -220,6 +220,35 @@ describe("HTTP API", () => {
     assert.equal(body.tasks.length, 2);
   });
 
+  test("GET /tasks summaries include active agent and lease metadata", async () => {
+    await request("POST", "/tasks", {
+      title: "Leased task",
+      description: "Should expose lease info in summary",
+      assignee: "coder",
+    });
+    const claimRes = await request("POST", "/tasks/1/claim", {
+      agentId: "coder",
+      source: "test",
+    });
+    assert.equal(claimRes.status, 200);
+
+    const res = await request("GET", "/tasks");
+    assert.equal(res.status, 200);
+    const body = res.body as {
+      tasks: Array<{
+        id: string;
+        activeAgent: string | null;
+        leaseExpiresAt: number | null;
+        updatedAtMs: number | null;
+      }>;
+    };
+    const task = body.tasks.find((entry) => entry.id === "1");
+    assert.ok(task);
+    assert.equal(task.activeAgent, "coder");
+    assert.equal(typeof task.leaseExpiresAt, "number");
+    assert.equal(task.updatedAtMs !== null && task.updatedAtMs > 0, true);
+  });
+
   test("GET /dispatchable lists dispatchable tasks", async () => {
     await request("POST", "/tasks", {
       title: "Ready task",
@@ -241,6 +270,21 @@ describe("HTTP API", () => {
   test("404 for unknown routes", async () => {
     const res = await request("GET", "/not-a-route");
     assert.equal(res.status, 404);
+  });
+
+  test("POST /tasks/:id/claim rejects blank agent id", async () => {
+    await request("POST", "/tasks", {
+      title: "Claim validation",
+      description: "Blank claim agent should fail",
+    });
+
+    const res = await request("POST", "/tasks/1/claim", {
+      agentId: "   ",
+      source: "test",
+    });
+    assert.equal(res.status, 400);
+    const body = res.body as { error: string };
+    assert.equal(body.error, "invalid_agent_id");
   });
 
   test("PATCH /tasks/:id/metadata updates priority", async () => {
