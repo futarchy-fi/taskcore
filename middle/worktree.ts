@@ -2,6 +2,17 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+export interface TaskContextFile {
+  taskId: string;
+  phase: string | null;
+  fenceToken: number;
+  sessionId: string;
+  journalPath: string;
+  codeWorktree: string | null;
+  claimedAt: number;
+  reviewNotes: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Git worktree lifecycle
 // ---------------------------------------------------------------------------
@@ -23,13 +34,20 @@ export function createWorktree(
   // the worktree doesn't have the keys yet.
   const useGitCrypt = fs.existsSync(path.join(repoPath, ".git", "git-crypt"));
   const noCheckout = useGitCrypt ? "--no-checkout" : null;
+  const resolvedStartPoint = startPoint && refExists(repoPath, startPoint)
+    ? startPoint
+    : undefined;
+  const createBranch = !branchExists(repoPath, branch);
 
   const addArgs = (withNewBranch: boolean): string[] => {
     const args = ["worktree", "add"];
     if (noCheckout) args.push(noCheckout);
+    if (withNewBranch) {
+      args.push("-b", branch);
+    }
     args.push(worktreePath);
-    if (withNewBranch && startPoint) {
-      args.push("-b", branch, startPoint);
+    if (withNewBranch) {
+      if (resolvedStartPoint) args.push(resolvedStartPoint);
     } else {
       args.push(branch);
     }
@@ -38,11 +56,11 @@ export function createWorktree(
 
   const tryAdd = (): void => {
     try {
-      git(repoPath, addArgs(!!startPoint));
+      git(repoPath, addArgs(createBranch));
     } catch (err) {
       const msg = String(err);
       // Branch may already exist — retry without -b
-      if (startPoint && msg.includes("already exists")) {
+      if (createBranch && msg.includes("already exists")) {
         git(repoPath, addArgs(false));
       } else {
         throw err;
@@ -72,6 +90,37 @@ export function createWorktree(
   }
 
   return worktreePath;
+}
+
+/**
+ * Ensure the expected worktree exists and points at the expected branch.
+ * If the path exists but is not the requested worktree and has no local edits,
+ * recreate it so agents do not inherit stale task state.
+ */
+export function ensureWorktree(
+  repoPath: string,
+  worktreePath: string,
+  branch: string,
+  startPoint?: string,
+): string {
+  if (!fs.existsSync(worktreePath)) {
+    return createWorktree(repoPath, worktreePath, branch, startPoint);
+  }
+
+  const currentBranch = getCurrentBranch(worktreePath);
+  if (currentBranch === branch) {
+    applyGitCryptSymlink(repoPath, worktreePath);
+    return worktreePath;
+  }
+
+  if (isWorktreeReusable(worktreePath)) {
+    removeWorktree(repoPath, worktreePath);
+    return createWorktree(repoPath, worktreePath, branch, startPoint);
+  }
+
+  throw new Error(
+    `existing worktree ${worktreePath} is on ${currentBranch ?? "unknown"} with local changes; expected ${branch}`,
+  );
 }
 
 /**
@@ -120,6 +169,18 @@ export function getWorktreePath(
   type: "journal" | "code",
 ): string {
   return path.join(baseDir, `${type}-T${taskId}`);
+}
+
+export function writeTaskContext(
+  taskContext: TaskContextFile,
+  roots: string[],
+): void {
+  const content = JSON.stringify(taskContext, null, 2) + "\n";
+  for (const root of roots) {
+    if (!root) continue;
+    ensureDir(root);
+    fs.writeFileSync(path.join(root, ".task"), content, "utf-8");
+  }
 }
 
 /**
@@ -205,12 +266,52 @@ export function cleanupStaleWorktrees(
 // Helpers
 // ---------------------------------------------------------------------------
 
+function branchExists(repoPath: string, branch: string): boolean {
+  return refExists(repoPath, `refs/heads/${branch}`);
+}
+
+function refExists(repoPath: string, ref: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+      cwd: repoPath,
+      encoding: "utf-8",
+      timeout: 30_000,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getCurrentBranch(worktreePath: string): string | null {
+  try {
+    const branch = git(worktreePath, ["branch", "--show-current"]).trim();
+    return branch || null;
+  } catch {
+    return null;
+  }
+}
+
+function isWorktreeReusable(worktreePath: string): boolean {
+  try {
+    return git(worktreePath, ["status", "--porcelain"]).trim().length === 0;
+  } catch {
+    return true;
+  }
+}
+
 /** Run a git command. */
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf-8",
     timeout: 30_000,
+    stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
       GIT_TERMINAL_PROMPT: "0",

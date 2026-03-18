@@ -37,7 +37,7 @@ import type { Config } from "./config.js";
 import { buildPrompt } from "./prompt.js";
 import { commitJournal, createTaskBranch, getFailureSummaries, getJournalContent, mergeTaskBranch, taskBranch } from "./journal.js";
 import { agentRole, loadRegistry, validateMetadataRoles, type Registry } from "./registry.js";
-import { createWorktree, getWorktreePath } from "./worktree.js";
+import { ensureWorktree, getWorktreePath, removeWorktree, writeTaskContext } from "./worktree.js";
 import { verifyArtifacts } from "./finalize.js";
 import { createOrFindPr } from "./github.js";
 
@@ -452,9 +452,7 @@ function ensureTaskWorkspaces(config: Config, task: Task): {
     const jBranch = taskBranch(task.id);
     const jPath = getWorktreePath(config.worktreeBaseDir, task.id, "journal");
     createTaskBranch(config.journalRepoPath, task.id, task.parentId);
-    if (!fs.existsSync(jPath)) {
-      createWorktree(config.journalRepoPath, jPath, jBranch);
-    }
+    ensureWorktree(config.journalRepoPath, jPath, jBranch);
     journalWorktree = jPath;
     journalPath = `${path.join(jPath, "tasks", `T${task.id}`)}${path.sep}`;
   } catch (err) {
@@ -471,9 +469,7 @@ function ensureTaskWorkspaces(config: Config, task: Task): {
       const baseBranch = parentCodeBranch
         ?? (task.metadata["base_branch"] as string | undefined)
         ?? "main";
-      if (!fs.existsSync(cPath)) {
-        createWorktree(targetRepo, cPath, codeBranch, baseBranch);
-      }
+      ensureWorktree(targetRepo, cPath, codeBranch, baseBranch);
       codeWorktree = cPath;
     } catch (err) {
       warnings.push(`code worktree setup failed: ${String(err)}`);
@@ -481,6 +477,41 @@ function ensureTaskWorkspaces(config: Config, task: Task): {
   }
 
   return { journalWorktree, journalPath, codeWorktree, warnings };
+}
+
+function writeWorkspaceTaskContext(
+  task: Task,
+  workspaces: {
+    journalWorktree: string | null;
+    journalPath: string | null;
+    codeWorktree: string | null;
+  },
+  sessionId: string,
+  fenceToken: number,
+  claimedAt: number,
+): void {
+  const roots = [workspaces.journalWorktree, workspaces.codeWorktree].filter((root): root is string => !!root);
+  if (roots.length === 0 || !workspaces.journalPath) return;
+
+  writeTaskContext({
+    taskId: task.id,
+    phase: task.phase,
+    fenceToken,
+    sessionId,
+    journalPath: workspaces.journalPath,
+    codeWorktree: workspaces.codeWorktree,
+    claimedAt,
+    reviewNotes: [],
+  }, roots);
+}
+
+function cleanupTaskWorkspaces(config: Config, task: Task): void {
+  removeWorktree(config.journalRepoPath, getWorktreePath(config.worktreeBaseDir, task.id, "journal"));
+
+  const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
+  if (!targetRepo) return;
+
+  removeWorktree(targetRepo, getWorktreePath(config.worktreeBaseDir, task.id, "code"));
 }
 
 function ensureJournalWorktreeForTask(config: Config, task: Task): {
@@ -810,6 +841,7 @@ function handleClaimTask(
 
     // The daemon owns worktree creation so the CLI can stay a pure HTTP client.
     const workspace = ensureTaskWorkspaces(config, updated);
+    writeWorkspaceTaskContext(updated, workspace, sessionId, fenceToken, now);
     const parentJournal = updated.parentId
       ? getJournalContent(config.journalRepoPath, updated.parentId)
       : null;
@@ -1418,10 +1450,10 @@ function handleStatusUpdate(
         return applyDoneTransition(core, config, task, fenceToken, ctx, now, b.evidence, b.stateRef);
 
       case "reject":
-        return applyRejectTransition(core, task, fenceToken, ctx, now, b.evidence);
+        return applyRejectTransition(core, config, task, fenceToken, ctx, now, b.evidence);
 
       case "blocked":
-        return applyBlockedTransition(core, task, now, b.blocker ?? b.evidence ?? "No reason provided", ctx);
+        return applyBlockedTransition(core, config, task, now, b.blocker ?? b.evidence ?? "No reason provided", ctx);
 
       case "pending":
         return applyChangesRequestedTransition(core, task, fenceToken, ctx, now, b.evidence);
@@ -1433,7 +1465,7 @@ function handleStatusUpdate(
         return applyDecomposeTransition(core, task, fenceToken, ctx, now);
 
       case "cancel":
-        return applyCancelTransition(core, task, now, b.evidence, ctx);
+        return applyCancelTransition(core, config, task, now, b.evidence, ctx);
 
       default:
         return { status: 400, body: { error: "unknown_status", message: `Unknown status: ${b.status}` } };
@@ -1819,6 +1851,7 @@ function applyDoneTransition(
     notifyInformed(task, "✅ Done");
     mergeCodeBranch(config, task);
     maybeCreatePr(config, task, core);
+    cleanupTaskWorkspaces(config, task);
 
     return {
       status: 200,
@@ -1901,6 +1934,7 @@ function applyDoneTransition(
   notifyInformed(task, "✅ Done");
   mergeCodeBranch(config, task);
   maybeCreatePr(config, task, core);
+  cleanupTaskWorkspaces(config, task);
 
   return {
     status: 200,
@@ -1911,6 +1945,7 @@ function applyDoneTransition(
 /** reject: review.active → failed */
 function applyRejectTransition(
   core: Core,
+  config: Config,
   task: Task,
   fenceToken: number,
   ctx: AgentContext,
@@ -2013,6 +2048,7 @@ function applyRejectTransition(
   if (err) return err;
 
   notifyInformed(task, "❌ Rejected (final)", evidence ?? "Rejected by reviewer — all attempts exhausted");
+  cleanupTaskWorkspaces(config, task);
 
   return {
     status: 200,
@@ -2023,6 +2059,7 @@ function applyRejectTransition(
 /** blocked: any active state → TaskBlocked */
 function applyBlockedTransition(
   core: Core,
+  config: Config,
   task: Task,
   ts: number,
   blocker: string,
@@ -2051,6 +2088,7 @@ function applyBlockedTransition(
   if (err) return err;
 
   notifyInformed(task, "🚫 Blocked", blocker);
+  cleanupTaskWorkspaces(config, task);
 
   return {
     status: 200,
@@ -2063,6 +2101,7 @@ function applyBlockedTransition(
 /** cancel: any non-terminal state -> TaskCanceled */
 function applyCancelTransition(
   core: Core,
+  config: Config,
   task: Task,
   ts: number,
   evidence?: string,
@@ -2079,6 +2118,7 @@ function applyCancelTransition(
 
   const err = submitOrError(core, canceled);
   if (err) return err;
+  cleanupTaskWorkspaces(config, task);
 
   return {
     status: 200,

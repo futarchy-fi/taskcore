@@ -1,4 +1,5 @@
 import * as http from "node:http";
+import { execFileSync } from "node:child_process";
 import { test, describe, beforeEach, afterEach } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -59,7 +60,7 @@ function request(
 async function setup(): Promise<void> {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "taskcore-test-"));
   dbPath = path.join(tmpDir, "test.db");
-  port = 18800 + Math.floor(Math.random() * 1000);
+  port = 0;
   const journalRepoPath = path.join(tmpDir, "journal");
   const worktreeBaseDir = path.join(tmpDir, "worktrees");
   const workspaceDir = path.join(tmpDir, "workspace");
@@ -96,7 +97,14 @@ async function setup(): Promise<void> {
 
   server = createHttpServer(core, config);
   await new Promise<void>((resolve) => {
-    server.listen(port, "127.0.0.1", resolve);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("failed to bind ephemeral test port");
+      }
+      port = address.port;
+      resolve();
+    });
   });
 }
 
@@ -108,6 +116,16 @@ async function teardown(): Promise<void> {
   } catch {
     // Ignore
   }
+}
+
+function initRepo(repoPath: string): void {
+  fs.mkdirSync(repoPath, { recursive: true });
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: repoPath, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Taskcore Tests"], { cwd: repoPath, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "taskcore-tests@example.com"], { cwd: repoPath, stdio: "ignore" });
+  fs.writeFileSync(path.join(repoPath, "README.md"), "# test\n", "utf-8");
+  execFileSync("git", ["add", "README.md"], { cwd: repoPath, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: repoPath, stdio: "ignore" });
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +478,95 @@ describe("HTTP API", () => {
     assert.equal(readRes.status, 200);
     const readBody = readRes.body as { content: string };
     assert.ok(readBody.content.includes("Starting implementation"));
+  });
+
+  test("claim refreshes stale .task metadata in an existing code worktree", async () => {
+    const repoPath = path.join(tmpDir, "code-repo");
+    initRepo(repoPath);
+
+    await request("POST", "/tasks", {
+      title: "Refresh stale context",
+      description: "Existing worktree context should be overwritten on claim",
+      assignee: "coder",
+      repo: repoPath,
+      skipAnalysis: true,
+    });
+
+    const codeWorktree = path.join(config.worktreeBaseDir, "code-T1");
+    execFileSync("git", ["worktree", "add", "-b", "task/T1", codeWorktree, "main"], {
+      cwd: repoPath,
+      stdio: "ignore",
+    });
+    fs.writeFileSync(path.join(codeWorktree, ".task"), JSON.stringify({
+      taskId: "2123",
+      phase: "execution",
+      fenceToken: 1,
+      sessionId: "stale-session",
+      journalPath: "/tmp/stale/",
+      codeWorktree,
+      claimedAt: 1,
+      reviewNotes: [],
+    }, null, 2) + "\n", "utf-8");
+
+    const claimRes = await request("POST", "/tasks/1/claim", {
+      agentId: "coder",
+      source: "test",
+    });
+    assert.equal(claimRes.status, 200);
+
+    const claimBody = claimRes.body as {
+      sessionId: string;
+      fenceToken: number;
+      workspace?: { journalPath?: string | null; codeWorktree?: string | null };
+    };
+    const dotask = JSON.parse(fs.readFileSync(path.join(codeWorktree, ".task"), "utf-8")) as Record<string, unknown>;
+    assert.equal(dotask["taskId"], "1");
+    assert.equal(dotask["sessionId"], claimBody.sessionId);
+    assert.equal(dotask["fenceToken"], claimBody.fenceToken);
+    assert.equal(dotask["journalPath"], claimBody.workspace?.journalPath);
+    assert.equal(dotask["codeWorktree"], claimBody.workspace?.codeWorktree);
+  });
+
+  test("status done cleans up journal and code worktrees", async () => {
+    const repoPath = path.join(tmpDir, "code-repo");
+    initRepo(repoPath);
+
+    await request("POST", "/tasks", {
+      title: "Cleanup worktrees",
+      description: "Terminal tasks should remove their worktrees",
+      assignee: "coder",
+      repo: repoPath,
+      skipAnalysis: true,
+    });
+
+    const claimRes = await request("POST", "/tasks/1/claim", {
+      agentId: "coder",
+      source: "test",
+    });
+    assert.equal(claimRes.status, 200);
+
+    const claimBody = claimRes.body as {
+      workspace?: {
+        journalWorktree?: string | null;
+        codeWorktree?: string | null;
+      };
+    };
+    const codeWorktree = claimBody.workspace?.codeWorktree;
+    const journalWorktree = claimBody.workspace?.journalWorktree;
+    assert.ok(codeWorktree);
+    assert.ok(journalWorktree);
+
+    fs.writeFileSync(path.join(codeWorktree!, "feature.txt"), "done\n", "utf-8");
+    execFileSync("git", ["add", "feature.txt"], { cwd: codeWorktree!, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "task work"], { cwd: codeWorktree!, stdio: "ignore" });
+
+    const doneRes = await request("POST", "/tasks/1/status", {
+      status: "done",
+      evidence: "Work completed",
+    });
+    assert.equal(doneRes.status, 200);
+    assert.equal(fs.existsSync(codeWorktree!), false);
+    assert.equal(fs.existsSync(journalWorktree!), false);
   });
 
   test("status done completes execution task directly when no reviewer is configured", async () => {
