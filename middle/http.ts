@@ -1843,7 +1843,6 @@ function applyDoneTransition(
       taskId: task.id,
       ts: ts + 1,
       stateRef: stateRef ?? defaultStateRef(),
-      source: { type: "agent", id: ctx.agentId },
     };
     const err = submitOrError(core, completed);
     if (err) return err;
@@ -1926,7 +1925,6 @@ function applyDoneTransition(
     taskId: task.id,
     ts: ts + 2,
     stateRef: stateRef ?? defaultStateRef(),
-    source: { type: "agent", id: ctx.agentId },
   };
   err = submitOrError(core, completed);
   if (err) return err;
@@ -2042,7 +2040,6 @@ function applyRejectTransition(
       whatWasLearned: "Reviewer rejected the submission. All review attempts exhausted.",
       artifactRef: null,
     },
-    source: { type: "agent", id: ctx.agentId },
   };
   err = submitOrError(core, failed);
   if (err) return err;
