@@ -242,7 +242,7 @@ export function taskBranch(taskId: string): string {
 
 function branchExists(repoPath: string, branch: string): boolean {
   try {
-    git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}`]);
+    git(repoPath, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
     return true;
   } catch {
     return false;
@@ -255,6 +255,7 @@ function git(cwd: string, args: string[]): string {
     cwd,
     encoding: "utf-8",
     timeout: 10_000,
+    stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
       GIT_TERMINAL_PROMPT: "0",

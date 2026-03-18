@@ -462,10 +462,12 @@ export interface ReviewPolicyMet extends BaseEvent {
 // Completion verification
 // ---------------------------------------------------------------------------
 
-export type ArtifactKind = "journal" | "code" | "pr";
+export type ArtifactKind = "journal" | "code" | "pr" | "file";
 
 export interface ArtifactEvidence {
   kind: ArtifactKind;
+  path?: string;
+  sizeBytes?: number;
   repo?: string;
   branch?: string;
   baseRef?: string | null;

@@ -6,7 +6,7 @@ import { loadConfig } from "./config.js";
 import { createHttpServer, cleanupPendingDecompositions } from "./http.js";
 import { exportState } from "./state-export.js";
 import { initJournalRepo } from "./journal.js";
-import { cleanupStaleWorktrees } from "./worktree.js";
+import { cleanupStaleWorktrees, getWorktreePath, removeWorktree } from "./worktree.js";
 
 // ---------------------------------------------------------------------------
 // Lock file
@@ -102,6 +102,40 @@ function reconcileOrphanedTasks(core: OrchestrationCore): void {
   }
 }
 
+function cleanupClosedTaskWorktrees(
+  core: OrchestrationCore,
+  config: ReturnType<typeof loadConfig>,
+): void {
+  if (!fs.existsSync(config.worktreeBaseDir)) return;
+
+  let cleaned = 0;
+  const state = core.getState();
+  for (const entry of fs.readdirSync(config.worktreeBaseDir)) {
+    const match = /^(journal|code)-T(.+)$/.exec(entry);
+    if (!match) continue;
+
+    const kind = match[1] as "journal" | "code";
+    const taskId = match[2]!;
+    const task = state.tasks[taskId];
+    if (!task || task.terminal === null) continue;
+
+    if (kind === "journal") {
+      removeWorktree(config.journalRepoPath, getWorktreePath(config.worktreeBaseDir, taskId, "journal"));
+      cleaned++;
+      continue;
+    }
+
+    const targetRepo = (task.metadata["repo"] as string | undefined) || config.defaultCodeRepo || undefined;
+    if (!targetRepo) continue;
+    removeWorktree(targetRepo, getWorktreePath(config.worktreeBaseDir, taskId, "code"));
+    cleaned++;
+  }
+
+  if (cleaned > 0) {
+    console.log(`[daemon] Cleaned up ${cleaned} closed worktree(s)`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -182,6 +216,7 @@ async function main(): Promise<void> {
       }
       // Sweep pending decomposition sessions for tasks that went terminal or changed phase
       cleanupPendingDecompositions(core);
+      cleanupClosedTaskWorktrees(core, config);
     } catch (err) {
       console.error("[daemon] Tick exception:", err);
     }
