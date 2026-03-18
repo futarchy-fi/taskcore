@@ -475,6 +475,8 @@ export interface ArtifactEvidence {
   aheadCount?: number | null;
   changedFiles?: string[];
   prUrl?: string | null;
+  path?: string;
+  sizeBytes?: number;
 }
 
 export interface CompletionVerification {
@@ -492,6 +494,7 @@ export interface CompletionVerificationRecorded extends BaseEvent {
 export interface TaskCompleted extends BaseEvent {
   type: "TaskCompleted";
   stateRef: StateRef;
+  source?: EventSource;
 }
 
 export interface TaskFailed extends BaseEvent {
@@ -499,6 +502,7 @@ export interface TaskFailed extends BaseEvent {
   reason: "budget_exhausted" | "cost_exhausted" | "review_rejected";
   phase: Phase;
   summary: FailureSummary;
+  source?: EventSource;
 }
 
 export interface TaskExhausted extends BaseEvent {
