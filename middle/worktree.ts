@@ -23,13 +23,20 @@ export function createWorktree(
   // the worktree doesn't have the keys yet.
   const useGitCrypt = fs.existsSync(path.join(repoPath, ".git", "git-crypt"));
   const noCheckout = useGitCrypt ? "--no-checkout" : null;
+  const resolvedStartPoint = startPoint && refExists(repoPath, startPoint)
+    ? startPoint
+    : undefined;
+  const createBranch = !branchExists(repoPath, branch);
 
   const addArgs = (withNewBranch: boolean): string[] => {
     const args = ["worktree", "add"];
     if (noCheckout) args.push(noCheckout);
+    if (withNewBranch) {
+      args.push("-b", branch);
+    }
     args.push(worktreePath);
-    if (withNewBranch && startPoint) {
-      args.push("-b", branch, startPoint);
+    if (withNewBranch) {
+      if (resolvedStartPoint) args.push(resolvedStartPoint);
     } else {
       args.push(branch);
     }
@@ -38,11 +45,11 @@ export function createWorktree(
 
   const tryAdd = (): void => {
     try {
-      git(repoPath, addArgs(!!startPoint));
+      git(repoPath, addArgs(createBranch));
     } catch (err) {
       const msg = String(err);
       // Branch may already exist — retry without -b
-      if (startPoint && msg.includes("already exists")) {
+      if (createBranch && msg.includes("already exists")) {
         git(repoPath, addArgs(false));
       } else {
         throw err;
@@ -205,12 +212,35 @@ export function cleanupStaleWorktrees(
 // Helpers
 // ---------------------------------------------------------------------------
 
+function branchExists(repoPath: string, branch: string): boolean {
+  return refExists(repoPath, `refs/heads/${branch}`);
+}
+
+function refExists(repoPath: string, ref: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+      cwd: repoPath,
+      encoding: "utf-8",
+      timeout: 30_000,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Run a git command. */
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf-8",
     timeout: 30_000,
+    stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
       GIT_TERMINAL_PROMPT: "0",

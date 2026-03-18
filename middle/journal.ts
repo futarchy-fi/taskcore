@@ -255,6 +255,7 @@ function git(cwd: string, args: string[]): string {
     cwd,
     encoding: "utf-8",
     timeout: 10_000,
+    stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
       GIT_TERMINAL_PROMPT: "0",
