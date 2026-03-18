@@ -63,6 +63,34 @@ test("validator rejects non-monotonic fence token", () => {
   assert.equal(error.code, "fence_not_monotonic");
 });
 
+test("validator rejects LeaseGranted with empty agent id", () => {
+  const state = bootstrapState();
+
+  const invalidLease: Event = {
+    type: "LeaseGranted",
+    taskId: "T10",
+    ts: 2,
+    fenceToken: 1,
+    agentId: "   ",
+    phase: "analysis",
+    leaseTimeout: 60_000,
+    sessionId: "sess-1",
+    sessionType: "fresh",
+    contextBudget: 512,
+    agentContext: {
+      sessionId: "sess-1",
+      agentId: "   ",
+      memoryRef: null,
+      contextTokens: null,
+      modelId: "test",
+    },
+  };
+
+  const error = validateEvent(state, invalidLease);
+  assert.ok(error);
+  assert.equal(error.code, "invalid_agent_id");
+});
+
 test("validator enforces failure summary on TaskFailed", () => {
   const state = bootstrapState();
 

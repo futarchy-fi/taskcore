@@ -11,6 +11,7 @@ import {
   filterClaimableTasks,
   includeReviewQueueTask,
 } from "./claimability.js";
+import { allocateCosts, parsePlan } from "./plan-parse.js";
 
 // Handle EPIPE errors gracefully (e.g., when piping to head)
 process.stdout.on("error", (err: NodeJS.ErrnoException) => {
@@ -535,7 +536,9 @@ function phaseGuidance(phase: string, condition: string): string[] {
     case "decomposition.active":
       return [
         "You're decomposing this task. Next steps:",
-        "  task decompose start      # begin decomposition",
+        "  task plan --file plan.md  # materialize a whole checklist in one shot",
+        "  task decompose plan --stdin  # same flow, reading markdown from stdin",
+        "  task decompose start      # fallback: build children incrementally",
         "  task decompose add <...>  # add a child task",
         "  task decompose commit     # finalize children",
         "  task decompose cancel     # cancel decomposition",
@@ -768,7 +771,8 @@ function printHelp(): void {
     "  task update <message>",
     "  task analyze",
     "  task decide <execute|decompose>",
-    "  task decompose <start|add|commit|cancel> ...",
+    "  task plan <plan-text> | --file <path> | --stdin  # plan-based decomposition",
+    "  task decompose <start|add|commit|cancel|plan> ...",
     "  task review <read|note|approve|reject|request-changes> ...",
     "  task journal <read|write|write-file> ...",
     "  task worktree",
@@ -1520,10 +1524,12 @@ async function cmdClaim(argv: string[], jsonMode: boolean): Promise<void> {
     process.stdout.write("  task review reject --force             — reject permanently (prefer request-changes)\n");
     process.stdout.write("  task review request-changes \"notes\"   — request changes\n");
   } else if (phase === "decomposition") {
-    process.stdout.write("  task decompose start      — begin decomposition\n");
-    process.stdout.write("  task decompose add \"...\"  — add a child task\n");
-    process.stdout.write("  task decompose commit     — finalize children\n");
-    process.stdout.write("  task decompose cancel     — cancel decomposition\n");
+    process.stdout.write("  task plan --file plan.md   — commit a whole checklist in one shot\n");
+    process.stdout.write("  task decompose plan --stdin — same flow, reading markdown from stdin\n");
+    process.stdout.write("  task decompose start       — fallback: begin incremental decomposition\n");
+    process.stdout.write("  task decompose add \"...\"   — add a child task\n");
+    process.stdout.write("  task decompose commit      — finalize children\n");
+    process.stdout.write("  task decompose cancel      — cancel decomposition\n");
   } else {
     process.stdout.write("  task submit \"what you did\"   — when done\n");
     process.stdout.write("  task complete \"evidence\"     — done, no review needed\n");
@@ -2005,9 +2011,221 @@ async function cmdDecompose(argv: string[], jsonMode: boolean): Promise<void> {
       return;
     }
 
+    case "plan": {
+      const { flags } = parseFlags(args);
+
+      // Read plan text from --items, --file, or --stdin
+      let planText: string;
+      const itemsFlag = getFlagString(flags, "items");
+      const fileFlag = getFlagString(flags, "file");
+      const useStdin = getFlagBool(flags, "stdin");
+
+      if (itemsFlag !== undefined) {
+        planText = itemsFlag;
+      } else if (fileFlag !== undefined) {
+        if (!fs.existsSync(fileFlag)) {
+          throw new CliError(`File not found: ${fileFlag}`, 1);
+        }
+        planText = fs.readFileSync(fileFlag, "utf-8");
+      } else if (useStdin) {
+        planText = fs.readFileSync(0, "utf-8");
+      } else {
+        throw new CliError(
+          "Usage: task decompose plan --items <text> | --file <path> | --stdin\n" +
+            "       [--strategy sequential|parallel]",
+          1,
+        );
+      }
+
+      const strategyRaw = getFlagString(flags, "strategy") ?? "sequential";
+      if (strategyRaw !== "sequential" && strategyRaw !== "parallel") {
+        throw new CliError("--strategy must be 'sequential' or 'parallel'", 1);
+      }
+      const strategy = strategyRaw as "sequential" | "parallel";
+
+      // Parse the plan into items
+      const parsedItems = parsePlan(planText);
+      if (parsedItems.length === 0) {
+        throw new CliError(
+          "No items found in plan. Use checklist (- [ ] step), ordered (1. step), or bullet (- step) format.",
+          1,
+        );
+      }
+
+      // Fetch parent task to determine remaining budget
+      const task = await getTask(taskId);
+      const costObj = asRecord(task["cost"]);
+      const budgetRemaining = costObj
+        ? (asNumber(costObj["allocated"]) ?? 0)
+          - (asNumber(costObj["consumed"]) ?? 0)
+          - (asNumber(costObj["childAllocated"]) ?? 0)
+          + (asNumber(costObj["childRecovered"]) ?? 0)
+        : 0;
+
+      // Allocate costs (explicit + auto-distribution)
+      const allocation = allocateCosts(parsedItems, budgetRemaining);
+      if (!allocation.ok) {
+        throw new CliError(`Cost allocation failed: ${(allocation as { ok: false; error: string }).error}`, 1);
+      }
+
+      // Build children array for the one-shot endpoint
+      const children = allocation.items.map((item) => {
+        const child: Record<string, unknown> = {
+          title: item.title,
+          description: item.description,
+          costAllocation: item.cost,
+        };
+        if (item.assignee) child["assignee"] = item.assignee;
+        if (item.reviewer) child["reviewer"] = item.reviewer;
+        if (item.skipAnalysis) child["skipAnalysis"] = true;
+        return child;
+      });
+
+      const response = await apiRequest("POST", `/tasks/${taskId}/decompose`, {
+        children,
+        coordinationMode: strategy,
+      });
+
+      if (jsonMode) {
+        process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+        return;
+      }
+
+      process.stdout.write("--- Decomposition committed ---\n\n");
+      const responseChildren = asArray<unknown>(response["children"])
+        .map((c) => asRecord(c))
+        .filter((c): c is Record<string, unknown> => c !== null);
+      process.stdout.write(`Created ${responseChildren.length} children:\n`);
+      for (const child of responseChildren) {
+        process.stdout.write(
+          `  T${getString(child, "id", "?")}: ${getString(child, "title", "(untitled)")}  ${formatMoney(child["costAllocation"])}\n`,
+        );
+      }
+
+      const planAgentId = process.env["TASKCORE_AGENT_ID"];
+      if (planAgentId) clearActiveTask(planAgentId);
+      return;
+    }
+
     default:
-      throw new CliError("Usage: task decompose <start|add|checkpoint|commit|cancel> ...", 1);
+      throw new CliError("Usage: task decompose <start|add|checkpoint|commit|cancel|plan> ...", 1);
   }
+}
+
+/**
+ * `task plan` — top-level shortcut for plan-based decomposition.
+ *
+ * Usage:
+ *   task plan "- [ ] step one\n- [ ] step two"
+ *   task plan --file plan.md
+ *   task plan --stdin
+ *   task plan "- step one" --strategy parallel
+ *
+ * Equivalent to `task decompose plan` but more natural for agents.
+ * Accepts plan text as a positional arg (most common), --file, or --stdin.
+ */
+async function cmdPlan(argv: string[], jsonMode: boolean): Promise<void> {
+  requireAgentId();
+  const taskId = currentTaskId();
+  const { positionals, flags } = parseFlags(argv);
+
+  // Read plan text from positional arg, --file, or --stdin
+  let planText: string;
+  const fileFlag = getFlagString(flags, "file");
+  const useStdin = getFlagBool(flags, "stdin");
+
+  if (positionals.length > 0) {
+    planText = positionals.join(" ");
+  } else if (fileFlag !== undefined) {
+    if (!fs.existsSync(fileFlag)) {
+      throw new CliError(`File not found: ${fileFlag}`, 1);
+    }
+    planText = fs.readFileSync(fileFlag, "utf-8");
+  } else if (useStdin) {
+    planText = fs.readFileSync(0, "utf-8");
+  } else {
+    throw new CliError(
+      "Usage: task plan <plan-text> | --file <path> | --stdin\n" +
+        "       [--strategy sequential|parallel]\n" +
+        "\n" +
+        "Plan format:\n" +
+        "  - [ ] Step title (cost: 10, assignee: coder)\n" +
+        "  1. Ordered step\n" +
+        "  - Bullet step\n" +
+        "  # Section heading\n" +
+        "  Indented lines extend item descriptions.",
+      1,
+    );
+  }
+
+  const strategyRaw = getFlagString(flags, "strategy") ?? "sequential";
+  if (strategyRaw !== "sequential" && strategyRaw !== "parallel") {
+    throw new CliError("--strategy must be 'sequential' or 'parallel'", 1);
+  }
+  const strategy = strategyRaw as "sequential" | "parallel";
+
+  // Parse the plan
+  const parsedItems = parsePlan(planText);
+  if (parsedItems.length === 0) {
+    throw new CliError(
+      "No items found in plan. Use checklist (- [ ] step), ordered (1. step), or bullet (- step) format.",
+      1,
+    );
+  }
+
+  // Fetch task to determine remaining budget
+  const task = await getTask(taskId);
+  const costObj = asRecord(task["cost"]);
+  const budgetRemaining = costObj
+    ? (asNumber(costObj["allocated"]) ?? 0)
+      - (asNumber(costObj["consumed"]) ?? 0)
+      - (asNumber(costObj["childAllocated"]) ?? 0)
+      + (asNumber(costObj["childRecovered"]) ?? 0)
+    : 0;
+
+  // Allocate costs
+  const allocation = allocateCosts(parsedItems, budgetRemaining);
+  if (!allocation.ok) {
+    throw new CliError(`Cost allocation failed: ${(allocation as { ok: false; error: string }).error}`, 1);
+  }
+
+  // Build children array
+  const children = allocation.items.map((item) => {
+    const child: Record<string, unknown> = {
+      title: item.title,
+      description: item.description,
+      costAllocation: item.cost,
+    };
+    if (item.assignee) child["assignee"] = item.assignee;
+    if (item.reviewer) child["reviewer"] = item.reviewer;
+    if (item.skipAnalysis) child["skipAnalysis"] = true;
+    return child;
+  });
+
+  const response = await apiRequest("POST", `/tasks/${taskId}/decompose`, {
+    children,
+    coordinationMode: strategy,
+  });
+
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify(response, null, 2) + "\n");
+    return;
+  }
+
+  process.stdout.write(`--- Plan materialized for T${taskId} ---\n\n`);
+  const responseChildren = asArray<unknown>(response["children"])
+    .map((c) => asRecord(c))
+    .filter((c): c is Record<string, unknown> => c !== null);
+  process.stdout.write(`Created ${responseChildren.length} child tasks:\n`);
+  for (const child of responseChildren) {
+    process.stdout.write(
+      `  T${getString(child, "id", "?")}: ${getString(child, "title", "(untitled)")}  ${formatMoney(child["costAllocation"])}\n`,
+    );
+  }
+  process.stdout.write("\nParent task is now a coordinator. Children will execute the plan.\n");
+
+  const planAgentId = process.env["TASKCORE_AGENT_ID"];
+  if (planAgentId) clearActiveTask(planAgentId);
 }
 
 function ensureContextWithTaskId(taskId: string): TaskContext {
@@ -2606,6 +2824,27 @@ const subcommandHelp: Record<string, string> = {
     "  decompose   Task will be split into subtasks",
   ].join("\n"),
 
+  plan: [
+    "task plan <plan-text> | --file <path> | --stdin",
+    "",
+    "One-shot plan-based decomposition. Parses a markdown plan into",
+    "child tasks and materializes them under the current task.",
+    "Equivalent to `task decompose plan` but accepts plan as a positional arg.",
+    "",
+    "Options:",
+    "  --file <path>                       Read plan from file",
+    "  --stdin                             Read plan from stdin",
+    "  --strategy sequential|parallel      Coordination mode (default: sequential)",
+    "",
+    "Plan format:",
+    "  - [ ] Step title (cost: 10, assignee: coder)",
+    "  1. Ordered step",
+    "  - Bullet step",
+    "  # Section heading   — prefixes following items with 'Section: '",
+    "  Indented lines (2+ spaces) extend the item description.",
+    "  Trailing (key: val) metadata: cost, assignee, reviewer, skip-analysis",
+  ].join("\n"),
+
   decompose: [
     "task decompose <subcommand> ...",
     "",
@@ -2620,6 +2859,19 @@ const subcommandHelp: Record<string, string> = {
     "    --skip-analysis                     Skip analysis phase for child",
     "  commit <strategy>                     Commit the decomposition",
     "  cancel                                Cancel pending decomposition",
+    "  plan                                  One-shot plan-based decomposition",
+    "    --items <markdown>                  Inline plan text",
+    "    --file <path>                       Read plan from file",
+    "    --stdin                             Read plan from stdin",
+    "    --strategy sequential|parallel      Coordination mode (default: sequential)",
+    "",
+    "Plan format (for 'plan' subcommand):",
+    "  - [ ] Step title (cost: 10, assignee: coder)",
+    "  1. Ordered step",
+    "  - Bullet step",
+    "  # Section heading   — prefixes following items with 'Section: '",
+    "  Indented lines (2+ spaces) extend the item description.",
+    "  Trailing (key: val) metadata: cost, assignee, reviewer, skip-analysis",
   ].join("\n"),
 
   review: [
@@ -2798,6 +3050,9 @@ async function run(argv: string[]): Promise<void> {
       return;
     case "decide":
       await cmdDecide(rest, jsonMode);
+      return;
+    case "plan":
+      await cmdPlan(rest, jsonMode);
       return;
     case "decompose":
       await cmdDecompose(rest, jsonMode);

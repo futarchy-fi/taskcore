@@ -8,6 +8,7 @@ import {
   type Event,
   type LeaseExpired,
   type PhaseTransition,
+  type RetryScheduled,
   type SystemState,
   type Task,
   type TaskExhausted,
@@ -16,6 +17,14 @@ import {
 
 function backoffDue(task: Task, now: number): boolean {
   return task.condition === "retryWait" && task.retryAfter !== null && task.retryAfter <= now;
+}
+
+function hasActiveAgent(task: Task): boolean {
+  return typeof task.leasedTo === "string" && task.leasedTo.trim().length > 0;
+}
+
+function malformedActiveLease(task: Task): boolean {
+  return task.condition === "active" && (!hasActiveAgent(task) || task.leaseExpiresAt === null);
 }
 
 function childrenCompleteReady(state: SystemState, task: Task): { allTerminal: boolean; anyDone: boolean } {
@@ -39,6 +48,7 @@ function childrenCompleteReady(state: SystemState, task: Task): { allTerminal: b
 
 export class CoreClock {
   private readonly sourceId: string;
+  private static readonly LEAKED_LEASE_BACKOFF_MS = 1_000;
 
   public constructor(sourceId = "core-clock") {
     this.sourceId = sourceId;
@@ -103,11 +113,22 @@ export class CoreClock {
         }
       }
 
-      if (
-        task.condition === "active" &&
-        task.leaseExpiresAt !== null &&
-        task.leaseExpiresAt <= now
-      ) {
+      if (malformedActiveLease(task)) {
+        const retryScheduled: RetryScheduled = {
+          type: "RetryScheduled",
+          taskId: task.id,
+          ts: now,
+          fenceToken: task.currentFenceToken,
+          reason: "orphaned_on_restart",
+          retryAfter: now + CoreClock.LEAKED_LEASE_BACKOFF_MS,
+          phase: task.phase,
+          attemptNumber: Math.max(1, task.attempts[task.phase].used),
+        };
+        due.push(retryScheduled);
+        continue;
+      }
+
+      if (task.condition === "active" && task.leaseExpiresAt !== null && task.leaseExpiresAt <= now) {
         const leaseExpired: LeaseExpired = {
           type: "LeaseExpired",
           taskId: task.id,

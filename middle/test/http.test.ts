@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import * as http from "node:http";
 import { test, describe, beforeEach, afterEach } from "node:test";
 import * as assert from "node:assert/strict";
@@ -110,6 +111,16 @@ async function teardown(): Promise<void> {
   }
 }
 
+function initRepo(repoPath: string): void {
+  fs.mkdirSync(repoPath, { recursive: true });
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: repoPath, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Taskcore Tests"], { cwd: repoPath, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "taskcore-tests@example.com"], { cwd: repoPath, stdio: "ignore" });
+  fs.writeFileSync(path.join(repoPath, "README.md"), "# test\n", "utf-8");
+  execFileSync("git", ["add", "README.md"], { cwd: repoPath, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: repoPath, stdio: "ignore" });
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -209,6 +220,35 @@ describe("HTTP API", () => {
     assert.equal(body.tasks.length, 2);
   });
 
+  test("GET /tasks summaries include active agent and lease metadata", async () => {
+    await request("POST", "/tasks", {
+      title: "Leased task",
+      description: "Should expose lease info in summary",
+      assignee: "coder",
+    });
+    const claimRes = await request("POST", "/tasks/1/claim", {
+      agentId: "coder",
+      source: "test",
+    });
+    assert.equal(claimRes.status, 200);
+
+    const res = await request("GET", "/tasks");
+    assert.equal(res.status, 200);
+    const body = res.body as {
+      tasks: Array<{
+        id: string;
+        activeAgent: string | null;
+        leaseExpiresAt: number | null;
+        updatedAtMs: number | null;
+      }>;
+    };
+    const task = body.tasks.find((entry) => entry.id === "1");
+    assert.ok(task);
+    assert.equal(task.activeAgent, "coder");
+    assert.equal(typeof task.leaseExpiresAt, "number");
+    assert.equal(task.updatedAtMs !== null && task.updatedAtMs > 0, true);
+  });
+
   test("GET /dispatchable lists dispatchable tasks", async () => {
     await request("POST", "/tasks", {
       title: "Ready task",
@@ -230,6 +270,21 @@ describe("HTTP API", () => {
   test("404 for unknown routes", async () => {
     const res = await request("GET", "/not-a-route");
     assert.equal(res.status, 404);
+  });
+
+  test("POST /tasks/:id/claim rejects blank agent id", async () => {
+    await request("POST", "/tasks", {
+      title: "Claim validation",
+      description: "Blank claim agent should fail",
+    });
+
+    const res = await request("POST", "/tasks/1/claim", {
+      agentId: "   ",
+      source: "test",
+    });
+    assert.equal(res.status, 400);
+    const body = res.body as { error: string };
+    assert.equal(body.error, "invalid_agent_id");
   });
 
   test("PATCH /tasks/:id/metadata updates priority", async () => {
@@ -460,6 +515,41 @@ describe("HTTP API", () => {
     assert.equal(readRes.status, 200);
     const readBody = readRes.body as { content: string };
     assert.ok(readBody.content.includes("Starting implementation"));
+  });
+
+  test("claim falls back to repo HEAD when requested base branch is missing", async () => {
+    const repoPath = path.join(tmpDir, "code-repo");
+    initRepo(repoPath);
+
+    await request("POST", "/tasks", {
+      title: "Claim fallback test",
+      description: "Claim should still create a code worktree when base branch is missing",
+      assignee: "coder",
+      repo: repoPath,
+      baseBranch: "missing-base",
+      skipAnalysis: true,
+    });
+
+    const claimRes = await request("POST", "/tasks/1/claim", {
+      agentId: "coder",
+      source: "test",
+    });
+    assert.equal(claimRes.status, 200);
+
+    const claimBody = claimRes.body as {
+      workspace?: { codeWorktree?: string | null };
+      warnings?: string[];
+    };
+    assert.ok(claimBody.workspace?.codeWorktree);
+    assert.deepEqual(claimBody.warnings ?? [], []);
+
+    const codeWorktree = claimBody.workspace?.codeWorktree!;
+    assert.equal(fs.existsSync(codeWorktree), true);
+    assert.equal(
+      execFileSync("git", ["branch", "--show-current"], { cwd: codeWorktree, encoding: "utf-8" }).trim(),
+      "task/T1",
+    );
+    assert.equal(fs.existsSync(path.join(codeWorktree, "README.md")), true);
   });
 
   test("status done completes execution task directly when no reviewer is configured", async () => {

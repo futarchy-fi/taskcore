@@ -321,6 +321,14 @@ function validateSessionPolicy(
   return null;
 }
 
+function validateLeaseAgent(event: Extract<Event, { type: "LeaseGranted" }>): ValidationError | null {
+  if (!nonEmptyText(event.agentId)) {
+    return mkError(event, "invalid_agent_id", "LeaseGranted.agentId must be non-empty.");
+  }
+
+  return null;
+}
+
 function validateWaitAction(event: Extract<Event, { type: "WaitResolved" }>): ValidationError | null {
   if (event.action === "block" && !validFailureSummary(event.summary)) {
     return mkError(
@@ -491,6 +499,11 @@ export function validateEvent(state: SystemState, event: Event): ValidationError
       }
       if (!isPositiveInt(event.contextBudget)) {
         return mkError(event, "invalid_context_budget", "Context budget must be a positive integer.");
+      }
+
+      const agentError = validateLeaseAgent(event);
+      if (agentError) {
+        return agentError;
       }
 
       const attempt = task.attempts[event.phase];

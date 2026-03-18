@@ -412,7 +412,8 @@ function appendDecompositionInstructions(sections: string[], task: Task, config:
   sections.push("");
   sections.push("## How to Submit Your Decomposition");
   sections.push("");
-  sections.push("Use the incremental decompose CLI — it guides you step by step:");
+  sections.push("Preferred when you already have a checklist: use the one-shot plan flow (`task plan --file plan.md` or `task decompose plan --stdin`).");
+  sections.push("If you need to build children incrementally, use the step-by-step decompose flow below:");
   sections.push("");
   sections.push("```bash");
   sections.push(`# Step 1: Start a decomposition session`);
